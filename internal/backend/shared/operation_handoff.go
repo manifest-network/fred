@@ -437,15 +437,19 @@ func (s *OperationSettlement) ListFailedOperationReceipts() ([]FailedOperationRe
 // LookupOperationRecovery returns the sealed durable state of one exact
 // operation from the coordinator that owns its possible settlement.
 func (s *OperationSettlement) LookupOperationRecovery(
+	ctx context.Context,
 	probe OperationIntentProbe,
 ) (OperationRecoveryState, error) {
 	if s == nil || s.callbacks == nil || s.releases == nil {
 		return nil, errors.New("operation settlement is invalid")
 	}
+	if ctx == nil {
+		return nil, errors.New("operation recovery lookup requires a context")
+	}
 	if probe.settlement != s {
 		return nil, errors.New("operation intent probe belongs to another journal pair")
 	}
-	state, err := s.callbacks.lookupOperationRecovery(probe)
+	state, err := s.callbacks.lookupOperationRecovery(ctx, probe)
 	if err != nil {
 		return nil, err
 	}
@@ -1260,8 +1264,12 @@ func (s *OperationSettlement) CommitOperationFailure(
 // Release derived from claim is admissible; an older, superseded, divergent, or
 // absent generation grants no success authority.
 func (s *OperationSettlement) ProveCommittedOperation(
+	ctx context.Context,
 	claim OperationIntentClaim,
 ) (OperationReleaseCommitted, error) {
+	if ctx == nil {
+		return OperationReleaseCommitted{}, errors.New("committed operation proof requires a context")
+	}
 	if s == nil || s.callbacks == nil || s.releases == nil {
 		return OperationReleaseCommitted{}, errors.New("operation settlement is invalid")
 	}
@@ -1269,7 +1277,12 @@ func (s *OperationSettlement) ProveCommittedOperation(
 	if err != nil {
 		return OperationReleaseCommitted{}, err
 	}
-	unlock := s.callbacks.lockDeliveryLease(durable.LeaseUUID())
+	// The lease's delivery gate can be held across another publication's
+	// storage attestation, so the wait follows the caller's context.
+	unlock, err := s.callbacks.lockDeliveryLeaseContext(ctx, durable.LeaseUUID())
+	if err != nil {
+		return OperationReleaseCommitted{}, fmt.Errorf("wait for the lease's callback delivery: %w", err)
+	}
 	defer unlock()
 	if err := s.callbacks.requireCurrentOperationClaim(durable); err != nil {
 		return OperationReleaseCommitted{}, err

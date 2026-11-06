@@ -248,7 +248,7 @@ func (b *Backend) ensureCommittedRestoreDestinationForClose(ctx context.Context,
 			backend.ErrInvalidState, leaseUUID,
 		)
 	}
-	operation, err := b.currentRestoreOperation(*source)
+	operation, err := b.currentRestoreOperation(ctx, *source)
 	if err != nil && !errors.Is(err, shared.ErrOperationIntentMissing) {
 		return fmt.Errorf(
 			"%w: restore destination %q has conflicting operation authority: %w",
@@ -257,7 +257,7 @@ func (b *Backend) ensureCommittedRestoreDestinationForClose(ctx context.Context,
 	}
 	switch state := operation.(type) {
 	case shared.OperationIntentClaim:
-		proof, proofErr := b.operationSettlement.ProveCommittedOperation(state)
+		proof, proofErr := b.operationSettlement.ProveCommittedOperation(ctx, state)
 		if proofErr != nil {
 			return fmt.Errorf("prove committed restore before close admission: %w", proofErr)
 		}
@@ -351,7 +351,7 @@ func (b *Backend) doDeprovisionScoped(
 	b.provisionsMu.RLock()
 	_, projectionExists := b.provisions[leaseUUID]
 	b.provisionsMu.RUnlock()
-	if err := b.settleCommittedOperationBeforeClose(leaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeClose(ctx, leaseUUID); err != nil {
 		return err
 	}
 	if err := b.settleMaintenanceBeforeClose(leaseUUID); err != nil {

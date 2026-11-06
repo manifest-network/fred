@@ -66,12 +66,75 @@ type actorObservationMessage interface {
 // successful actor admission can consume the envelope. A refused enqueue
 // releases the claim so bounded routing retries remain possible.
 type messageEnvelope struct {
-	message  leaseMessage
-	accepted atomic.Bool
+	message   leaseMessage
+	admission atomic.Uint32
 }
+
+// envelopeAdmission is the closed set of an envelope's admission states. An
+// enqueue claims admission tentatively, then either an actor accepts the
+// message or the claim rolls back to idle. Abandoning an idle envelope
+// settles it at once; abandoning one mid-enqueue is recorded, and that
+// enqueue settles it if no actor accepts, so the request is never lost.
+type envelopeAdmission uint32
+
+const (
+	envelopeIdle envelopeAdmission = iota
+	envelopeEnqueueing
+	envelopeEnqueueingAbandoned
+	envelopeAccepted
+	envelopeAbandoned
+)
 
 func newMessageEnvelope(message leaseMessage) *messageEnvelope {
 	return &messageEnvelope{message: message}
+}
+
+func (e *messageEnvelope) state() envelopeAdmission {
+	return envelopeAdmission(e.admission.Load())
+}
+
+func (e *messageEnvelope) move(from, to envelopeAdmission) bool {
+	return e.admission.CompareAndSwap(uint32(from), uint32(to))
+}
+
+// beginEnqueue claims admission for one enqueue attempt.
+func (e *messageEnvelope) beginEnqueue() bool {
+	return e.move(envelopeIdle, envelopeEnqueueing)
+}
+
+// finishEnqueue records whether an actor accepted the message. A refused
+// attempt rolls back to idle, unless the envelope was abandoned meanwhile;
+// then this attempt settles the abandonment.
+func (e *messageEnvelope) finishEnqueue(enqueued bool) {
+	switch {
+	case enqueued:
+		// An abandonment requested meanwhile is moot: an actor owns it now.
+		e.admission.Store(uint32(envelopeAccepted))
+	case e.move(envelopeEnqueueing, envelopeIdle):
+	default:
+		e.admission.Store(uint32(envelopeAbandoned))
+		e.message.onPanic(errCommandAbandoned)
+	}
+}
+
+// abandon settles an envelope no actor has accepted, or asks the enqueue in
+// flight to settle it if that enqueue is refused.
+func (e *messageEnvelope) abandon() {
+	for {
+		switch e.state() {
+		case envelopeIdle:
+			if e.move(envelopeIdle, envelopeAbandoned) {
+				e.message.onPanic(errCommandAbandoned)
+				return
+			}
+		case envelopeEnqueueing:
+			if e.move(envelopeEnqueueing, envelopeEnqueueingAbandoned) {
+				return
+			}
+		case envelopeEnqueueingAbandoned, envelopeAccepted, envelopeAbandoned:
+			return
+		}
+	}
 }
 
 // ActorCommand is the opaque, one-shot capability for caller-authored work.
@@ -87,14 +150,13 @@ func newActorCommand(message actorCommandMessage) ActorCommand {
 var errCommandAbandoned = errors.New("actor command abandoned before an actor accepted it")
 
 // Abandon settles a command that no actor accepted, giving back what it owns,
-// such as a close's command fence, and makes it unusable. It claims the same
-// one-shot admission that enqueueing claims, so it does nothing to a command
-// an actor accepted.
+// such as a close's command fence, and makes it unusable. It does nothing to a
+// command an actor accepted. Abandoning during an enqueue is never lost: if
+// that enqueue is refused, it settles the abandonment.
 func (c ActorCommand) Abandon() {
-	if c.envelope == nil || !c.envelope.accepted.CompareAndSwap(false, true) {
-		return
+	if c.envelope != nil {
+		c.envelope.abandon()
 	}
-	c.envelope.message.onPanic(errCommandAbandoned)
 }
 
 // ActorObservation is an opaque, one-shot substrate observation bound to an
@@ -2267,14 +2329,12 @@ func (a *LeaseActor) TryEnqueueRecovery(command RecoveryCommand) bool {
 }
 
 func (a *LeaseActor) tryEnqueueEnvelope(envelope *messageEnvelope, message leaseMessage) bool {
-	if envelope == nil || message == nil || !envelope.accepted.CompareAndSwap(false, true) {
+	if envelope == nil || message == nil || !envelope.beginEnqueue() {
 		return false
 	}
-	if a.tryEnqueue(message) {
-		return true
-	}
-	envelope.accepted.Store(false)
-	return false
+	enqueued := a.tryEnqueue(message)
+	envelope.finishEnqueue(enqueued)
+	return enqueued
 }
 
 // tryEnqueue does a non-blocking enqueue of an internal message into the actor's inbox.

@@ -2,6 +2,7 @@ package leasesm
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -57,18 +58,18 @@ func (a *LeaseActor) CloseOwnsObservation(observation ActorObservation) bool {
 }
 
 // CloseAdmitted gives back the command fence the close's caller handed over,
-// on evidence that the close's durable head is committed: head must be a
-// durable close intent claim for this scope's lease. That head refuses every
-// other mutation of the lease, so teardown runs without the fence. The actor
-// releases the fence anyway when the close attempt ends, so a close that never
-// reaches its head never leaks it.
+// on evidence that the close's durable head is committed in this actor's own
+// journal: the actor's recovery lineage must prove head (ProvesCloseHead).
+// That head refuses every other mutation of the lease, so teardown runs
+// without the fence. The actor releases the fence anyway when the close
+// attempt ends, so a close that never reaches its head never leaks it.
 func (scope ActorCloseScope) CloseAdmitted(head shared.CloseIntentClaim) error {
 	leaseUUID := scope.LeaseUUID()
 	if leaseUUID == "" {
 		return errors.New("close admission needs an active actor close")
 	}
-	if !head.Durable() || head.LeaseUUID() != leaseUUID {
-		return errors.New("close admission needs this lease's durable close head")
+	if err := scope.state.lineage.ProvesCloseHead(head, leaseUUID); err != nil {
+		return fmt.Errorf("close admission needs this lease's durable close head: %w", err)
 	}
 	scope.state.fence.Release()
 	return nil

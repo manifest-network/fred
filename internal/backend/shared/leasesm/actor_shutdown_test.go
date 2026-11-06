@@ -181,6 +181,56 @@ func TestCloseCommandTakesOwnershipOfItsLeasesFence(t *testing.T) {
 	retaken.Release()
 }
 
+// Abandoning a close while an enqueue of it is in flight is never lost: if no
+// actor accepts it, that enqueue settles the abandonment and gives the fence
+// back; if an actor accepts it, the actor owns it and abandonment does nothing.
+func TestAbandonDuringEnqueueIsNeverLost(t *testing.T) {
+	for _, accepted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("accepted=%t", accepted), func(t *testing.T) {
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{ProvisionStore: newMockProvisionStore()})
+			command, reply := newTestDeprovisionCommand(t, actor)
+			fenceFree := func() bool {
+				hold, free := actor.cfg.CommandFence.TryLock(testActorLeaseUUID)
+				hold.Release()
+				return free
+			}
+			require.True(t, command.envelope.beginEnqueue())
+			command.Abandon()
+			require.False(t, fenceFree(), "abandonment waits for the enqueue in flight")
+			command.envelope.finishEnqueue(accepted)
+			if accepted {
+				require.False(t, fenceFree(), "an accepted close owns its fence")
+				require.Empty(t, reply.Result(), "an accepted close is not abandoned")
+				return
+			}
+			require.True(t, fenceFree(), "the refused enqueue settles the abandonment")
+			require.ErrorIs(t, <-reply.Result(), errCommandAbandoned)
+			require.False(t, actor.TryEnqueueCommand(command), "an abandoned close is spent")
+		})
+	}
+}
+
+// Concurrent enqueue attempts against an actor that refuses them, racing an
+// abandonment, always end with the close settled exactly once.
+func TestAbandonRacingRefusedEnqueuesSettlesOnce(t *testing.T) {
+	for range 200 {
+		actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{ProvisionStore: newMockProvisionStore()})
+		actor.stopAdmission()
+		command, reply := newTestDeprovisionCommand(t, actor)
+		var attempts sync.WaitGroup
+		for range 4 {
+			attempts.Go(func() { require.False(t, actor.TryEnqueueCommand(command)) })
+		}
+		attempts.Go(command.Abandon)
+		attempts.Wait()
+		hold, free := actor.cfg.CommandFence.TryLock(testActorLeaseUUID)
+		require.True(t, free, "the abandoned close gave its fence back")
+		hold.Release()
+		require.ErrorIs(t, <-reply.Result(), errCommandAbandoned)
+		require.Empty(t, reply.Result(), "abandonment settles once")
+	}
+}
+
 func TestNewLeaseActorRequiresACloseTimeout(t *testing.T) {
 	store := newMockProvisionStore()
 	cfg := validConstructionTestActorConfig(context.Background(), store)

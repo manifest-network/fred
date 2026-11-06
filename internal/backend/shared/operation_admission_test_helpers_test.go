@@ -1,5 +1,7 @@
 package shared
 
+import "context"
+
 // These adapters deliberately exist only in the shared package's test build.
 // Production callers must cross the exact CallbackStore/ReleaseStore pair via
 // OperationSettlement; storage-level tests still need direct access to verify
@@ -41,7 +43,8 @@ func (s *CallbackStore) ListFailedOperationReceipts() ([]FailedOperationReceipt,
 }
 
 func (s *CallbackStore) LookupOperationRecovery(
+	ctx context.Context,
 	probe OperationIntentProbe,
 ) (OperationRecoveryState, error) {
-	return s.lookupOperationRecovery(probe)
+	return s.lookupOperationRecovery(ctx, probe)
 }

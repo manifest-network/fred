@@ -71,7 +71,7 @@ func (b *Backend) acquireCloseIntent(
 // already queued behind it), close admission must not classify the committed
 // operation as preempted Failed. A genuinely uncommitted intent is deliberately
 // left for BeginClose's atomic failure-preemption transaction.
-func (b *Backend) settleCommittedOperationBeforeClose(leaseUUID string) error {
+func (b *Backend) settleCommittedOperationBeforeClose(ctx context.Context, leaseUUID string) error {
 	if b.callbackStore == nil || b.releaseStore == nil {
 		return nil
 	}
@@ -95,7 +95,7 @@ func (b *Backend) settleCommittedOperationBeforeClose(leaseUUID string) error {
 	if !committed {
 		return nil
 	}
-	proof, err := b.operationSettlement.ProveCommittedOperation(pending)
+	proof, err := b.operationSettlement.ProveCommittedOperation(ctx, pending)
 	if err != nil {
 		return fmt.Errorf("prove committed operation before close admission: %w", err)
 	}
@@ -111,7 +111,7 @@ func (b *Backend) settleCommittedOperationBeforeClose(leaseUUID string) error {
 // settleCommittedOperationBeforeMaintenance closes the operation-callback
 // write-ahead window before a restart, update, or autonomous custom-domain
 // replacement can append a new release in the same provision/restore lineage.
-func (b *Backend) settleCommittedOperationBeforeMaintenance(leaseUUID string) error {
+func (b *Backend) settleCommittedOperationBeforeMaintenance(ctx context.Context, leaseUUID string) error {
 	if b.callbackStore == nil || b.releaseStore == nil {
 		return nil
 	}
@@ -138,7 +138,7 @@ func (b *Backend) settleCommittedOperationBeforeMaintenance(leaseUUID string) er
 			backend.ErrInvalidState, leaseUUID,
 		)
 	}
-	proof, err := b.operationSettlement.ProveCommittedOperation(pending)
+	proof, err := b.operationSettlement.ProveCommittedOperation(ctx, pending)
 	if err != nil {
 		return fmt.Errorf("prove committed operation before maintenance admission: %w", err)
 	}

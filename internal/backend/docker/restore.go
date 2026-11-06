@@ -285,7 +285,7 @@ func (b *Backend) commitRecoveredRestore(
 		return fmt.Errorf("restore commit cannot execute plan %T", plan)
 	}
 	if decision, ok := plan.(restoreCommitPending); ok {
-		committed, err := b.operationSettlement.ProveCommittedOperation(decision.claim)
+		committed, err := b.operationSettlement.ProveCommittedOperation(ctx, decision.claim)
 		if err != nil {
 			return fmt.Errorf("prove committed restore operation for %q: %w", e.NewLeaseUUID, err)
 		}
@@ -336,7 +336,7 @@ func (b *Backend) ensureRestoreDestinationUnowned(destinationLease string) error
 // topology that the still-original finalizer cannot durably identify after a
 // crash; callers must first complete a plain Restart so Ready finalization can
 // consume the row.
-func (b *Backend) ensureRestoreDestinationRestartAvailable(destinationLease string) error {
+func (b *Backend) ensureRestoreDestinationRestartAvailable(ctx context.Context, destinationLease string) error {
 	if b.retentionStore == nil {
 		return nil
 	}
@@ -360,7 +360,7 @@ func (b *Backend) ensureRestoreDestinationRestartAvailable(destinationLease stri
 			backend.ErrInvalidState, destinationLease,
 		)
 	}
-	operation, err := b.currentRestoreOperation(*source)
+	operation, err := b.currentRestoreOperation(ctx, *source)
 	if err != nil {
 		if errors.Is(err, shared.ErrOperationIntentMissing) {
 			// The exact Release is already the irreversible ownership proof;
@@ -446,7 +446,7 @@ func (b *Backend) reconcileRestoringWithAuthorityUsing(
 			if err != nil {
 				return fmt.Errorf("validate restore commit for destination %q: %w", e.NewLeaseUUID, err)
 			}
-			operation, operationErr := b.currentRestoreOperation(e)
+			operation, operationErr := b.currentRestoreOperation(ctx, e)
 			if operationErr != nil && !errors.Is(operationErr, shared.ErrOperationIntentMissing) {
 				return fmt.Errorf("read exact restore operation for destination %q: %w",
 					e.NewLeaseUUID, operationErr)
@@ -657,7 +657,7 @@ func (b *Backend) settleRolledBackRestoreOperation(
 // admissible here: a restore can transition its durable state while a retention
 // sweep waits. Any pending claim that touches only one side (or a different
 // generation) is conflicting authority and therefore fails closed.
-func (b *Backend) currentRestoreOperation(e shared.RetentionEntry) (shared.OperationRecoveryState, error) {
+func (b *Backend) currentRestoreOperation(ctx context.Context, e shared.RetentionEntry) (shared.OperationRecoveryState, error) {
 	if b.operationSettlement == nil {
 		return nil, errors.New("operation settlement is required to recover a restore operation")
 	}
@@ -695,7 +695,7 @@ func (b *Backend) currentRestoreOperation(e shared.RetentionEntry) (shared.Opera
 	if err != nil {
 		return nil, fmt.Errorf("construct restore operation recovery probe: %w", err)
 	}
-	state, err := b.operationSettlement.LookupOperationRecovery(probe)
+	state, err := b.operationSettlement.LookupOperationRecovery(ctx, probe)
 	if err != nil {
 		return nil, err
 	}

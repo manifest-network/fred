@@ -116,7 +116,7 @@ type operationSettlementService interface {
 	ListOperationIntents() ([]shared.OperationIntentClaim, error)
 	ListOperationRecoveryStates() ([]shared.OperationRecoveryState, error)
 	ListFailedOperationReceipts() ([]shared.FailedOperationReceipt, error)
-	LookupOperationRecovery(shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
+	LookupOperationRecovery(context.Context, shared.OperationIntentProbe) (shared.OperationRecoveryState, error)
 	PrepareOperationRelease(shared.OperationIntentClaim) (shared.OperationReleaseCandidate, error)
 	ReserveProvisionResources(*shared.ResourcePool, shared.OperationIntentClaim) (shared.ProvisionAdmission, error)
 	CheckOperationReleaseCapacity(shared.OperationReleaseCandidate) error
@@ -128,7 +128,7 @@ type operationSettlementService interface {
 	CleanupFailedOperationReceipt(context.Context, shared.LeaseRecoveryScope, shared.FailedOperationReceipt) error
 	CommitOperationSuccess(shared.OperationExecutionSuccess) (shared.OperationReleaseCommitted, error)
 	CommitOperationFailure(shared.OperationExecutionFailure) (shared.OperationReleaseUncommitted, error)
-	ProveCommittedOperation(shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
+	ProveCommittedOperation(context.Context, shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
 }
 
 // releaseBackfillService is the pair-bound authority for enriching an active

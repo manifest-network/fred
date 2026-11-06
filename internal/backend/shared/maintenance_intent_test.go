@@ -1499,7 +1499,7 @@ func TestMaintenanceIntentPreservesTerminalOperationOnlyWithinSameAuthority(t *t
 			require.ErrorIs(t, err, ErrMaintenanceIntentConflict)
 			require.ErrorContains(t, err, "different backend storage, principal, or operation authority")
 
-			state, lookupErr := callbacks.LookupOperationRecovery(
+			state, lookupErr := callbacks.LookupOperationRecovery(t.Context(),
 				testOperationIntentProbe(t, callbacks, op, opIdentity),
 			)
 			require.NoError(t, lookupErr)

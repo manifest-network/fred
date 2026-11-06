@@ -136,7 +136,7 @@ func TestRestoreOperationAuthorityDerivesActiveHealthServices(t *testing.T) {
 			before := restoreAuthorityJournalBytes(t, b)
 			for _, validate := range []func() error{
 				func() error { return b.validateRestoreOperationAuthority(claims[0], entry) },
-				func() error { _, err := b.currentRestoreOperation(entry); return err },
+				func() error { _, err := b.currentRestoreOperation(t.Context(), entry); return err },
 			} {
 				err := validate()
 				if test.wantErr {

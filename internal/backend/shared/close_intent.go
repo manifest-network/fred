@@ -158,12 +158,6 @@ type CloseIntentClaim struct {
 	digest              [sha256.Size]byte
 }
 
-// Durable reports whether a close settlement issued c for a close intent it
-// committed. The zero value and a hand-assembled claim are not durable.
-func (c CloseIntentClaim) Durable() bool {
-	return c.settlement != nil && validateCloseIntentClaim(c) == nil
-}
-
 func (c CloseIntentClaim) IntentID() string {
 	if c.intentID == uuid.Nil {
 		return ""

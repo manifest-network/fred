@@ -1064,6 +1064,7 @@ func (s *CallbackStore) listFailedOperationReceipts() ([]FailedOperationReceipt,
 // Missing evidence is an error rather than an implicit outcome: recovery must
 // never turn journal absence into permission to commit or destroy substrate.
 func (s *CallbackStore) lookupOperationRecovery(
+	ctx context.Context,
 	probe OperationIntentProbe,
 ) (OperationRecoveryState, error) {
 	if probe.issuer != s || s == nil {
@@ -1075,10 +1076,15 @@ func (s *CallbackStore) lookupOperationRecovery(
 		return nil, err
 	}
 
-	unlock := s.lockDeliveryLease(probe.leaseUUID)
+	// The lease's delivery gate can be held across a publication's storage
+	// attestation, so the wait follows the caller's context.
+	unlock, err := s.lockDeliveryLeaseContext(ctx, probe.leaseUUID)
+	if err != nil {
+		return nil, fmt.Errorf("wait for the lease's callback delivery: %w", err)
+	}
 	defer unlock()
 	var state OperationRecoveryState
-	err := s.view(func(tx *bolt.Tx) error {
+	err = s.view(func(tx *bolt.Tx) error {
 		head, present, err := getLeaseMutationHeadTx(tx, probe.leaseUUID)
 		if err != nil {
 			return err

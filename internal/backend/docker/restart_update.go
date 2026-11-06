@@ -227,11 +227,11 @@ func (b *Backend) routeReplaceRestart(
 			return replayErr
 		}
 	}
-	if err := b.settleCommittedOperationBeforeMaintenance(leaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeMaintenance(ctx, leaseUUID); err != nil {
 		return err
 	}
 	if route.kind == shared.MaintenanceIntentRestart {
-		if err := b.ensureRestoreDestinationRestartAvailable(leaseUUID); err != nil {
+		if err := b.ensureRestoreDestinationRestartAvailable(ctx, leaseUUID); err != nil {
 			return err
 		}
 	} else if err := b.ensureRestoreDestinationUnowned(leaseUUID); err != nil {
@@ -514,7 +514,7 @@ func (b *Backend) update(
 		}
 	}
 	logger := b.logger.With("lease_uuid", req.LeaseUUID)
-	if err := b.settleCommittedOperationBeforeMaintenance(req.LeaseUUID); err != nil {
+	if err := b.settleCommittedOperationBeforeMaintenance(ctx, req.LeaseUUID); err != nil {
 		return err
 	}
 	if err := b.ensureRestoreDestinationUnowned(req.LeaseUUID); err != nil {

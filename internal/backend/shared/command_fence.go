@@ -43,11 +43,24 @@ type commandFenceOwner struct {
 	state     atomic.Uint32
 }
 
+// commandFenceOwnership is the closed set of an owner's states: it owns the
+// fence until it moves it to a new owner or releases it, and never again.
+type commandFenceOwnership uint32
+
 const (
-	commandFenceOwned uint32 = iota
+	commandFenceOwned commandFenceOwnership = iota
 	commandFenceMoved
 	commandFenceReleased
 )
+
+func (owner *commandFenceOwner) owns() bool {
+	return commandFenceOwnership(owner.state.Load()) == commandFenceOwned
+}
+
+// give ends this owner's ownership, as moved or released, if it still owns.
+func (owner *commandFenceOwner) give(to commandFenceOwnership) bool {
+	return owner.state.CompareAndSwap(uint32(commandFenceOwned), uint32(to))
+}
 
 // LeaseUUID names the lease whose fence this is, or "" for the zero value.
 func (hold CommandFenceHold) LeaseUUID() string {
@@ -61,14 +74,13 @@ func (hold CommandFenceHold) LeaseUUID() string {
 // minted by fence for that lease, and has been neither released nor moved.
 func (hold CommandFenceHold) Owns(fence *CommandFence, leaseUUID string) bool {
 	return hold.owner != nil && fence != nil && hold.owner.fence == fence &&
-		leaseUUID != "" && hold.owner.leaseUUID == leaseUUID &&
-		hold.owner.state.Load() == commandFenceOwned
+		leaseUUID != "" && hold.owner.leaseUUID == leaseUUID && hold.owner.owns()
 }
 
 // Transfer moves the ownership into a new hold, which the caller passes on
 // without keeping. It fails when hold no longer owns its fence.
 func (hold CommandFenceHold) Transfer() (CommandFenceHold, error) {
-	if hold.owner == nil || !hold.owner.state.CompareAndSwap(commandFenceOwned, commandFenceMoved) {
+	if hold.owner == nil || !hold.owner.give(commandFenceMoved) {
 		return CommandFenceHold{}, errors.New("command fence hold does not own its fence")
 	}
 	return hold.owner.fence.hold(hold.owner.leaseUUID, hold.owner.entry), nil
@@ -76,7 +88,7 @@ func (hold CommandFenceHold) Transfer() (CommandFenceHold, error) {
 
 // Release gives the fence back if hold still owns it.
 func (hold CommandFenceHold) Release() {
-	if hold.owner == nil || !hold.owner.state.CompareAndSwap(commandFenceOwned, commandFenceReleased) {
+	if hold.owner == nil || !hold.owner.give(commandFenceReleased) {
 		return
 	}
 	<-hold.owner.entry.held

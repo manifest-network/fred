@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
@@ -173,6 +174,37 @@ func TestCloseCallerStopsWaitingForIdentityVerification(t *testing.T) {
 	require.False(t, found, "nothing ran before identity was verified")
 	require.NoError(t, b.Deprovision(t.Context(), closeDeprovisionLeaseUUID))
 	closeCloseRecoveryBackend(t, b, stores)
+}
+
+// Only a close head committed in this backend's own journal proves a close
+// admitted here. Another backend's durable claim for the same lease UUID
+// cannot release this backend's command fence.
+func TestCloseHeadEvidenceIsBoundToTheBackendsOwnJournal(t *testing.T) {
+	local, localStores := openCloseRecoveryBackend(t, t.TempDir(), &mockDockerClient{}, nil)
+	seedCloseDeprovisionLease(t, local, localStores)
+	foreign, foreignStores := openCloseRecoveryBackend(t, t.TempDir(), &mockDockerClient{}, nil)
+	seedCloseDeprovisionLease(t, foreign, foreignStores)
+	bindBackendRecoveryCoordinatorForTest(t, local)
+	bindBackendRecoveryCoordinatorForTest(t, foreign)
+	lineage := local.recoveryCoordinator.Lineage()
+
+	foreignHead, found, err := foreign.acquireCloseIntent(t.Context(), closeDeprovisionLeaseUUID, true)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Error(t, lineage.ProvesCloseHead(foreignHead, closeDeprovisionLeaseUUID),
+		"another journal's head proves nothing here, even before this journal has one")
+
+	localHead, found, err := local.acquireCloseIntent(t.Context(), closeDeprovisionLeaseUUID, true)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NoError(t, lineage.ProvesCloseHead(localHead, closeDeprovisionLeaseUUID))
+	require.Error(t, lineage.ProvesCloseHead(foreignHead, closeDeprovisionLeaseUUID),
+		"another journal's head proves nothing here, even when this journal has one")
+	require.Error(t, lineage.ProvesCloseHead(localHead, "0192f1a0-3333-4abc-8def-000000000999"),
+		"a head proves only its own lease")
+	require.Error(t, shared.RecoveryLineage{}.ProvesCloseHead(localHead, closeDeprovisionLeaseUUID))
+	closeCloseRecoveryBackend(t, foreign, foreignStores)
+	closeCloseRecoveryBackend(t, local, localStores)
 }
 
 func TestIsLifecyclePendingRecognizesOnlyAClosePendingWithItsLease(t *testing.T) {

@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -53,12 +54,43 @@ type RecoveryCoordinator struct {
 
 // RecoveryLineage is an opaque comparable identity passed into a lease actor
 // at construction. Possessing it does not mint recovery authority; it only lets
-// the coordinator reject an active scope from another backend construction.
+// the coordinator reject an active scope from another backend construction,
+// and lets the actor check a close head against the coordinator's own close
+// journal.
 type RecoveryLineage struct{ identity *recoveryLineageIdentity }
 
-// Non-zero size is load-bearing: Go permits distinct zero-sized allocations
-// to have equal addresses, which would collapse two coordinator lineages.
-type recoveryLineageIdentity struct{ _ byte }
+// recoveryLineageIdentity is allocated once per coordinator. Its non-zero size
+// is load-bearing: Go permits distinct zero-sized allocations to have equal
+// addresses, which would collapse two coordinator lineages.
+type recoveryLineageIdentity struct {
+	// close is the coordinator's close settlement, or nil when it has none.
+	close *CloseSettlement
+}
+
+// ProvesCloseHead checks head as evidence that this lineage's own close journal
+// has committed a close of leaseUUID: the coordinator's close settlement issued
+// head, and head is still the lease's current close intent there. A claim from
+// another backend's journal, or a superseded one, proves nothing here.
+func (lineage RecoveryLineage) ProvesCloseHead(head CloseIntentClaim, leaseUUID string) error {
+	if lineage.identity == nil || lineage.identity.close == nil {
+		return errors.New("recovery lineage has no close journal")
+	}
+	settlement := lineage.identity.close
+	if err := settlement.requireClaim(head); err != nil {
+		return err
+	}
+	if leaseUUID == "" || head.LeaseUUID() != leaseUUID {
+		return errors.New("close head names another lease")
+	}
+	current, found, err := settlement.GetCloseIntent(leaseUUID)
+	if err != nil {
+		return fmt.Errorf("read the lease's close head: %w", err)
+	}
+	if !found || current.intentID != head.intentID || current.digest != head.digest {
+		return errors.New("close head is not the lease's current close intent")
+	}
+	return nil
+}
 
 // LeaseRecoveryScope is an opaque, exact-lease capability valid only while a
 // RecoveryCoordinator callback is running. Copies share revocation state, so a
@@ -93,7 +125,7 @@ func NewRecoveryCoordinator(config RecoveryCoordinatorConfig) (*RecoveryCoordina
 	coordinator := &RecoveryCoordinator{
 		operations: config.Operations, maintenance: config.Maintenance,
 		close: config.Close, exclude: config.ExcludeLease,
-		lineage:            RecoveryLineage{identity: &recoveryLineageIdentity{}},
+		lineage:            RecoveryLineage{identity: &recoveryLineageIdentity{close: config.Close}},
 		validateActorClose: config.ValidateActorClose,
 	}
 	if config.Operations != nil && config.Operations.recoveryCoordinator != nil {

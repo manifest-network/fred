@@ -892,7 +892,7 @@ func TestRecoverState_ActiveRestoreReleaseWithNoSurvivorsRemainsRepairableAcross
 	active, err := releases.LatestActive(destinationLease)
 	require.NoError(t, err)
 	require.NotNil(t, active, "runtime failure must not erase the committed destination")
-	assert.NoError(t, b.ensureRestoreDestinationRestartAvailable(destinationLease),
+	assert.NoError(t, b.ensureRestoreDestinationRestartAvailable(t.Context(), destinationLease),
 		"settled committed destinations must remain repairable")
 	require.ErrorIs(t, b.ensureRestoreDestinationUnowned(destinationLease), backend.ErrInvalidState)
 	require.NoError(t, b.RefreshState(context.Background()),
@@ -1267,13 +1267,17 @@ func TestCommittedRestoreSettlementBeforeCloseStopsAtTheCallersDeadline(t *testi
 	// production does.
 	rebuildCallbackSender(fixture.backend, testCallbackClient)
 	var calls atomic.Int32
+	var released atomic.Bool
+	var reachedOnce sync.Once
 	reached := make(chan struct{})
 	daemonInfo := fixture.docker.DaemonInfoFn
 	fixture.docker.DaemonInfoFn = func(ctx context.Context) (DaemonSecurityInfo, error) {
-		if calls.Add(1) == 1 {
-			return daemonInfo(ctx) // the close's own identity check
+		// The close's own identity check passes; every later attestation,
+		// including any background one, stalls until the close returns.
+		if calls.Add(1) == 1 || released.Load() {
+			return daemonInfo(ctx)
 		}
-		close(reached)
+		reachedOnce.Do(func() { close(reached) })
 		<-ctx.Done()
 		return DaemonSecurityInfo{}, ctx.Err()
 	}
@@ -1281,6 +1285,7 @@ func TestCommittedRestoreSettlementBeforeCloseStopsAtTheCallersDeadline(t *testi
 	defer cancel()
 	started := time.Now()
 	err := fixture.backend.Deprovision(waiting, fixture.destinationLease)
+	released.Store(true)
 	require.Less(t, time.Since(started), 5*time.Second, "the caller outlasted its deadline")
 	select {
 	case <-reached:
@@ -1291,6 +1296,56 @@ func TestCommittedRestoreSettlementBeforeCloseStopsAtTheCallersDeadline(t *testi
 	_, found, readErr := fixture.callbacks.GetCloseIntent(fixture.destinationLease)
 	require.NoError(t, readErr)
 	assert.False(t, found, "nothing is admitted before the restore settles")
+	fence, free := fixture.backend.commandFence.TryLock(fixture.destinationLease)
+	require.True(t, free, "an abandoned preparation gives the fence back")
+	fence.Release()
+}
+
+// Proving a committed restore before its destination's close waits for the
+// lease's callback delivery under the close caller's deadline. Another
+// publication can hold that gate across a slow identity attestation.
+func TestCommittedRestoreProofBeforeCloseStopsAtTheCallersDeadline(t *testing.T) {
+	fixture := newCommittedRestoreFixture(t, false)
+	fixture.projectDestination(fixture.callbackURL, fixture.lifecycleCallbackURL)
+	rebuildCallbackSender(fixture.backend, testCallbackClient)
+	var attestations atomic.Int32
+	attesting, finishAttesting := make(chan struct{}), make(chan struct{})
+	daemonInfo := fixture.docker.DaemonInfoFn
+	fixture.docker.DaemonInfoFn = func(ctx context.Context) (DaemonSecurityInfo, error) {
+		// The concurrent publication attests first outside, then inside the
+		// lease's delivery gate. The close starts only after that second one.
+		if attestations.Add(1) == 2 {
+			close(attesting)
+			<-finishAttesting
+		}
+		return daemonInfo(ctx)
+	}
+	pending, err := fixture.backend.pendingOperationIntentForLease(fixture.destinationLease)
+	require.NoError(t, err)
+	proof, err := fixture.backend.operationSettlement.ProveCommittedOperation(t.Context(), pending)
+	require.NoError(t, err)
+	published := make(chan error, 1)
+	go func() {
+		published <- fixture.backend.callbackPublisher.PublishOperationSuccessContext(t.Context(), proof)
+	}()
+	select {
+	case <-attesting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the concurrent publication never attested inside the delivery gate")
+	}
+
+	waiting, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = fixture.backend.Deprovision(waiting, fixture.destinationLease)
+	elapsed := time.Since(started)
+	close(finishAttesting)
+	require.NoError(t, <-published)
+	require.Less(t, elapsed, 2*time.Second, "the caller outlasted its deadline")
+	require.True(t, IsLifecyclePending(err), "%v", err)
+	_, found, readErr := fixture.callbacks.GetCloseIntent(fixture.destinationLease)
+	require.NoError(t, readErr)
+	assert.False(t, found, "nothing is admitted while the restore's proof waits")
 	fence, free := fixture.backend.commandFence.TryLock(fixture.destinationLease)
 	require.True(t, free, "an abandoned preparation gives the fence back")
 	fence.Release()

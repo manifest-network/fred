@@ -1757,8 +1757,9 @@ The lease's command fence, taken before the restore-destination check, moves
 into the close: the close command takes ownership of the hold, so no copy its
 caller kept can release it. It stays held until the close's durable head
 commits, however soon the request stops waiting, so no restore or other
-command can be admitted between that check and the head. Only the durable
-close claim releases it early; otherwise the close attempt's end does.
+command can be admitted between that check and the head. Only the lease's
+current close head in this backend's own journal releases it early; otherwise
+the close attempt's end does.
 Teardown runs without the fence, since the head refuses every other mutation. A retry that reaches the lease's actor just
 as the running close retires it is handed to the next actor, which answers it
 from the durable close journal.
