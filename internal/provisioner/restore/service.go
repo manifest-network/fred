@@ -133,11 +133,12 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 	execution := service.coordinator.ExecuteApplication(ctx, request)
 	backendName := execution.BackendName()
 	if errors.Is(execution.CallErr(), backend.ErrInsufficientResources) {
-		verdict := metrics.CapacityVerdictAmbiguous
+		verdicts := metrics.ForBackend(backendName).InsufficientResources
+		verdict := verdicts.Ambiguous
 		if execution.Refusal() == backend.RestoreRefusalCapacity {
-			verdict = metrics.CapacityVerdictCodedRefusal
+			verdict = verdicts.CodedRefusal
 		}
-		metrics.BackendInsufficientResourcesTotal.WithLabelValues(backendName, verdict).Inc()
+		verdict.Inc()
 	}
 	if execution.Disposition() == placement.RestoreApplicationAccepted {
 		if execution.Err() != nil {
@@ -176,7 +177,7 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		result.Outcome = OutcomeServiceUnavailable
 	}
 	if execution.DefinitivelyRefused() {
-		service.publishEventBestEffort(backendName, metrics.LifecycleEventRestoreRefused,
+		service.publishRefusalBestEffort(backendName,
 			backend.LeaseStatusEvent{
 				LeaseUUID: command.TargetLeaseUUID,
 				Status:    backend.ProvisionStatusFailed, Error: "restore did not start",
@@ -196,9 +197,8 @@ func (service *Service) accepted(command Command, backendName string) Result {
 	return Result{Outcome: OutcomeAccepted, BackendName: backendName}
 }
 
-func (service *Service) publishEventBestEffort(
+func (service *Service) publishRefusalBestEffort(
 	backendName string,
-	eventName string,
 	event backend.LeaseStatusEvent,
 ) {
 	if service.events == nil {
@@ -206,13 +206,11 @@ func (service *Service) publishEventBestEffort(
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-				eventName,
-			).Inc()
+			metrics.LifecycleEventSinkPanics.RestoreRefused.Inc()
 			slog.Error("restore lifecycle event sink panicked; continuing lifecycle settlement",
 				"lease_uuid", event.LeaseUUID,
 				"backend", backendName,
-				"event", eventName,
+				"event", metrics.LifecycleEventRestoreRefused,
 				"panic", recovered,
 				"stack", string(debug.Stack()),
 			)

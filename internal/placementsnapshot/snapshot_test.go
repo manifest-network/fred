@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -486,7 +487,9 @@ func TestEachAttemptCountsExactlyOneOutcome(t *testing.T) {
 	service, err := NewService(f.placements, f.payloads, f.snapshots, settings)
 	require.NoError(t, err)
 	counter := func(result outcome) float64 {
-		return testutil.ToFloat64(metrics.PlacementSnapshotsTotal.WithLabelValues(result.label()))
+		series, ok := result.counter(service.series)
+		require.True(t, ok)
+		return testutil.ToFloat64(series)
 	}
 	before := map[outcome]float64{}
 	for _, result := range outcomes {
@@ -495,13 +498,13 @@ func TestEachAttemptCountsExactlyOneOutcome(t *testing.T) {
 
 	result, report := service.snapshotOnce(t.Context(), time.Now())
 	require.Equal(t, outcomeSuccess, result)
-	record(result, report)
+	record(service.series, result, report)
 	assert.Len(t, f.entries(t), 3)
 
 	require.NoError(t, f.payloads.Close())
 	result, report = service.snapshotOnce(t.Context(), time.Now())
 	assert.Equal(t, outcomeError, result)
-	record(result, report)
+	record(service.series, result, report)
 
 	assert.InDelta(t, before[outcomeSuccess]+1, counter(outcomeSuccess), 0)
 	assert.InDelta(t, before[outcomeError]+1, counter(outcomeError), 0)
@@ -543,23 +546,28 @@ func TestSettingsAndServiceRefuseInvalidInputs(t *testing.T) {
 }
 
 func TestOutcomesAndPruneFailuresAreClosed(t *testing.T) {
-	seen := map[string]bool{}
+	series := metrics.BindPlacementSnapshots()
+	seen := map[prometheus.Counter]bool{}
 	for _, result := range outcomes {
-		label := result.label()
-		assert.NotEmpty(t, label)
-		assert.False(t, seen[label])
-		seen[label] = true
+		counter, ok := result.counter(series)
+		assert.True(t, ok)
+		assert.False(t, seen[counter], "every outcome has its own series")
+		seen[counter] = true
 	}
-	assert.Empty(t, outcomeInvalid.label())
-	assert.Empty(t, outcome(99).label())
+	_, ok := outcomeInvalid.counter(series)
+	assert.False(t, ok)
+	_, ok = outcome(99).counter(series)
+	assert.False(t, ok)
 	for _, failure := range pruneFailures {
-		label := failure.label()
-		assert.NotEmpty(t, label)
-		assert.False(t, seen[label])
-		seen[label] = true
+		counter, ok := failure.counter(series.PruneFailures)
+		assert.True(t, ok)
+		assert.False(t, seen[counter], "every prune failure has its own series")
+		seen[counter] = true
 	}
-	assert.Empty(t, pruneFailureInvalid.label())
-	assert.Empty(t, pruneFailure(99).label())
+	_, ok = pruneFailureInvalid.counter(series.PruneFailures)
+	assert.False(t, ok)
+	_, ok = pruneFailure(99).counter(series.PruneFailures)
+	assert.False(t, ok)
 	assert.Empty(t, fileKindInvalid.suffix())
 	assert.True(t, slices.Contains(setFileKinds[:], fileKindManifest))
 	assert.Equal(t, fileKindManifest, setFileKinds[0], "a set's manifest is deleted first")

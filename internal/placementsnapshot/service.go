@@ -7,6 +7,8 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -55,22 +57,24 @@ const (
 
 var outcomes = [...]outcome{outcomeSuccess, outcomeError, outcomeInsufficientSpace}
 
-func (result outcome) label() string {
+// counter is the result's series; the invalid zero value has none.
+func (result outcome) counter(series metrics.PlacementSnapshotCounters) (prometheus.Counter, bool) {
 	switch result {
 	case outcomeSuccess:
-		return "success"
+		return series.Success, true
 	case outcomeError:
-		return "error"
+		return series.Error, true
 	case outcomeInsufficientSpace:
-		return "insufficient_space"
+		return series.InsufficientSpace, true
 	default:
-		return ""
+		return nil, false
 	}
 }
 
 // Service snapshots both live stores into one directory on a fixed interval.
 // Only NewService mints one.
 type Service struct {
+	series     metrics.PlacementSnapshotCounters
 	placements *placement.Store
 	payloads   *payload.Store
 	directory  *Directory
@@ -94,13 +98,10 @@ func NewService(
 	if settings.interval <= 0 || settings.retain < 1 {
 		return nil, errors.New("snapshot settings are invalid")
 	}
-	for _, result := range outcomes {
-		metrics.PlacementSnapshotsTotal.WithLabelValues(result.label())
-	}
-	for _, failure := range pruneFailures {
-		metrics.PlacementSnapshotPruneFailuresTotal.WithLabelValues(failure.label())
-	}
 	return &Service{
+		// Bound here, not at package init: the series exist only while
+		// snapshots are configured.
+		series:     metrics.BindPlacementSnapshots(),
 		placements: placements,
 		payloads:   payloads,
 		directory:  directory,
@@ -126,7 +127,7 @@ func (service *Service) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 		result, report := service.snapshotOnce(ctx, time.Now())
-		record(result, report)
+		record(service.series, result, report)
 		timer.Reset(service.settings.interval)
 	}
 }
@@ -192,13 +193,13 @@ func hasRoom(available uint64, cutSize int64) bool {
 }
 
 // record counts one attempt exactly once, and every pruning failure.
-func record(result outcome, report pruneReport) {
-	if label := result.label(); label != "" {
-		metrics.PlacementSnapshotsTotal.WithLabelValues(label).Inc()
+func record(series metrics.PlacementSnapshotCounters, result outcome, report pruneReport) {
+	if counter, ok := result.counter(series); ok {
+		counter.Inc()
 	}
 	for failure, count := range report.failures {
-		if label := failure.label(); label != "" && count > 0 {
-			metrics.PlacementSnapshotPruneFailuresTotal.WithLabelValues(label).Add(float64(count))
+		if counter, ok := failure.counter(series.PruneFailures); ok && count > 0 {
+			counter.Add(float64(count))
 		}
 	}
 }

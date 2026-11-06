@@ -428,7 +428,7 @@ func (s *Server) handleProvisionCallback(w http.ResponseWriter, r *http.Request)
 		key = "legacy"
 	}
 	if s.callbackRateLimiter != nil && !s.callbackRateLimiter.get(key).Allow() {
-		metrics.RateLimitRejectionsTotal.WithLabelValues("callback_storage").Inc()
+		metrics.RateLimitRejections.CallbackStorage.Inc()
 		w.Header().Set("Retry-After", calcRetryAfterSeconds(s.callbackRateLimiter.rate))
 		writeError(w, "callback rate limit exceeded", http.StatusTooManyRequests)
 		return
@@ -597,7 +597,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 		// Record metrics
 		metrics.APIRequestDuration.WithLabelValues(r.Method, path, statusStr).Observe(duration.Seconds())
-		metrics.APIRequestsTotal.WithLabelValues(r.Method, path, statusStr).Inc()
+		metrics.CountAPIRequest(r.Method, path, statusStr)
 
 		slog.Info("http request",
 			"method", r.Method,

@@ -77,12 +77,16 @@ func TestZeroValuesNeverClose(t *testing.T) {
 	assert.False(t, Exhaustion{}.Valid(), "the zero proof is invalid")
 }
 
-func TestLabelsAreTheClosedSet(t *testing.T) {
-	assert.Equal(t, []string{"absent", "unknown", "retry", "exhausted"}, Labels())
+func TestPickCoversTheClosedSet(t *testing.T) {
+	want := map[kind]string{kindAbsent: "absent", kindUnknown: "unknown", kindRetry: "retry", kindExhausted: "exhausted"}
 	for raw := range 256 {
-		label := Verdict{kind: kind(raw)}.Label()
-		if kind(raw) >= kindSentinel {
-			assert.Equal(t, "absent", label, "kind %d outside the closed set", raw)
+		verdict := Verdict{kind: kind(raw)}
+		picked := Pick(verdict, "absent", "unknown", "retry", "exhausted")
+		assert.Equal(t, verdict.Label(), picked, "Pick and Label agree for kind %d", raw)
+		if expected, ok := want[kind(raw)]; ok {
+			assert.Equal(t, expected, picked, "kind %d", raw)
+		} else {
+			assert.Equal(t, "absent", picked, "kind %d outside the closed set", raw)
 		}
 		_, exhausted := Verdict{kind: kind(raw), leaseUUID: testLease, consecutiveFailures: 3}.Exhausted()
 		assert.Equal(t, kind(raw) == kindExhausted, exhausted, "kind %d", raw)

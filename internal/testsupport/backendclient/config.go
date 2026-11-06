@@ -43,14 +43,11 @@ type Config struct {
 	// Optional Prometheus metrics. When nil, metric recording is skipped.
 	// This prevents binaries that don't use these metrics (e.g., docker-backend)
 	// from registering phantom fred-level metrics via transitive imports.
-	RequestDuration     *prometheus.HistogramVec // labels: backend, operation, status
-	RequestsTotal       *prometheus.CounterVec   // labels: backend, operation, status
-	CircuitBreakerState *prometheus.GaugeVec     // labels: backend
-	// MalformedErrorBodyTotal counts client-error responses whose body was not
-	// the declared JSON error envelope. A backend contributing to this is
-	// off-contract (BACKEND_GUIDE.md) and its tenants are getting a generic
-	// message in place of a real diagnostic.
-	MalformedErrorBodyTotal *prometheus.CounterVec // labels: backend, operation
+	RequestDuration *prometheus.HistogramVec // labels: backend, operation, status
+	// RequestCounters binds the request and malformed-error-body counters of
+	// one backend operation.
+	RequestCounters     backend.RequestCounterBinder
+	CircuitBreakerState *prometheus.GaugeVec // labels: backend
 }
 
 func (cfg Config) options() backend.HTTPClientOptions {
@@ -72,8 +69,7 @@ func (cfg Config) options() backend.HTTPClientOptions {
 		ProvisionsPageLimit:      cfg.ProvisionsPageLimit,
 		RetentionsPageLimit:      cfg.RetentionsPageLimit,
 		RequestDuration:          cfg.RequestDuration,
-		RequestsTotal:            cfg.RequestsTotal,
+		RequestCounters:          cfg.RequestCounters,
 		CircuitBreakerState:      cfg.CircuitBreakerState,
-		MalformedErrorBodyTotal:  cfg.MalformedErrorBodyTotal,
 	}
 }

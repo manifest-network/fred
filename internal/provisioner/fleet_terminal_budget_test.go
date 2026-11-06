@@ -10,7 +10,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // TestFleet_TerminalBudgetDecidesFailedLeaseClose drives the providerd half of
@@ -43,7 +42,7 @@ func TestFleet_TerminalBudgetDecidesFailedLeaseClose(t *testing.T) {
 	labels := []string{"exhausted", "retry", "absent", "unknown"}
 	before := make(map[string]float64, len(labels))
 	for _, label := range labels {
-		before[label] = promtestutil.ToFloat64(metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(label))
+		before[label] = promtestutil.ToFloat64(terminalVerdictSeries(t, label))
 	}
 	for _, lease := range leases {
 		f.addLease(lease.name, billingtypes.LEASE_STATE_ACTIVE)
@@ -82,7 +81,7 @@ func TestFleet_TerminalBudgetDecidesFailedLeaseClose(t *testing.T) {
 		}
 	}
 	for _, label := range labels {
-		got := promtestutil.ToFloat64(metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(label)) - before[label]
+		got := promtestutil.ToFloat64(terminalVerdictSeries(t, label)) - before[label]
 		assert.Equal(t, 1.0, got, "one failed lease per verdict %s", label)
 	}
 

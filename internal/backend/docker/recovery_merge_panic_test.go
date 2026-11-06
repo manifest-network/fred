@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // The real merge emits this diagnostic while holding provisionsMu. A handler
@@ -53,7 +52,7 @@ func TestReconciliationMergePanicReleasesLeaseLocksAndRetries(t *testing.T) {
 		b.cfg.ReconcileInterval = time.Minute
 		handler := &mergePanicHandler{Handler: slog.DiscardHandler}
 		b.logger = slog.New(handler)
-		panics := background.CleanupPanicsTotal.WithLabelValues("docker_reconciliation")
+		panics := reconciliationCleanupPanics
 		beforePanics := testutil.ToFloat64(panics)
 		beforeSuccess := testutil.ToFloat64(reconciliationTotal.WithLabelValues("success"))
 		defer func() { b.stopCancel(); b.wg.Wait() }()

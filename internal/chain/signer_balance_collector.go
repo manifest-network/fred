@@ -44,12 +44,14 @@ const (
 // goroutines outside of Collect. This means the gauge naturally tracks the
 // live pool (e.g. after DemoteToSingleSigner) without any extra wiring.
 type SignerBalanceCollector struct {
-	bankQ           bankQuerier
-	pool            *SignerPool
-	denom           string
-	scrapeTimeout   time.Duration
-	desc            *prometheus.Desc
-	failuresCounter *prometheus.CounterVec
+	bankQ         bankQuerier
+	pool          *SignerPool
+	denom         string
+	scrapeTimeout time.Duration
+	desc          *prometheus.Desc
+	// failures holds each signer address's balance-query failure series,
+	// bound at construction so a first failure is visible to increase().
+	failures map[string]prometheus.Counter
 }
 
 // NewSignerBalanceCollector constructs a per-scrape signer balance collector.
@@ -69,8 +71,21 @@ func NewSignerBalanceCollector(bankQ bankQuerier, pool *SignerPool, denom string
 			[]string{"role", "address", "index", "denom"},
 			nil,
 		),
-		failuresCounter: metrics.SignerBalanceQueryFailures,
+		failures: bindBalanceQueryFailures(pool, denom),
 	}
+}
+
+// bindBalanceQueryFailures binds the failure series of every address the pool
+// holds now. The pool only ever shrinks (DemoteToSingleSigner), so every
+// address a later scrape queries is among them.
+func bindBalanceQueryFailures(pool *SignerPool, denom string) map[string]prometheus.Counter {
+	failures := map[string]prometheus.Counter{
+		pool.ProviderAddress(): metrics.BindSignerBalanceQueryFailure(signerRoleProvider, pool.ProviderAddress(), denom),
+	}
+	for _, address := range pool.SubSignerAddresses() {
+		failures[address] = metrics.BindSignerBalanceQueryFailure(signerRoleSubSigner, address, denom)
+	}
+	return failures
 }
 
 // Describe implements prometheus.Collector.
@@ -143,7 +158,9 @@ func (c *SignerBalanceCollector) Collect(ch chan<- prometheus.Metric) {
 				"denom", c.denom,
 				"error", r.err,
 			)
-			c.failuresCounter.WithLabelValues(t.role, t.addr, c.denom).Inc()
+			if failures, ok := c.failures[t.addr]; ok {
+				failures.Inc()
+			}
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(

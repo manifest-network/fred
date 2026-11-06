@@ -31,9 +31,9 @@ func fencedCallbackKeyring(t *testing.T) *CallbackKeyringAuthenticator {
 // Not parallel: these read process-global counters.
 func TestCallbackKeyringRefusesAFencedBackendsOwnCallback(t *testing.T) {
 	keyring := fencedCallbackKeyring(t)
-	fenced := metrics.APICallbackAuthFailuresTotal.WithLabelValues(metrics.CallbackAuthFailureFenced)
-	mismatch := metrics.APICallbackAuthFailuresTotal.WithLabelValues(metrics.CallbackAuthFailureMismatch)
-	verified := metrics.APICallbackSignatureKeyTotal.WithLabelValues("fenced-b", metrics.CallbackKeySlotCurrent)
+	fenced := metrics.CallbackAuthFailures.Fenced
+	mismatch := metrics.CallbackAuthFailures.Mismatch
+	verified := metrics.ForBackend("fenced-b").CallbackSignatureKey.Current
 	fencedBefore, mismatchBefore, verifiedBefore :=
 		promtestutil.ToFloat64(fenced), promtestutil.ToFloat64(mismatch), promtestutil.ToFloat64(verified)
 

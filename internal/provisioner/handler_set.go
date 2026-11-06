@@ -85,9 +85,9 @@ func NewHandlerSet(deps HandlerDeps) (*HandlerSet, error) {
 
 // HandleLeaseCreated processes new lease events.
 func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
-	defer func() { recordWatermillMetrics(TopicLeaseCreated, err) }()
+	defer func() { recordWatermillMetrics(leaseCreatedTopic, err) }()
 
-	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, TopicLeaseCreated)
+	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, leaseCreatedTopic)
 	if !ok {
 		return nil
 	}
@@ -131,25 +131,25 @@ func (h *HandlerSet) HandleLeaseCreated(msg *message.Message) (err error) {
 
 // HandleLeaseClosed processes lease closure events.
 func (h *HandlerSet) HandleLeaseClosed(msg *message.Message) (err error) {
-	defer func() { recordWatermillMetrics(TopicLeaseClosed, err) }()
-	return h.processLeaseClose(msg, TopicLeaseClosed)
+	defer func() { recordWatermillMetrics(leaseClosedTopic, err) }()
+	return h.processLeaseClose(msg, leaseClosedTopic)
 }
 
 // HandleLeaseExpired processes lease expiration events.
 // Same logic as HandleLeaseClosed but records metrics under the correct topic.
 func (h *HandlerSet) HandleLeaseExpired(msg *message.Message) (err error) {
-	defer func() { recordWatermillMetrics(TopicLeaseExpired, err) }()
-	return h.processLeaseClose(msg, TopicLeaseExpired)
+	defer func() { recordWatermillMetrics(leaseExpiredTopic, err) }()
+	return h.processLeaseClose(msg, leaseExpiredTopic)
 }
 
 // processLeaseClose is the shared implementation for HandleLeaseClosed and HandleLeaseExpired.
-func (h *HandlerSet) processLeaseClose(msg *message.Message, topic string) error {
+func (h *HandlerSet) processLeaseClose(msg *message.Message, topic messageTopic) error {
 	event, ok := unmarshalMessagePayload[chain.LeaseEvent](msg, topic)
 	if !ok {
 		return nil
 	}
 
-	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic)
+	slog.Info("processing lease close", "lease_uuid", event.LeaseUUID, "tenant", event.Tenant, "topic", topic.name)
 
 	// If the lease was still awaiting payload, update the gauge.
 	h.awaitingMu.Lock()
@@ -194,7 +194,7 @@ func (h *HandlerSet) HandleBackendCallbackEvidence(
 	ctx context.Context,
 	request hmacauth.VerifiedRequest,
 ) (err error) {
-	defer func() { recordWatermillMetrics(TopicBackendCallback, err) }()
+	defer func() { recordWatermillMetrics(backendCallbackTopic, err) }()
 	if h.callbacks == nil {
 		return errCallbackOperationsUnavailable
 	}
@@ -204,7 +204,7 @@ func (h *HandlerSet) HandleBackendCallbackEvidence(
 // HandlePayloadReceived processes payload upload events.
 // This triggers provisioning for leases that were waiting for a payload.
 func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
-	defer func() { recordWatermillMetrics(TopicPayloadReceived, err) }()
+	defer func() { recordWatermillMetrics(payloadReceivedTopic, err) }()
 
 	// Guard against nil payloadStore - this shouldn't happen in normal operation
 	// since payload events are only published after successful storage, but
@@ -214,7 +214,7 @@ func (h *HandlerSet) HandlePayloadReceived(msg *message.Message) (err error) {
 		return nil // Don't retry - configuration issue
 	}
 
-	event, ok := unmarshalMessagePayload[payload.Event](msg, TopicPayloadReceived)
+	event, ok := unmarshalMessagePayload[payload.Event](msg, payloadReceivedTopic)
 	if !ok {
 		return nil
 	}

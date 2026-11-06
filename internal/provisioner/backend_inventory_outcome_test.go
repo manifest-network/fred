@@ -3,6 +3,10 @@ package provisioner
 import (
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/metrics"
+
 	"github.com/stretchr/testify/assert"
 
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -34,20 +38,22 @@ func TestClassifyBackendInventoryCoversEveryEvidenceShape(t *testing.T) {
 		"a paired answer the sweep did not accept never counts as answered")
 }
 
-func TestBackendInventoryOutcomeLabelsAreClosedAndOnlyKeptEvidenceAnswers(t *testing.T) {
-	assert.Empty(t, backendInventoryOutcomeInvalid.label(), "the zero value is never exported")
+func TestBackendInventoryOutcomeSeriesAreClosedAndOnlyKeptEvidenceAnswers(t *testing.T) {
+	counters := metrics.ForBackend("inventory-outcome-test").Inventory
+	_, ok := backendInventoryOutcomeInvalid.counter(counters)
+	assert.False(t, ok, "the zero value is never exported")
 	assert.False(t, backendInventoryOutcomeInvalid.answered())
 
-	labels := make(map[string]struct{}, len(backendInventoryOutcomes))
+	seen := make(map[prometheus.Counter]struct{}, len(backendInventoryOutcomes))
 	for _, outcome := range backendInventoryOutcomes {
-		label := outcome.label()
-		assert.NotEmpty(t, label)
-		assert.NotContains(t, labels, label, "every outcome has its own label")
-		labels[label] = struct{}{}
+		counter, ok := outcome.counter(counters)
+		assert.True(t, ok)
+		assert.NotContains(t, seen, counter, "every outcome has its own series")
+		seen[counter] = struct{}{}
 	}
 	for _, outcome := range backendInventoryOutcomes {
 		want := outcome == backendInventoryOutcomeAuthoritative ||
 			outcome == backendInventoryOutcomePartial
-		assert.Equal(t, want, outcome.answered(), outcome.label())
+		assert.Equal(t, want, outcome.answered(), "outcome %d", outcome)
 	}
 }

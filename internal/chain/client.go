@@ -302,7 +302,7 @@ func (c *Client) simulateGas(ctx context.Context, signer *Signer, msgs []sdktype
 		return 0, accResp.Account, fmt.Errorf("simulate: %w", err)
 	}
 	if signer.maxGasLimit > 0 && adjusted > signer.maxGasLimit {
-		metrics.GasSimulationTotal.WithLabelValues("refused").Inc()
+		metrics.GasSimulation.Refused.Inc()
 		return 0, accResp.Account, fmt.Errorf("%w: estimated gas %d exceeds max_gas_limit %d", errGasExceedsCap, adjusted, signer.maxGasLimit)
 	}
 	return adjusted, accResp.Account, nil
@@ -315,12 +315,12 @@ func recordQueryMetrics(queryName string, start time.Time) {
 }
 
 // recordTxMetrics records outcome for a chain transaction.
-func recordTxMetrics(txType string, err error) {
-	outcome := metrics.OutcomeSuccess
+func recordTxMetrics(tx metrics.MessageOutcomeCounters, err error) {
 	if err != nil {
-		outcome = metrics.OutcomeError
+		tx.Error.Inc()
+		return
 	}
-	metrics.ChainTxTotal.WithLabelValues(txType, outcome).Inc()
+	tx.Success.Inc()
 }
 
 // Ping checks if the chain connection is healthy by querying the signer's account.
@@ -425,7 +425,8 @@ func (c *Client) GetProvider(ctx context.Context, providerUUID string) (*skutype
 // for each batch using msgFactory, broadcasting it, and recording metrics.
 //
 // Parameters:
-//   - metricType: base verb for metrics and errors (e.g., "acknowledge", "reject", "close")
+//   - metricType: base verb for errors (e.g., "acknowledge", "reject", "close")
+//   - txMetrics: the transaction counters of that verb
 //   - opName: operation name for structured log field (e.g., "acknowledged", "rejected", "closed")
 //   - msgFactory: creates the appropriate message type for each batch
 //   - extraLogAttrs: additional key-value pairs to include in log output
@@ -436,6 +437,7 @@ func (c *Client) broadcastBatchedMsgs(
 	ctx context.Context,
 	leaseUUIDs []string,
 	metricType string,
+	txMetrics metrics.MessageOutcomeCounters,
 	opName string,
 	msgFactory func(batch []string) sdktypes.Msg,
 	extraLogAttrs ...any,
@@ -472,7 +474,7 @@ func (c *Client) broadcastBatchedMsgs(
 			}
 
 			txHash, err := c.broadcastTxWithSigner(ctx, held, []sdktypes.Msg{msg}, defaultBroadcastOpts())
-			recordTxMetrics(metricType, err)
+			recordTxMetrics(txMetrics, err)
 			if err != nil {
 				return fmt.Errorf("failed to %s leases: %w", metricType, err)
 			}
@@ -494,7 +496,7 @@ func (c *Client) broadcastBatchedMsgs(
 
 // AcknowledgeLeases acknowledges the given leases. Returns the number of leases acknowledged and tx hashes.
 func (c *Client) AcknowledgeLeases(ctx context.Context, leaseUUIDs []string) (uint64, []string, error) {
-	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "acknowledge", "acknowledged",
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "acknowledge", metrics.ChainTx.Acknowledge, "acknowledged",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgAcknowledgeLease{
 				Sender:     c.providerAddress,
@@ -527,7 +529,7 @@ func (c *Client) WithdrawByProvider(ctx context.Context, providerUUID string, ke
 	}
 
 	txHash, err := c.broadcastTx(ctx, msg)
-	recordTxMetrics("withdraw", err)
+	recordTxMetrics(metrics.ChainTx.Withdraw, err)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to withdraw: %w", err)
 	}
@@ -646,15 +648,15 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, held heldSigner, msg
 		case simErr != nil:
 			c.simBreaker.recordFailure(c.now())
 			simGas = fallbackGasOrRaw(signer)
-			metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+			metrics.GasSimulation.Fallback.Inc()
 			slog.Warn("gas simulation failed; using fallback ceiling", "error", simErr, "fallback_gas", simGas)
 		default:
 			c.simBreaker.recordSuccess()
-			metrics.GasSimulationTotal.WithLabelValues("simulated").Inc()
+			metrics.GasSimulation.Simulated.Inc()
 		}
 	} else {
 		simGas = fallbackGasOrRaw(signer) // breaker open: skip Simulate (no RPC round-trip)
-		metrics.GasSimulationTotal.WithLabelValues("fallback").Inc()
+		metrics.GasSimulation.Fallback.Inc()
 	}
 	metrics.GasSimulated.Observe(float64(simGas))
 	// SOLE declaration of gasLimitOverride at function scope. The OOG closure
@@ -727,10 +729,10 @@ func (c *Client) broadcastTxWithSigner(ctx context.Context, held heldSigner, msg
 				increased = min(increased, stdmath.MaxInt64)
 				if increased == currentGas {
 					// Already at the cap; retrying with the same gas is futile.
-					metrics.SignerOOGRetriesTotal.WithLabelValues("exhausted").Inc()
+					metrics.SignerOOGRetries.Exhausted.Inc()
 					return backoff.Permanent(err)
 				}
-				metrics.SignerOOGRetriesTotal.WithLabelValues("retried").Inc()
+				metrics.SignerOOGRetries.Retried.Inc()
 				gasLimitOverride = &increased
 			}
 		}
@@ -1034,7 +1036,7 @@ func (c *Client) GetProviderWithdrawable(ctx context.Context, providerUUID strin
 // Returns the number of leases rejected and tx hashes.
 // This is used when provisioning fails and the provider cannot fulfill the lease.
 func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
-	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "reject", "rejected",
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "reject", metrics.ChainTx.Reject, "rejected",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgRejectLease{
 				Sender:     c.providerAddress,
@@ -1048,7 +1050,7 @@ func (c *Client) RejectLeases(ctx context.Context, leaseUUIDs []string, reason s
 
 // CloseLeases closes the given leases with an optional reason. Returns the number of leases closed and tx hashes.
 func (c *Client) CloseLeases(ctx context.Context, leaseUUIDs []string, reason string) (uint64, []string, error) {
-	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "close", "closed",
+	return c.broadcastBatchedMsgs(ctx, leaseUUIDs, "close", metrics.ChainTx.Close, "closed",
 		func(batch []string) sdktypes.Msg {
 			return &billingtypes.MsgCloseLease{
 				Sender:     c.providerAddress,

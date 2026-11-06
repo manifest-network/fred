@@ -20,8 +20,6 @@ const (
 	kindUnknown
 	kindRetry
 	kindExhausted
-	// kindSentinel bounds the closed set. It is never a valid verdict.
-	kindSentinel
 )
 
 // FromProvision reads one ProvisionInfo from complete inventory. It is the only
@@ -65,14 +63,20 @@ func (v Verdict) Label() string {
 	}
 }
 
-// Labels returns every verdict label in a fixed order, so a metric can be
-// pre-initialized with exactly the closed set.
-func Labels() []string {
-	labels := make([]string, 0, int(kindSentinel))
-	for k := kindAbsent; k < kindSentinel; k++ {
-		labels = append(labels, Verdict{kind: k}.Label())
+// Pick returns the value of v's verdict among one value per verdict. Taking
+// every verdict's value makes a caller handle the whole closed set, so a metric
+// keyed by verdict has a series for each one.
+func Pick[T any](v Verdict, absent, unknown, retry, exhausted T) T {
+	switch v.kind {
+	case kindRetry:
+		return retry
+	case kindExhausted:
+		return exhausted
+	case kindUnknown:
+		return unknown
+	default:
+		return absent
 	}
-	return labels
 }
 
 // ConsecutiveFailures is the backend's recorded count, for logs only. It never

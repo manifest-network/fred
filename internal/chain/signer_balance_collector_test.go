@@ -63,12 +63,10 @@ func gatherGaugeSeries(t *testing.T, reg *prometheus.Registry) []gaugeSample {
 
 // newCollectorForTest constructs a SignerBalanceCollector wired to a fresh
 // Prometheus registry. It returns the collector and the registry so callers
-// can gather/assert without polluting prometheus.DefaultRegisterer. The
-// failures counter (metrics.SignerBalanceQueryFailures) is global; tests
-// Reset it before use.
+// can gather/assert without polluting prometheus.DefaultRegisterer. Each test
+// pool's addresses are freshly generated, so their failure series start at 0.
 func newCollectorForTest(t *testing.T, bankQ bankQuerier, pool *SignerPool, denom string, timeout time.Duration) (*SignerBalanceCollector, *prometheus.Registry) {
 	t.Helper()
-	metrics.SignerBalanceQueryFailures.Reset()
 	collector := NewSignerBalanceCollector(bankQ, pool, denom, timeout)
 	reg := prometheus.NewRegistry()
 	require.NoError(t, reg.Register(collector))
@@ -168,17 +166,17 @@ func TestSignerBalanceCollector_PerAddressFailure_DropsSeriesAndIncrementsCounte
 		assert.NotEqual(t, failAddr, s.address, "series for failing address should not be emitted")
 	}
 	// Provider still present
-	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", failAddr, "umfx")))
+	assert.Equal(t, 1.0, balanceQueryFailures("sub_signer", failAddr))
 	// No counter increment for provider or for other sub-signers.
-	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", providerAddr, "umfx")))
-	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", subAddrs[0], "umfx")))
-	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", subAddrs[2], "umfx")))
+	assert.Equal(t, 0.0, balanceQueryFailures("provider", providerAddr))
+	assert.Equal(t, 0.0, balanceQueryFailures("sub_signer", subAddrs[0]))
+	assert.Equal(t, 0.0, balanceQueryFailures("sub_signer", subAddrs[2]))
 
 	// Second scrape: same failure → counter at 2, still no series for index 1.
 	_ = collector // keep reference
 	samples2 := gatherGaugeSeries(t, reg)
 	require.Len(t, samples2, 3)
-	assert.Equal(t, 2.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", failAddr, "umfx")))
+	assert.Equal(t, 2.0, balanceQueryFailures("sub_signer", failAddr))
 }
 
 func TestSignerBalanceCollector_AllQueriesFail_NoGaugeSeries(t *testing.T) {
@@ -196,9 +194,9 @@ func TestSignerBalanceCollector_AllQueriesFail_NoGaugeSeries(t *testing.T) {
 	samples := gatherGaugeSeries(t, reg)
 	require.Empty(t, samples, "no gauge series when all queries fail")
 
-	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", providerAddr, "umfx")))
+	assert.Equal(t, 1.0, balanceQueryFailures("provider", providerAddr))
 	for _, addr := range subAddrs {
-		assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", addr, "umfx")))
+		assert.Equal(t, 1.0, balanceQueryFailures("sub_signer", addr))
 	}
 }
 
@@ -224,9 +222,9 @@ func TestSignerBalanceCollector_ContextTimeout_DoesNotBlockScrape(t *testing.T) 
 	assert.Empty(t, samples, "no gauge series should be emitted on timeout")
 
 	// All 1+N addresses bumped the failures counter.
-	assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
+	assert.Equal(t, 1.0, balanceQueryFailures("provider", pool.ProviderAddress()))
 	for _, addr := range pool.SubSignerAddresses() {
-		assert.Equal(t, 1.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("sub_signer", addr, "umfx")))
+		assert.Equal(t, 1.0, balanceQueryFailures("sub_signer", addr))
 	}
 }
 
@@ -322,7 +320,7 @@ func TestSignerBalanceCollector_LargeBalance_EmitsGaugeNoFailure(t *testing.T) {
 	assert.InEpsilon(t, 1e29, v, 1e-6, "gauge value must approximate the 1e29 balance within float64 rounding")
 
 	// A valid large balance is NOT a query failure: the counter stays at zero.
-	assert.Equal(t, 0.0, promtestutil.ToFloat64(metrics.SignerBalanceQueryFailures.WithLabelValues("provider", pool.ProviderAddress(), "umfx")))
+	assert.Equal(t, 0.0, balanceQueryFailures("provider", pool.ProviderAddress()))
 }
 
 // TestSignerBalanceCollector_NonDefaultDenom_PropagatesThroughQueryAndLabel
@@ -365,4 +363,9 @@ func TestSignerBalanceCollector_NonDefaultDenom_PropagatesThroughQueryAndLabel(t
 	for _, s := range samples {
 		assert.Equal(t, testDenom, s.denom, "gauge series must carry the configured denom label (not a hard-coded umfx)")
 	}
+}
+
+// balanceQueryFailures reads the failure series of one signer address.
+func balanceQueryFailures(role, address string) float64 {
+	return promtestutil.ToFloat64(metrics.BindSignerBalanceQueryFailure(role, address, "umfx"))
 }

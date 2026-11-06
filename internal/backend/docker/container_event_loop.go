@@ -8,7 +8,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm/failurecause"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // The container event loop delivers container deaths to their lease actors
@@ -238,7 +237,7 @@ func (b *Backend) logContainerDeathOverflow(dropped uint64) {
 		if value == nil {
 			return
 		}
-		background.GoroutinePanicsTotal.WithLabelValues(containerDeathOverflowReporter).Inc()
+		containerDeathOverflowPanics.Inc()
 		// The handler most likely panicked itself, so reporting the panic
 		// through it is best effort: a second panic ends here.
 		defer func() { _ = recover() }()

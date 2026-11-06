@@ -17,7 +17,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 func eventStreamCount(outcome string) float64 {
@@ -344,7 +343,7 @@ func TestContainerDeathOverflowReporter_ContainsLogHandlerPanics(t *testing.T) {
 		b := &Backend{logger: slog.New(handler)}
 		overflow := newContainerDeathOverflow()
 		ctx, cancel := context.WithCancel(context.Background())
-		panics := background.GoroutinePanicsTotal.WithLabelValues(containerDeathOverflowReporter)
+		panics := containerDeathOverflowPanics
 		before := testutil.ToFloat64(panics)
 		done := make(chan struct{})
 		go func() {

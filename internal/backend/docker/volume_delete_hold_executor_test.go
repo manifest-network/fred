@@ -19,7 +19,6 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 func dueHold(t *testing.T, name string, lastAttempt time.Time) volumeDeleteHoldView {
@@ -344,7 +343,7 @@ func TestVolumeDeleteHoldIterationCountsPanics(t *testing.T) {
 			return volumeDeleteHoldPassReport{}
 		},
 	}
-	panics := background.CleanupPanicsTotal.WithLabelValues(volumeDeleteHoldComponent)
+	panics := volumeDeleteHoldCleanupPanics
 	before := testutil.ToFloat64(panics)
 	b.runVolumeDeleteHoldIteration()
 	assert.Equal(t, before+1, testutil.ToFloat64(panics))

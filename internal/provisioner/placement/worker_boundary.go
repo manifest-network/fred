@@ -44,11 +44,11 @@ type workerStageEntry struct {
 var workerStages = [...]workerStageEntry{
 	workerChainInventory: {
 		name:   "chain inventory read",
-		panics: metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_chain_leases"),
+		panics: metrics.ReconcilerPanics.FetchChainLeases,
 	},
 	workerMaintenanceRecovery: {
 		name:   "maintenance recovery",
-		panics: background.GoroutinePanicsTotal.WithLabelValues("maintenance_recovery"),
+		panics: background.GoroutinePanics("maintenance_recovery"),
 	},
 }
 

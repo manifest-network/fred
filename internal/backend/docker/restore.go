@@ -17,7 +17,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -1513,7 +1512,7 @@ func (b *Backend) startRetentionReaper() {
 	b.wg.Go(func() {
 		util.StartCleanupLoop(b.stopCtx, interval, func() error {
 			return b.runRetentionSweep(b.stopCtx)
-		}, "retention", func(any) { background.CleanupPanicsTotal.WithLabelValues("retention").Inc() })
+		}, "retention", func(any) { retentionCleanupPanics.Inc() })
 	})
 }
 

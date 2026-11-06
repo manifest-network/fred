@@ -111,8 +111,9 @@ func (p *placementPruner) pruneTerminalCandidate(
 			"lease_uuid", leaseUUID, "error", result.Err())
 	}
 	if metricReason != "" {
-		metrics.ReconcilerCleanupSkipsTotal.
-			WithLabelValues(metrics.CleanupPassPlacement, metricReason).Inc()
+		if skipped, ok := metrics.ReconcilerCleanupSkips.Placement.ForReason(metricReason); ok {
+			skipped.Inc()
+		}
 	}
 	return false
 }
@@ -162,7 +163,7 @@ schedule:
 			// neither crash providerd nor prevent healthy candidates from pruning.
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					metrics.ReconcilerPanicsTotal.WithLabelValues("placement_cleanup").Inc()
+					metrics.ReconcilerPanics.PlacementCleanup.Inc()
 					slog.Error("reconciler placement cleanup panic; preserving exact record",
 						"lease_uuid", leaseUUID,
 						"panic", recovered,
@@ -204,8 +205,7 @@ schedule:
 							}
 						}
 					}
-					metrics.ReconcilerCleanupSkipsTotal.
-						WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipAttemptPending).Inc()
+					metrics.ReconcilerCleanupSkips.Placement.AttemptPending.Inc()
 					slog.Debug("reconcile: keeping placement with unresolved backend attempt",
 						"lease_uuid", leaseUUID,
 						"backend", record.Backend,
@@ -223,8 +223,7 @@ schedule:
 					continue
 				}
 				if !projected.HasPruneAbsence(leaseUUID) {
-					metrics.ReconcilerCleanupSkipsTotal.
-						WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent).Inc()
+					metrics.ReconcilerCleanupSkips.Placement.BackendSilent.Inc()
 					slog.Debug("reconcile: keeping placement without projection-minted absence proof",
 						"lease_uuid", leaseUUID,
 						"backend", record.Backend,

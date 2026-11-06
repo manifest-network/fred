@@ -98,7 +98,7 @@ func TestActiveReleaseManifestPropagatesTheBackendError(t *testing.T) {
 }
 
 func TestActiveReleaseManifestRecoversABackendPanic(t *testing.T) {
-	counter := metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_releases")
+	counter := metrics.ReconcilerPanics.FetchReleases
 	before := promtestutil.ToFloat64(counter)
 	coordinator := releaseReaderForTest(t, &executionTestBackend{
 		name: "backend-a",

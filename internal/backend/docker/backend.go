@@ -28,7 +28,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // dockerReadClient is the only Docker API surface retained by Backend. Tenant
@@ -2398,7 +2397,7 @@ func newBackend(
 	cbStore, err := shared.OpenIdentityBoundCallbackStore(shared.CallbackStoreConfig{
 		DBPath:         cfg.CallbackDBPath,
 		MaxAge:         cfg.CallbackMaxAge,
-		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("callback").Inc() },
+		OnCleanupPanic: func(any) { callbackCleanupPanics.Inc() },
 	}, storage, storeAuthorityGate)
 	if err != nil {
 		_ = docker.Close()
@@ -2408,7 +2407,7 @@ func newBackend(
 	diagStore, err := shared.NewDiagnosticsStore(shared.DiagnosticsStoreConfig{
 		DBPath:         cfg.DiagnosticsDBPath,
 		MaxAge:         cfg.DiagnosticsMaxAge,
-		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("diagnostics").Inc() },
+		OnCleanupPanic: func(any) { diagnosticsCleanupPanics.Inc() },
 	})
 	if err != nil {
 		_ = cbStore.Close()
@@ -2419,7 +2418,7 @@ func newBackend(
 	releaseStore, err := shared.OpenIdentityBoundReleaseStore(shared.ReleaseStoreConfig{
 		DBPath:         cfg.ReleasesDBPath,
 		MaxAge:         cfg.ReleasesMaxAge,
-		OnCleanupPanic: func(any) { background.CleanupPanicsTotal.WithLabelValues("releases").Inc() },
+		OnCleanupPanic: func(any) { releasesCleanupPanics.Inc() },
 	}, storage, storeAuthorityGate)
 	if err != nil {
 		_ = cbStore.Close()
@@ -2641,7 +2640,7 @@ func newBackend(
 			callbackStoreErrorsTotal.Inc()
 		},
 		OnReplayPanic: func(any) {
-			background.GoroutinePanicsTotal.WithLabelValues("callback_replay").Inc()
+			callbackReplayPanics.Inc()
 		},
 	})
 	if err != nil {

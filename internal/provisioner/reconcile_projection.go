@@ -261,7 +261,7 @@ func (r *Reconciler) projectPlacementInventory(
 						"panic", rec,
 						"stack", string(debug.Stack()),
 					)
-					metrics.ReconcilerPanicsTotal.WithLabelValues("check_placement_marker").Inc()
+					metrics.ReconcilerPanics.CheckPlacementMarker.Inc()
 					goErr = nil
 				}
 			}()

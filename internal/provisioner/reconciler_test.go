@@ -2719,7 +2719,7 @@ func TestReconciler_ReconcileAll_ActiveFailedExhausted(t *testing.T) {
 	var closedLeases []string
 	var closedReason string
 	var mu sync.Mutex
-	exhaustedVerdicts := metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues("exhausted")
+	exhaustedVerdicts := metrics.ReconcilerTerminalVerdicts.Exhausted
 	exhaustedBefore := promtestutil.ToFloat64(exhaustedVerdicts)
 
 	mockChain := &chaintest.MockClient{
@@ -2831,7 +2831,7 @@ func TestReconciler_ReconcileAll_UnresolvablePlacement_RefusesWithoutTerminating
 
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, newMockInFlightTracker(nil), ps)
 	require.NoError(t, err)
-	leaseErrorActions := metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError)
+	leaseErrorActions := metrics.ReconcilerActions.LeaseError
 	leaseErrorsBefore := promtestutil.ToFloat64(leaseErrorActions)
 
 	// The sweep itself must not fail: one refused lease is a per-lease error,
@@ -2958,7 +2958,7 @@ func TestReconciler_FailCountAloneNeverCloses(t *testing.T) {
 			})
 			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, nil, nil)
 			require.NoError(t, err)
-			verdicts := metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(test.label)
+			verdicts := terminalVerdictSeries(t, test.label)
 			before := promtestutil.ToFloat64(verdicts)
 
 			assert.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -4171,7 +4171,7 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 	cleanupSkipsBefore := make(map[string]float64, len(cleanupReasons))
 	for _, reason := range cleanupReasons {
 		cleanupSkipsBefore[reason] = promtestutil.ToFloat64(
-			metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPlacement, reason),
+			cleanupSkipSeries(t, metrics.ReconcilerCleanupSkips.Placement, reason),
 		)
 	}
 
@@ -4186,7 +4186,7 @@ func TestReconciler_PrunesOnlyPositivelyTerminalPlacementAbsenceMarkers(t *testi
 		"a failed point lookup must keep the fail-closed marker")
 	for _, reason := range cleanupReasons {
 		assert.Equal(t, cleanupSkipsBefore[reason], promtestutil.ToFloat64(
-			metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPlacement, reason),
+			cleanupSkipSeries(t, metrics.ReconcilerCleanupSkips.Placement, reason),
 		), "marker retirement is bookkeeping, not withheld destructive cleanup (%s)", reason)
 	}
 }
@@ -4310,7 +4310,7 @@ func TestReconciler_PlacementMarkerCheckPanicDoesNotCrashFred(t *testing.T) {
 	require.NoError(t, err)
 	seedReconciliationAbsenceUntrusted(t, r, "panic-marker", "backend-a")
 
-	panics := metrics.ReconcilerPanicsTotal.WithLabelValues("check_placement_marker")
+	panics := metrics.ReconcilerPanics.CheckPlacementMarker
 	before := promtestutil.ToFloat64(panics)
 	var reconcileErr error
 	require.NotPanics(t, func() {
@@ -5178,7 +5178,7 @@ func TestReconciler_ReconcileAll_OrphanRecheck(t *testing.T) {
 			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, nil, nil)
 			require.NoError(t, err)
 
-			skips := metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassOrphan, tc.wantReason)
+			skips := cleanupSkipSeries(t, metrics.ReconcilerCleanupSkips.Orphan, tc.wantReason)
 			before := promtestutil.ToFloat64(skips)
 			inflightBefore := promtestutil.ToFloat64(metrics.ReconcilerInflightSkipsTotal)
 			const previousSuccess = 123.0
@@ -5249,8 +5249,7 @@ func TestReconciler_ConfirmTerminal_BoundsTheChainLookup(t *testing.T) {
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, nil, nil)
 	require.NoError(t, err)
 
-	skips := metrics.ReconcilerCleanupSkipsTotal.
-		WithLabelValues(metrics.CleanupPassOrphan, metrics.CleanupSkipChainError)
+	skips := cleanupSkipSeries(t, metrics.ReconcilerCleanupSkips.Orphan, metrics.CleanupSkipChainError)
 	before := promtestutil.ToFloat64(skips)
 
 	// t.Context() has no deadline of its own, so any deadline the lookup sees is
@@ -5296,7 +5295,7 @@ func TestReconciler_CleanupOrphanedPayloads_ChainErrorKeepsPayload(t *testing.T)
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, newMockInFlightTracker(payloadStore), nil)
 	require.NoError(t, err)
 
-	skips := metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(metrics.CleanupPassPayload, metrics.CleanupSkipChainError)
+	skips := metrics.ReconcilerCleanupSkips.Payload.ChainError
 	before := promtestutil.ToFloat64(skips)
 	require.NoError(t, reconciler.ReconcileAll(t.Context()))
 	after := promtestutil.ToFloat64(skips)
@@ -6754,8 +6753,8 @@ func TestReconciler_CycleCompletenessRequiresInventoriesAndProjection(t *testing
 			metrics.ReconcilerLastSuccessTimestamp.Set(previousSuccess)
 			metrics.ReconcilerSweepComplete.Set(1)
 			metrics.ReconcilerSweepProjectionCommitted.Set(1)
-			degraded := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded)
-			success := metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess)
+			degraded := metrics.ReconcilerRuns.Degraded
+			success := metrics.ReconcilerRuns.Success
 			degradedBefore := promtestutil.ToFloat64(degraded)
 			successBefore := promtestutil.ToFloat64(success)
 
@@ -6801,9 +6800,7 @@ func TestReconciler_InsufficientResources_IncrementsMetric(t *testing.T) {
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, noopAck, router, tracker, nil)
 	require.NoError(t, err)
 
-	counter := metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-		"cap-backend", metrics.CapacityVerdictAmbiguous,
-	)
+	counter := capacityVerdictSeries(t, "cap-backend", metrics.CapacityVerdictAmbiguous)
 	before := promtestutil.ToFloat64(counter)
 
 	_ = reconciler.ReconcileAll(t.Context())
@@ -6887,9 +6884,7 @@ func TestReconciler_CapacityRefusalProofControlsAttemptRecovery(t *testing.T) {
 			}
 			reconciler, err := newTestReconciler(t, ReconcilerConfig{}, chainClient, noopAck, router, runtime, store)
 			require.NoError(t, err)
-			counter := metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-				first.Name(), test.wantVerdict,
-			)
+			counter := capacityVerdictSeries(t, first.Name(), test.wantVerdict)
 			before := promtestutil.ToFloat64(counter)
 
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
@@ -7003,7 +6998,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, ack, router, mockTracker, nil)
 	require.NoError(t, err)
 
-	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanics.FetchProvisions)
 
 	// Must not crash fred, and — since ENG-356 — must not fail the sweep either.
 	// A panicking backend is just one that did not answer: it is marked
@@ -7013,7 +7008,7 @@ func TestReconciler_FetchPanicDoesNotCrashFred(t *testing.T) {
 	assert.NoError(t, reconciler.ReconcileAll(t.Context()),
 		"a panicking backend must degrade the sweep, not abort it")
 
-	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("fetch_provisions"))
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanics.FetchProvisions)
 	assert.Equal(t, before+1, after,
 		"ReconcilerPanicsTotal{fetch_provisions} must increment by 1")
 
@@ -7075,12 +7070,12 @@ func TestReconciler_ProcessLeasePanicDoesNotCrashFred(t *testing.T) {
 	reconciler, err := newTestReconciler(t, ReconcilerConfig{}, mockChain, ack, router, mockTracker, nil)
 	require.NoError(t, err)
 
-	before := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease"))
+	before := promtestutil.ToFloat64(metrics.ReconcilerPanics.ProcessLease)
 
 	// Must not crash fred.
 	_ = reconciler.ReconcileAll(t.Context())
 
-	after := promtestutil.ToFloat64(metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease"))
+	after := promtestutil.ToFloat64(metrics.ReconcilerPanics.ProcessLease)
 	assert.Equal(t, before+1, after,
 		"ReconcilerPanicsTotal{process_lease} must increment by 1")
 
@@ -7333,9 +7328,7 @@ func TestReconcilerEventSinkPanicDoesNotPreventProvisionDispatch(t *testing.T) {
 		},
 	}
 	payloads := newMockInFlightTracker(nil)
-	panics := metrics.LifecycleEventSinkPanicsTotal.WithLabelValues(
-		metrics.LifecycleEventProvisionStarting,
-	)
+	panics := metrics.LifecycleEventSinkPanics.ProvisionStarting
 	before := promtestutil.ToFloat64(panics)
 	_, base, execution := testReconcilerPlacement(
 		t, store, router, payloads.testOperationRegistry, nil,
@@ -7848,7 +7841,7 @@ func TestCleanupOrphanedPlacements_PanicPreservesCandidateAndDoesNotBlockHealthy
 	r.placementPruner.maxWorkers = 2
 	answered := answeredSet{"backend-a": true}
 	evidence := cleanupPruneEvidence(t, r, nil, answered, answered)
-	panics := metrics.ReconcilerPanicsTotal.WithLabelValues("placement_cleanup")
+	panics := metrics.ReconcilerPanics.PlacementCleanup
 	before := promtestutil.ToFloat64(panics)
 
 	pruned := r.cleanupOrphanedPlacements(
@@ -7889,8 +7882,7 @@ func TestCleanupOrphanedPlacements_PerRecordAnswered(t *testing.T) {
 	evidence := cleanupPruneEvidence(
 		t, r, backendLeases, provisionsAnswered, retentionsAnswered,
 	)
-	skips := metrics.ReconcilerCleanupSkipsTotal.
-		WithLabelValues(metrics.CleanupPassPlacement, metrics.CleanupSkipBackendSilent)
+	skips := cleanupSkipSeries(t, metrics.ReconcilerCleanupSkips.Placement, metrics.CleanupSkipBackendSilent)
 	before := promtestutil.ToFloat64(skips)
 
 	// now far in the future so the ENG-335 grace window is not what is being tested.

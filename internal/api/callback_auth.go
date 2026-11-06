@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/manifest-network/fred/internal/backendidentity"
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/metrics"
@@ -143,16 +145,12 @@ func NewCallbackKeyringAuthenticator(
 		return nil, fmt.Errorf("callback HMAC keyring has no unfenced backend")
 	}
 	for _, key := range owned {
-		metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, metrics.CallbackKeySlotCurrent)
+		metrics.BindBackends(key.Backend)
 		configured := 0.0
 		if key.Keys.HasRotation() {
-			metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, metrics.CallbackKeySlotPrevious)
 			configured = 1
 		}
 		metrics.APICallbackPreviousKeyConfigured.WithLabelValues(key.Backend).Set(configured)
-	}
-	for _, failure := range callbackAuthFailures {
-		metrics.APICallbackAuthFailuresTotal.WithLabelValues(failure.label())
 	}
 	return &CallbackKeyringAuthenticator{
 		keys:          owned,
@@ -178,34 +176,26 @@ const (
 	callbackAuthFailureFenced
 )
 
-var callbackAuthFailures = [...]callbackAuthFailure{
-	callbackAuthFailureMissing,
-	callbackAuthFailureFormat,
-	callbackAuthFailureExpired,
-	callbackAuthFailureFuture,
-	callbackAuthFailureMismatch,
-	callbackAuthFailureUnknownStorage,
-	callbackAuthFailureFenced,
-}
-
-func (failure callbackAuthFailure) label() string {
+// counter is the failure's series; the invalid zero value has none.
+func (failure callbackAuthFailure) counter() (prometheus.Counter, bool) {
+	failures := metrics.CallbackAuthFailures
 	switch failure {
 	case callbackAuthFailureMissing:
-		return metrics.CallbackAuthFailureMissing
+		return failures.Missing, true
 	case callbackAuthFailureFormat:
-		return metrics.CallbackAuthFailureFormat
+		return failures.Format, true
 	case callbackAuthFailureExpired:
-		return metrics.CallbackAuthFailureExpired
+		return failures.Expired, true
 	case callbackAuthFailureFuture:
-		return metrics.CallbackAuthFailureFuture
+		return failures.Future, true
 	case callbackAuthFailureMismatch:
-		return metrics.CallbackAuthFailureMismatch
+		return failures.Mismatch, true
 	case callbackAuthFailureUnknownStorage:
-		return metrics.CallbackAuthFailureUnknownStorage
+		return failures.UnknownStorage, true
 	case callbackAuthFailureFenced:
-		return metrics.CallbackAuthFailureFenced
+		return failures.Fenced, true
 	default:
-		return ""
+		return nil, false
 	}
 }
 
@@ -228,16 +218,16 @@ func callbackAuthFailureOf(err error) callbackAuthFailure {
 }
 
 func (failure callbackAuthFailure) count() {
-	if label := failure.label(); label != "" {
-		metrics.APICallbackAuthFailuresTotal.WithLabelValues(label).Inc()
+	if counter, ok := failure.counter(); ok {
+		counter.Inc()
 	}
 }
 
-func callbackKeySlotLabel(slot hmacauth.KeySlot) string {
+func callbackKeySlot(slots metrics.CallbackKeySlotCounters, slot hmacauth.KeySlot) prometheus.Counter {
 	if slot == hmacauth.KeySlotRotation {
-		return metrics.CallbackKeySlotPrevious
+		return slots.Previous
 	}
-	return metrics.CallbackKeySlotCurrent
+	return slots.Current
 }
 
 // WithCanonicalPathPrefix applies the same reverse-proxy canonicalization
@@ -395,7 +385,7 @@ func (a *CallbackKeyringAuthenticator) VerifyCallbackEvidence(
 		callbackAuthFailureOf(err).count()
 		return hmacauth.VerifiedRequest{}, err
 	}
-	metrics.APICallbackSignatureKeyTotal.WithLabelValues(key.Backend, callbackKeySlotLabel(slot)).Inc()
+	callbackKeySlot(metrics.ForBackend(key.Backend).CallbackSignatureKey, slot).Inc()
 	return proof, nil
 }
 

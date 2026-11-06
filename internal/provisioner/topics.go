@@ -5,6 +5,9 @@ import (
 	"errors"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/manifest-network/fred/internal/metrics"
 )
 
 // Sentinel errors for provisioner operations.
@@ -56,6 +59,32 @@ const (
 	TopicBackendCallback = "events.backend.callback" // metrics label for synchronous callback application
 	TopicPayloadReceived = "events.payload.received"
 	TopicLeaseEvent      = "events.lease.event"
+)
+
+// messageTopic is a consumed topic with its message counters, bound at package
+// initialization so each topic's series exist before its first message.
+type messageTopic struct {
+	name      string
+	messages  metrics.MessageOutcomeCounters
+	malformed prometheus.Counter
+}
+
+var (
+	leaseCreatedTopic = messageTopic{
+		TopicLeaseCreated, metrics.WatermillMessages.LeaseCreated, metrics.MalformedMessages.LeaseCreated,
+	}
+	leaseClosedTopic = messageTopic{
+		TopicLeaseClosed, metrics.WatermillMessages.LeaseClosed, metrics.MalformedMessages.LeaseClosed,
+	}
+	leaseExpiredTopic = messageTopic{
+		TopicLeaseExpired, metrics.WatermillMessages.LeaseExpired, metrics.MalformedMessages.LeaseExpired,
+	}
+	backendCallbackTopic = messageTopic{
+		TopicBackendCallback, metrics.WatermillMessages.BackendCallback, metrics.MalformedMessages.BackendCallback,
+	}
+	payloadReceivedTopic = messageTopic{
+		TopicPayloadReceived, metrics.WatermillMessages.PayloadReceived, metrics.MalformedMessages.PayloadReceived,
+	}
 )
 
 // ChainClient defines the chain operations needed by the provisioner.

@@ -19,7 +19,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/docker/tenantseccomp"
 	"github.com/manifest-network/fred/internal/backend/shared"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -348,7 +347,7 @@ func (b *Backend) tenantSeccompCensusLoop() {
 			return nil
 		}, "docker_seccomp_census", func(any) {
 			tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
-			background.CleanupPanicsTotal.WithLabelValues("docker_seccomp_census").Inc()
+			seccompCensusCleanupPanics.Inc()
 		})
 		select {
 		case <-b.stopCtx.Done():

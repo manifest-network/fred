@@ -74,12 +74,28 @@ func waitsOnOperator(proof placement.DeferredDeprovision) bool {
 	return proof.Reason() == placement.DeprovisionDeferredBackendFenced
 }
 
+// deferredCloses is the deferral reason's series. A deferral proof is Valid
+// only with one of these four reasons, and the scheduler admits only valid
+// proofs.
+func deferredCloses(reason placement.DeprovisionDeferralReason) metrics.DeferredCloseOutcomeCounters {
+	switch reason {
+	case placement.DeprovisionDeferredInventory:
+		return metrics.DeferredCloses.InventoryPending
+	case placement.DeprovisionDeferredLifecycle:
+		return metrics.DeferredCloses.LifecycleBusy
+	case placement.DeprovisionDeferredBackendFenced:
+		return metrics.DeferredCloses.BackendFenced
+	default: // placement.DeprovisionDeferredBackendUnavailable
+		return metrics.DeferredCloses.BackendUnavailable
+	}
+}
+
 func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovision) error {
 	if !proof.Valid() {
 		return errors.New("invalid deferred close proof")
 	}
 	if waitsOnOperator(proof) {
-		metrics.DeferredClosesTotal.WithLabelValues("parked", string(proof.Reason())).Inc()
+		deferredCloses(proof.Reason()).Parked.Inc()
 		slog.Info("lease close waits on a fenced backend; reconciliation resumes it once the fence is lifted",
 			"lease_uuid", proof.LeaseUUID())
 		return nil
@@ -87,17 +103,17 @@ func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovi
 	scheduler.mu.Lock()
 	defer scheduler.mu.Unlock()
 	if scheduler.closed || !scheduler.started {
-		metrics.DeferredClosesTotal.WithLabelValues("unavailable", string(proof.Reason())).Inc()
+		deferredCloses(proof.Reason()).Unavailable.Inc()
 		return errDeferredCloseUnavailable
 	}
 	defer scheduler.updateOldestAgeLocked(time.Now())
 	if entry, exists := scheduler.entries[proof.LeaseUUID()]; exists {
 		entry.hint = &deferredCloseHint{proof: proof}
-		metrics.DeferredClosesTotal.WithLabelValues("coalesced", string(proof.Reason())).Inc()
+		deferredCloses(proof.Reason()).Coalesced.Inc()
 		return nil
 	}
 	if len(scheduler.entries) >= deferredCloseCapacity {
-		metrics.DeferredClosesTotal.WithLabelValues("full", string(proof.Reason())).Inc()
+		deferredCloses(proof.Reason()).Full.Inc()
 		return errDeferredCloseUnavailable
 	}
 	now := time.Now()
@@ -106,7 +122,7 @@ func (scheduler *deferredCloseScheduler) enqueue(proof placement.DeferredDeprovi
 		delay: deferredCloseInterval, next: now.Add(deferredCloseInterval),
 	}
 	metrics.DeferredClosesPending.Inc()
-	metrics.DeferredClosesTotal.WithLabelValues("queued", string(proof.Reason())).Inc()
+	deferredCloses(proof.Reason()).Queued.Inc()
 	scheduler.wakeDispatch()
 	slog.Info("lease close deferred", "lease_uuid", proof.LeaseUUID(), "reason", proof.Reason())
 	return nil
@@ -206,7 +222,7 @@ func (scheduler *deferredCloseScheduler) finishAttempt(
 		waitsOnOperator(result.Deferred()) {
 		delete(scheduler.entries, proof.LeaseUUID())
 		metrics.DeferredClosesPending.Dec()
-		metrics.DeferredClosesTotal.WithLabelValues("parked", string(result.Deferred().Reason())).Inc()
+		deferredCloses(result.Deferred().Reason()).Parked.Inc()
 		slog.Info("lease close now waits only on a fenced backend; reconciliation resumes it once the fence is lifted",
 			"lease_uuid", proof.LeaseUUID())
 		return
@@ -217,7 +233,7 @@ func (scheduler *deferredCloseScheduler) finishAttempt(
 		}
 		entry.delay = min(2*entry.delay, deferredCloseMaxInterval)
 		entry.next = time.Now().Add(entry.delay)
-		metrics.DeferredClosesTotal.WithLabelValues("retry", string(result.Deferred().Reason())).Inc()
+		deferredCloses(result.Deferred().Reason()).Retry.Inc()
 		return
 	}
 	if newerHint {
@@ -231,11 +247,11 @@ func (scheduler *deferredCloseScheduler) finishAttempt(
 		metrics.DeferredClosesPending.Dec()
 	}
 	if result.Disposition() == placement.DeprovisionEventCompleted {
-		metrics.DeferredClosesTotal.WithLabelValues("dispatched", string(proof.Reason())).Inc()
+		deferredCloses(proof.Reason()).Dispatched.Inc()
 		slog.Info("deferred lease close dispatched", "lease_uuid", proof.LeaseUUID())
 		return
 	}
-	metrics.DeferredClosesTotal.WithLabelValues("failed", string(proof.Reason())).Inc()
+	deferredCloses(proof.Reason()).Failed.Inc()
 	slog.Error("deferred lease close failed; reconciliation will retry",
 		"lease_uuid", proof.LeaseUUID(), "error", errors.Join(result.Err(), panicErr))
 }
@@ -251,7 +267,7 @@ func (scheduler *deferredCloseScheduler) updateOldestAgeLocked(now time.Time) {
 		if age >= deferredCloseOverdueAfter && !entry.overdueReported {
 			entry.overdueReported = true
 			proof := entry.hint.proof
-			metrics.DeferredClosesTotal.WithLabelValues("overdue", string(proof.Reason())).Inc()
+			deferredCloses(proof.Reason()).Overdue.Inc()
 			slog.Error("deferred lease close overdue; retry ownership retained",
 				"lease_uuid", proof.LeaseUUID(), "reason", proof.Reason(), "wait", age)
 		}
@@ -292,7 +308,7 @@ func (scheduler *deferredCloseScheduler) stop() {
 		scheduler.cancel()
 	}
 	for _, entry := range scheduler.entries {
-		metrics.DeferredClosesTotal.WithLabelValues("stopped", string(entry.hint.proof.Reason())).Inc()
+		deferredCloses(entry.hint.proof.Reason()).Stopped.Inc()
 	}
 	metrics.DeferredClosesPending.Sub(float64(len(scheduler.entries)))
 	clear(scheduler.entries)

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -465,7 +467,7 @@ func TestPayloadHandler_RefusedAdmission(t *testing.T) {
 		admission  placement.PayloadAdmission
 		wantStatus int
 		wantBody   ErrorResponse
-		wantMetric string
+		wantMetric prometheus.Counter
 	}{
 		{
 			admission:  placement.PayloadRestoreOwned,
@@ -473,43 +475,43 @@ func TestPayloadHandler_RefusedAdmission(t *testing.T) {
 			wantBody: ErrorResponse{
 				Error: errMsgRestoreInProgress, Code: http.StatusConflict, Reason: "restore_in_progress",
 			},
-			wantMetric: "restore_in_progress",
+			wantMetric: metrics.PayloadUploads.RestoreInProgress,
 		},
 		{
 			admission:  placement.PayloadAlreadyStored,
 			wantStatus: http.StatusConflict,
 			wantBody:   ErrorResponse{Error: "payload already received", Code: http.StatusConflict},
-			wantMetric: "conflict",
+			wantMetric: metrics.PayloadUploads.Conflict,
 		},
 		{
 			admission:  placement.PayloadNotStored,
 			wantStatus: http.StatusConflict,
 			wantBody:   ErrorResponse{Error: "payload already received", Code: http.StatusConflict},
-			wantMetric: "conflict",
+			wantMetric: metrics.PayloadUploads.Conflict,
 		},
 		{
 			admission:  placement.PayloadLeaseDeployed,
 			wantStatus: http.StatusConflict,
 			wantBody:   ErrorResponse{Error: errMsgLeaseDeployed, Code: http.StatusConflict},
-			wantMetric: "conflict",
+			wantMetric: metrics.PayloadUploads.Conflict,
 		},
 		{
 			admission:  placement.PayloadPlacementUnusable,
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   ErrorResponse{Error: errMsgServiceUnavailable, Code: http.StatusServiceUnavailable},
-			wantMetric: "error",
+			wantMetric: metrics.PayloadUploads.Error,
 		},
 		{
 			admission:  placement.PayloadLeaseUnavailable,
 			wantStatus: http.StatusServiceUnavailable,
 			wantBody:   ErrorResponse{Error: errMsgServiceUnavailable, Code: http.StatusServiceUnavailable},
-			wantMetric: "error",
+			wantMetric: metrics.PayloadUploads.Error,
 		},
 		{
 			admission:  placement.PayloadAdmission(255),
 			wantStatus: http.StatusInternalServerError,
 			wantBody:   ErrorResponse{Error: errMsgInternalServerError, Code: http.StatusInternalServerError},
-			wantMetric: "error",
+			wantMetric: metrics.PayloadUploads.Error,
 		},
 	}
 	for _, tt := range tests {
@@ -532,7 +534,7 @@ func TestPayloadHandler_RefusedAdmission(t *testing.T) {
 			publisher := newMockPayloadPublisher()
 			publisher.refusal = tt.admission
 			handler := NewPayloadHandler(client, publisher, testutil.ValidUUID1, "manifest", placement.NoBillingOnlySKUs())
-			counter := metrics.PayloadUploadsTotal.WithLabelValues(tt.wantMetric)
+			counter := tt.wantMetric
 			before := promtestutil.ToFloat64(counter)
 
 			tokenStr := testutil.CreateTestPayloadToken(kp, testutil.ValidUUID1, metaHash, time.Now())

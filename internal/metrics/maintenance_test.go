@@ -11,7 +11,7 @@ import (
 func TestMaintenanceRefusalSeriesExistBeforeFirstRefusal(t *testing.T) {
 	// Collect the actual registered vector without WithLabelValues: calling it
 	// here would create the series and conceal a missing package initialization.
-	require.NoError(t, testutil.CollectAndCompare(MaintenanceAdmissionRefusalsTotal, strings.NewReader(`
+	require.NoError(t, testutil.CollectAndCompare(maintenanceAdmissionRefusalsTotal, strings.NewReader(`
 # HELP fred_maintenance_admission_refusals_total Fresh maintenance commands refused by global pending budget or its newcomer reservation
 # TYPE fred_maintenance_admission_refusals_total counter
 fred_maintenance_admission_refusals_total{reason="bytes"} 0

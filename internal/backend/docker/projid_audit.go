@@ -18,7 +18,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/manifest-network/fred/internal/fstree"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -250,7 +249,7 @@ func (b *Backend) projidAuditLoop() {
 			b.projidAudit.pass(b.stopCtx)
 			return nil
 		}, "docker_projid_audit", func(any) {
-			background.CleanupPanicsTotal.WithLabelValues("docker_projid_audit").Inc()
+			projidAuditCleanupPanics.Inc()
 		})
 		timer.Reset(projidAuditInterval)
 	}

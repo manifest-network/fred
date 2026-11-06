@@ -112,7 +112,7 @@ func (c *TimeoutChecker) CheckOnce(ctx context.Context) {
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			backgroundmetrics.GoroutinePanicsTotal.WithLabelValues("timeout_checker_sweep").Inc()
+			timeoutSweepPanics.Inc()
 			slog.Error("callback timeout sweep panicked; preserving unsettled operations",
 				"panic", recovered,
 				"stack", string(debug.Stack()),
@@ -189,7 +189,7 @@ func (c *TimeoutChecker) settleTimeoutCandidatePanicSafe(
 ) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			backgroundmetrics.GoroutinePanicsTotal.WithLabelValues("timeout_checker_candidate").Inc()
+			timeoutCandidatePanics.Inc()
 			metadata := candidate.Metadata()
 			slog.Error("callback timeout candidate panicked; preserving exact operation",
 				"lease_uuid", metadata.LeaseUUID(),
@@ -264,7 +264,7 @@ func (c *TimeoutChecker) settleTimeoutCandidate(
 
 	operationLabel := timeoutOperationLabel(p.Kind())
 	metrics.CallbackTimeoutsTotal.Inc()
-	metrics.ProvisioningTotal.WithLabelValues(metrics.OutcomeError, p.Backend(), operationLabel).Inc()
+	provisioningOutcomes(metrics.ForBackend(p.Backend()).Provisioning, p.Kind()).Error.Inc()
 
 	// Record duration (from start until timeout)
 	duration := now.Sub(p.StartedAt()).Seconds()
@@ -287,3 +287,9 @@ func timeoutOperationLabel(kind operation.Kind) string {
 	}
 	return metrics.OperationProvision
 }
+
+// The timeout checker's panic series, bound at package initialization.
+var (
+	timeoutSweepPanics     = backgroundmetrics.GoroutinePanics("timeout_checker_sweep")
+	timeoutCandidatePanics = backgroundmetrics.GoroutinePanics("timeout_checker_candidate")
+)

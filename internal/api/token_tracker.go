@@ -144,7 +144,7 @@ func (t *TokenTracker) Close() error {
 // Note: WaitGroup.Done is handled by the caller via wg.Go() (Go 1.25+).
 func (t *TokenTracker) cleanupLoop(ctx context.Context) {
 	util.StartCleanupLoop(ctx, t.cleanupInterval, t.cleanup, "token",
-		func(any) { background.CleanupPanicsTotal.WithLabelValues("token").Inc() },
+		func(any) { tokenCleanupPanics.Inc() },
 	)
 }
 
@@ -190,3 +190,6 @@ func (t *TokenTracker) cleanup() error {
 
 	return err
 }
+
+// tokenCleanupPanics counts panics in the token tracker's cleanup loop.
+var tokenCleanupPanics = background.CleanupPanics("token")

@@ -64,7 +64,7 @@ func TestFencedClientRefusesEveryOperationWithoutARequest(t *testing.T) {
 	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "test_fenced_requests_total", Help: "test",
 	}, []string{"backend", "operation", "status"})
-	client, resolver := newFencedClientForTest(t, HTTPClientOptions{RequestsTotal: requests})
+	client, resolver := newFencedClientForTest(t, HTTPClientOptions{RequestCounters: vecRequestCounters(requests, nil)})
 	require.True(t, IsFenced(client))
 	require.Nil(t, client.wire)
 

@@ -20,7 +20,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backendidentity"
-	"github.com/manifest-network/fred/internal/metrics/background"
 )
 
 // provision is the in-memory record for a single lease. The k3s scaffold
@@ -616,7 +615,7 @@ func newBackend(
 		DBPath: cfg.CallbackDBPath,
 		MaxAge: cfg.CallbackMaxAge,
 		OnCleanupPanic: func(any) {
-			background.CleanupPanicsTotal.WithLabelValues("callback").Inc()
+			callbackCleanupPanics.Inc()
 		},
 	}, storage, storeAuthorityGate)
 	if err != nil {
@@ -627,7 +626,7 @@ func newBackend(
 		DBPath: cfg.DiagnosticsDBPath,
 		MaxAge: cfg.DiagnosticsMaxAge,
 		OnCleanupPanic: func(any) {
-			background.CleanupPanicsTotal.WithLabelValues("diagnostics").Inc()
+			diagnosticsCleanupPanics.Inc()
 		},
 	})
 	if err != nil {
@@ -639,7 +638,7 @@ func newBackend(
 		DBPath: cfg.ReleasesDBPath,
 		MaxAge: cfg.ReleasesMaxAge,
 		OnCleanupPanic: func(any) {
-			background.CleanupPanicsTotal.WithLabelValues("releases").Inc()
+			releasesCleanupPanics.Inc()
 		},
 	}, storage, storeAuthorityGate)
 	if err != nil {
@@ -732,7 +731,7 @@ func newBackend(
 			callbackStoreErrorsTotal.Inc()
 		},
 		OnReplayPanic: func(any) {
-			background.GoroutinePanicsTotal.WithLabelValues("callback_replay").Inc()
+			callbackReplayPanics.Inc()
 		},
 	})
 	if err != nil {

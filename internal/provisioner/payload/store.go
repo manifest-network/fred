@@ -299,7 +299,7 @@ func NewStore(cfg StoreConfig) (*Store, error) {
 					"panic", r,
 					"stack", string(debug.Stack()),
 				)
-				background.GoroutinePanicsTotal.WithLabelValues("payload_writer").Inc()
+				payloadWriterPanics.Inc()
 				// Cancel the store's ctx; subsequent Store/Pop/Delete
 				// calls observe ctx.Done() and return errors rather
 				// than blocking on the now-defunct writeCh.
@@ -1101,3 +1101,6 @@ func (s *Store) writerLoop(ctx context.Context) {
 		}
 	}
 }
+
+// payloadWriterPanics counts panics recovered in the payload writer.
+var payloadWriterPanics = background.GoroutinePanics("payload_writer")

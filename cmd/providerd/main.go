@@ -273,9 +273,17 @@ func run(cmd *cobra.Command, args []string) error {
 
 	authzQ := authz.NewQueryClient(chainClient.Conn())
 
+	// grantChecks is bound only for a pool with sub-signers, so a provider
+	// without them exports no grant-check series. The pool only ever shrinks, so
+	// the maintenance loop below, gated on the same condition, always finds it
+	// bound.
+	var grantChecks metrics.SignerGrantCheckCounters
 	if signerPool.HasSubSigners() {
+		grantChecks = metrics.BindSignerGrantCheck()
 		setupCtx, setupCancel := context.WithTimeout(workCtx, 60*time.Second)
 		if err := chain.EnsureGrantsWithRetry(setupCtx, authzQ, chainClient, signerPool); err != nil {
+			// The startup check is a sweep like the loop's, counted the same way.
+			grantChecks.Error.Inc()
 			if demoteOnGrantSetupError(err) {
 				// The queries succeeded and told us grants are missing, and we
 				// could not create them. That is a positive fact: the
@@ -295,6 +303,8 @@ func run(cmd *cobra.Command, args []string) error {
 					"recheck_interval", cfg.SubSignerFundCheckInterval,
 				)
 			}
+		} else {
+			grantChecks.Success.Inc()
 		}
 		setupCancel()
 	}
@@ -665,12 +675,12 @@ func run(cmd *cobra.Command, args []string) error {
 						// would starve the top-ups.
 						grantCtx, grantCancel := context.WithTimeout(workCtx, 60*time.Second)
 						// Plain EnsureGrants, not the retry wrapper: the loop is the retry.
-						outcome := metrics.OutcomeSuccess
 						if err := chain.EnsureGrants(grantCtx, authzQ, chainClient, signerPool); err != nil {
 							slog.Warn("sub-signer grant check failed", "error", err)
-							outcome = metrics.OutcomeError
+							grantChecks.Error.Inc()
+						} else {
+							grantChecks.Success.Inc()
 						}
-						metrics.SignerGrantCheckTotal.WithLabelValues(outcome).Inc()
 						grantCancel()
 
 						fundCtx, fundCancel := context.WithTimeout(workCtx, 60*time.Second)

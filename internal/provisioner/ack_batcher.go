@@ -107,6 +107,9 @@ type ackLane struct {
 	batchSize     int
 	flushTimeout  time.Duration
 	requests      chan ackRequest
+	// series are the lane's counters, bound when the lane is built so each
+	// exists at 0 before the lane's first failure or restart.
+	series metrics.AckBatchLaneCounters
 
 	// doneMu guards done, which is closed when the current batchLoop
 	// incarnation exits and replaced (resetDone) when the supervisor respawns
@@ -177,6 +180,7 @@ func NewAckBatcher(chainClient ChainClient, cfg AckBatcherConfig) *AckBatcher {
 			batchSize:     size,
 			flushTimeout:  cmp.Or(max(cfg.FlushTimeout, 0), DefaultAckFlushTimeout),
 			requests:      make(chan ackRequest, size*2),
+			series:        metrics.BindAckBatchLane(strconv.Itoa(i)),
 			done:          make(chan struct{}),
 		}
 	}
@@ -245,7 +249,7 @@ func (b *AckBatcher) superviseLane(ctx context.Context, lane *ackLane, laneIdx i
 			return
 		}
 		lane.resetDone()
-		metrics.AckBatcherLaneRestartsTotal.WithLabelValues(strconv.Itoa(laneIdx)).Inc()
+		lane.series.Restarts.Inc()
 		slog.Warn("ack batcher lane restarting after recovered panic", "lane", laneIdx)
 		// Pace restarts so a persistently-panicking flush cannot hot-loop under
 		// load (a batch can fill before the interval elapses).
@@ -360,7 +364,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
-			background.GoroutinePanicsTotal.WithLabelValues("ack_batcher").Inc()
+			ackBatcherPanics.Inc()
 			// Unblock any pending callers with an error; otherwise they'd
 			// hang forever waiting on their resultCh.
 			panicErr := fmt.Errorf("ack batcher lane %d panicked: %v", laneIdx, r)
@@ -501,7 +505,6 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 				"lane", laneIdx, "count", acknowledged, "tx_hashes", txHashes,
 			)
 		} else {
-			laneLabel := strconv.Itoa(laneIdx)
 			// Fee/gas errors indicate the client broadcast-retry loop exhausted
 			// its budget (e.g. hit maxGasLimit). Splitting the batch into N
 			// individual retries would hit the same wall N times and amplify the
@@ -510,7 +513,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 			// redelivery — the next attempt runs on fresh account state.
 			var chainErr *chain.ChainTxError
 			if errors.As(err, &chainErr) && (chainErr.IsInsufficientFee() || chainErr.IsOutOfGas()) {
-				metrics.AckBatchFeeGasErrorsTotal.WithLabelValues(laneLabel).Inc()
+				l.series.FeeGasErrors.Inc()
 				slog.Warn("batch acknowledgment failed with fee/gas error; surfacing to callers (not individualizing)",
 					"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 				)
@@ -529,7 +532,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 				}
 				return
 			}
-			metrics.AckBatchIndividualFallbacksTotal.WithLabelValues(laneLabel).Inc()
+			l.series.IndividualFallbacks.Inc()
 			slog.Warn("batch acknowledgment failed, falling back to individual acks",
 				"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
 			)
@@ -605,3 +608,6 @@ func (l *ackLane) acknowledgeIndividually(ctx context.Context, requests []ackReq
 		}
 	}
 }
+
+// ackBatcherPanics counts panics recovered in ack batcher lanes.
+var ackBatcherPanics = background.GoroutinePanics("ack_batcher")

@@ -53,11 +53,13 @@ func seedMaintenancePressure(t *testing.T, s *Store, template MaintenanceCommand
 }
 
 func maintenanceRefusalCountsForTest() map[string]float64 {
-	counts := make(map[string]float64)
-	for _, reason := range []string{"count", "bytes", "reserved_count", "reserved_bytes"} {
-		counts[reason] = testutil.ToFloat64(metrics.MaintenanceAdmissionRefusalsTotal.WithLabelValues(reason))
+	refusals := metrics.MaintenanceAdmissionRefusals
+	return map[string]float64{
+		"count":          testutil.ToFloat64(refusals.Count),
+		"bytes":          testutil.ToFloat64(refusals.Bytes),
+		"reserved_count": testutil.ToFloat64(refusals.ReservedCount),
+		"reserved_bytes": testutil.ToFloat64(refusals.ReservedBytes),
 	}
-	return counts
 }
 
 func TestFreshMaintenanceAdmissionBoundsAggregatePendingJournal(t *testing.T) {

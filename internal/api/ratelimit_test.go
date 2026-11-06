@@ -670,7 +670,7 @@ func TestCalcRetryAfterSeconds(t *testing.T) {
 }
 
 func TestRateLimiter_Middleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
-	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global"))
+	before := promtestutil.ToFloat64(metrics.RateLimitRejections.Global)
 
 	rl := NewRateLimiter(1, 1, nil) // 1 rps, burst 1
 
@@ -694,12 +694,12 @@ func TestRateLimiter_Middleware_IncrementsRateLimitRejectionsTotal(t *testing.T)
 	middleware.ServeHTTP(rec2, req2)
 	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
 
-	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("global"))
+	after := promtestutil.ToFloat64(metrics.RateLimitRejections.Global)
 	assert.Equal(t, 1.0, after-before, "global rate limit rejection metric should increment by 1")
 }
 
 func TestTenantRateLimiter_AuthMiddleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
-	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	before := promtestutil.ToFloat64(metrics.RateLimitRejections.Tenant)
 
 	kp := testutil.NewTestKeyPair("rl-tenant-test")
 	tl := NewTenantRateLimiter(1, 1, "manifest") // 1 rps, burst 1
@@ -728,12 +728,12 @@ func TestTenantRateLimiter_AuthMiddleware_IncrementsRateLimitRejectionsTotal(t *
 	middleware.ServeHTTP(rec2, req2)
 	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
 
-	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	after := promtestutil.ToFloat64(metrics.RateLimitRejections.Tenant)
 	assert.Equal(t, 1.0, after-before, "tenant rate limit rejection metric should increment by 1")
 }
 
 func TestTenantRateLimiter_PayloadAuthMiddleware_IncrementsRateLimitRejectionsTotal(t *testing.T) {
-	before := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	before := promtestutil.ToFloat64(metrics.RateLimitRejections.Tenant)
 
 	kp := testutil.NewTestKeyPair("rl-payload-test")
 	tl := NewTenantRateLimiter(1, 1, "manifest") // 1 rps, burst 1
@@ -762,6 +762,6 @@ func TestTenantRateLimiter_PayloadAuthMiddleware_IncrementsRateLimitRejectionsTo
 	middleware.ServeHTTP(rec2, req2)
 	assert.Equal(t, http.StatusTooManyRequests, rec2.Code)
 
-	after := promtestutil.ToFloat64(metrics.RateLimitRejectionsTotal.WithLabelValues("tenant"))
+	after := promtestutil.ToFloat64(metrics.RateLimitRejections.Tenant)
 	assert.Equal(t, 1.0, after-before, "tenant rate limit rejection metric should increment by 1 on payload auth")
 }

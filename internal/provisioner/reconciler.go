@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -283,7 +284,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	defer func() {
 		metrics.ReconciliationDuration.Observe(time.Since(startTime).Seconds())
 		if retErr != nil && !errors.Is(retErr, context.Canceled) {
-			metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeError).Inc()
+			metrics.ReconcilerRuns.Error.Inc()
 		}
 	}()
 
@@ -463,7 +464,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 						if rec := recover(); rec != nil {
 							slog.Error("reconciler billing-only acknowledgment panic — recovering to keep fred alive",
 								"lease_uuid", leaseUUID, "panic", rec, "stack", string(debug.Stack()))
-							metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+							metrics.ReconcilerPanics.ProcessLease.Inc()
 							leaseErrors.Add(1)
 						}
 					}()
@@ -494,14 +495,14 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 					if rec := recover(); rec != nil {
 						slog.Error("reconciler lost-lease panic — recovering to keep fred alive",
 							"lease_uuid", leaseUUID, "panic", rec, "stack", string(debug.Stack()))
-						metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+						metrics.ReconcilerPanics.ProcessLease.Inc()
 						leaseErrors.Add(1)
 					}
 				}()
 				if sweep.WasInFlight(leaseUUID) || projection.projected == nil {
 					deferred.Add(1)
 					metrics.ReconcilerDeferredLeasesTotal.Inc()
-					metrics.ReconcilerLostLeasesTotal.WithLabelValues("deferred").Inc()
+					metrics.ReconcilerLostLeases.Deferred.Inc()
 					return nil
 				}
 				wasDeferred, err := r.resolveLostLease(gctx, leaseUUID, projection.projected)
@@ -578,7 +579,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 						"panic", rec,
 						"stack", string(debug.Stack()),
 					)
-					metrics.ReconcilerPanicsTotal.WithLabelValues("process_lease").Inc()
+					metrics.ReconcilerPanics.ProcessLease.Inc()
 					leaseErrors.Add(1)
 				}
 			}()
@@ -760,7 +761,7 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 						"panic", rec,
 						"stack", string(debug.Stack()),
 					)
-					metrics.ReconcilerPanicsTotal.WithLabelValues("process_orphan").Inc()
+					metrics.ReconcilerPanics.ProcessOrphan.Inc()
 					leaseErrors.Add(1)
 				}
 			}()
@@ -787,19 +788,19 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	leaseErrorCount := leaseErrors.Load()
 
 	if provisionedCount > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionProvisioned).Add(float64(provisionedCount))
+		metrics.ReconcilerActions.Provisioned.Add(float64(provisionedCount))
 	}
 	if acknowledgedCount > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAcknowledged).Add(float64(acknowledgedCount))
+		metrics.ReconcilerActions.Acknowledged.Add(float64(acknowledgedCount))
 	}
 	if anomaliesCount > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionAnomaly).Add(float64(anomaliesCount))
+		metrics.ReconcilerActions.Anomaly.Add(float64(anomaliesCount))
 	}
 	if orphansCount > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionDeprovisioned).Add(float64(orphansCount))
+		metrics.ReconcilerActions.Deprovisioned.Add(float64(orphansCount))
 	}
 	if leaseErrorCount > 0 {
-		metrics.ReconciliationActions.WithLabelValues(metrics.ActionLeaseError).Add(float64(leaseErrorCount))
+		metrics.ReconcilerActions.LeaseError.Add(float64(leaseErrorCount))
 	}
 
 	// Record outcome. Exactly one value per sweep, most severe wins:
@@ -811,11 +812,11 @@ func (r *Reconciler) ReconcileAll(ctx context.Context) (retErr error) {
 	deferredCount := deferred.Load()
 	switch {
 	case !cycleComplete:
-		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeDegraded).Inc()
+		metrics.ReconcilerRuns.Degraded.Inc()
 	case leaseErrorCount > 0:
-		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomePartial).Inc()
+		metrics.ReconcilerRuns.Partial.Inc()
 	default:
-		metrics.ReconciliationTotal.WithLabelValues(metrics.OutcomeSuccess).Inc()
+		metrics.ReconcilerRuns.Success.Inc()
 		metrics.ReconcilerLastSuccessTimestamp.SetToCurrentTime()
 	}
 
@@ -1089,9 +1090,8 @@ func (r *Reconciler) doStartProvisioning(
 		provisionErr = settlement.Err()
 	}
 	if errors.Is(provisionErr, backend.ErrInsufficientResources) {
-		metrics.BackendInsufficientResourcesTotal.WithLabelValues(
-			result.BackendName(), capacityVerdictLabel(settlement.ProvisionRefusal()),
-		).Inc()
+		capacityVerdict(metrics.ForBackend(result.BackendName()).InsufficientResources,
+			settlement.ProvisionRefusal()).Inc()
 	}
 	if settlement.Superseded() {
 		// The exact callback owns every terminal side effect. In particular,
@@ -1269,14 +1269,6 @@ func (r *Reconciler) rejectLease(
 	return nil
 }
 
-// Pre-initialize every terminal verdict label (ENG-799) so an alert on a
-// verdict that never closes reads 0, not no-data, before the first failure.
-func init() {
-	for _, verdict := range terminalverdict.Labels() {
-		metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(verdict).Add(0)
-	}
-}
-
 // resolveLostLease closes an ACTIVE or rejects a PENDING lease whose placement
 // was lost with its retired backend's storage; a terminal lease needs nothing
 // and is pruned after an exact terminal read. deferred reports that the sweep
@@ -1288,32 +1280,32 @@ func (r *Reconciler) resolveLostLease(
 ) (deferred bool, err error) {
 	observed, disposition, err := projected.ObserveLiveAction(ctx, leaseUUID)
 	if err != nil {
-		metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+		metrics.ReconcilerLostLeases.Error.Inc()
 		slog.Error("reconcile: failed to re-read lost lease under lifecycle claim",
 			"lease_uuid", leaseUUID, "error", err)
 		return false, err
 	}
 	if disposition != placement.ReconciliationObservationReady || !observed.Valid() {
 		metrics.ReconcilerDeferredLeasesTotal.Inc()
-		metrics.ReconcilerLostLeasesTotal.WithLabelValues("deferred").Inc()
+		metrics.ReconcilerLostLeases.Deferred.Inc()
 		return true, nil
 	}
 	defer r.coordinator.ReleaseAction(observed)
-	outcome := ""
+	var outcome prometheus.Counter
 	switch observed.Lease().State {
 	case billingtypes.LEASE_STATE_ACTIVE:
-		outcome, err = "closed", r.closeLostLease(ctx, observed)
+		outcome, err = metrics.ReconcilerLostLeases.Closed, r.closeLostLease(ctx, observed)
 	case billingtypes.LEASE_STATE_PENDING:
-		outcome, err = "rejected", r.rejectLease(ctx, observed, lostBackendChainReason)
+		outcome, err = metrics.ReconcilerLostLeases.Rejected, r.rejectLease(ctx, observed, lostBackendChainReason)
 	default:
 		return false, nil
 	}
 	if err != nil {
-		metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+		metrics.ReconcilerLostLeases.Error.Inc()
 		slog.Error("reconcile: failed to end lost lease on chain", "lease_uuid", leaseUUID, "error", err)
 		return false, err
 	}
-	metrics.ReconcilerLostLeasesTotal.WithLabelValues(outcome).Inc()
+	outcome.Inc()
 	return false, nil
 }
 
@@ -1534,7 +1526,7 @@ func (r *Reconciler) fetchFleetSnapshot(
 	for _, backendName := range backendNames {
 		if _, isFenced := fenced[backendName]; isFenced {
 			snap.markUnanswered(backendName)
-			metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, metrics.FetchOutcomeFenced).Inc()
+			metrics.ForBackend(backendName).ReconcileFetch.Fenced.Inc()
 			continue
 		}
 		live = append(live, backendName)
@@ -1550,11 +1542,7 @@ func (r *Reconciler) fetchFleetSnapshot(
 				mu.Lock()
 				snap.markUnanswered(backendName)
 				mu.Unlock()
-				outcome := metrics.FetchOutcomeError
-				if errors.Is(err, backend.ErrCircuitOpen) {
-					outcome = metrics.FetchOutcomeCircuitOpen
-				}
-				metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, outcome).Inc()
+				fetchFailure(metrics.ForBackend(backendName).ReconcileFetch, err).Inc()
 				return nil
 			}
 			refreshErr := inventory.RefreshErr()
@@ -1584,14 +1572,12 @@ func (r *Reconciler) fetchFleetSnapshot(
 			snap.collectedByBackend[backendName] = inventory
 			snap.reportedByBackend[backendName] = reported
 			mu.Unlock()
-			fetchOutcome := metrics.FetchOutcomeOK
+			fetches := metrics.ForBackend(backendName).ReconcileFetch
 			if refreshErr != nil {
-				fetchOutcome = metrics.FetchOutcomeError
-				if errors.Is(refreshErr, backend.ErrCircuitOpen) {
-					fetchOutcome = metrics.FetchOutcomeCircuitOpen
-				}
+				fetchFailure(fetches, refreshErr).Inc()
+			} else {
+				fetches.OK.Inc()
 			}
-			metrics.ReconcilerBackendFetchTotal.WithLabelValues(backendName, fetchOutcome).Inc()
 
 			slog.Debug("fetched backend provisions",
 				"backend", backendName,
@@ -1805,13 +1791,16 @@ func (r *Reconciler) placementMarkerLeaseTerminal(ctx context.Context, leaseUUID
 // This runs on every candidate, not only on degraded sweeps: the staleness it
 // guards against comes from the sweep's own non-atomic chain queries, and is
 // identical on a sweep that saw every backend.
-func (r *Reconciler) confirmTerminal(ctx context.Context, pass, leaseUUID string) bool {
+func (r *Reconciler) confirmTerminal(ctx context.Context, cleanup cleanupPass, leaseUUID string) bool {
 	liveness, reason, lease, err := r.queryLeaseLiveness(ctx, leaseUUID)
 	if liveness == leaseTerminal {
 		return true
 	}
 
-	metrics.ReconcilerCleanupSkipsTotal.WithLabelValues(pass, reason).Inc()
+	pass := cleanup.name
+	if skipped, ok := cleanup.skips.ForReason(reason); ok {
+		skipped.Inc()
+	}
 	switch reason {
 	case metrics.CleanupSkipChainUnknown:
 		// Not self-healing, unlike chain_live and chain_error: fred will decline
@@ -2144,7 +2133,8 @@ func (r *Reconciler) processLease(
 	terminal := terminalverdict.FromProvision(provision)
 	if lease.State == billingtypes.LEASE_STATE_ACTIVE && isProvisioned &&
 		provision.Status == backend.ProvisionStatusFailed {
-		metrics.ReconcilerTerminalVerdictsTotal.WithLabelValues(terminal.Label()).Inc()
+		verdicts := metrics.ReconcilerTerminalVerdicts
+		terminalverdict.Pick(terminal, verdicts.Absent, verdicts.Unknown, verdicts.Retry, verdicts.Exhausted).Inc()
 	}
 	plan := planLease(leaseFacts{
 		authority:       lifecycleAuthorityDurable,
@@ -2262,12 +2252,12 @@ func (r *Reconciler) processLease(
 		slog.Error("reconcile: closing a live lease with no placement row that may have lived on a retired backend",
 			"lease_uuid", leaseUUID, "tenant", lease.Tenant)
 		if err := r.closeLostLease(ctx, authority.action); err != nil {
-			metrics.ReconcilerLostLeasesTotal.WithLabelValues("error").Inc()
+			metrics.ReconcilerLostLeases.Error.Inc()
 			slog.Error("reconcile: failed to close possibly lost lease", "lease_uuid", leaseUUID, "error", err)
 			hadError = true
 			return
 		}
-		metrics.ReconcilerLostLeasesTotal.WithLabelValues("closed").Inc()
+		metrics.ReconcilerLostLeases.Closed.Inc()
 
 	case reconcileActionReconcileCustomDomain:
 		if err := r.coordinator.ReconcileObservedCustomDomain(ctx, authority.action); err != nil {
@@ -2298,8 +2288,7 @@ func (r *Reconciler) processOrphan(
 	// chain reread before returning any executable orphan authority.
 	action, disposition, err := projected.ObserveTerminalOrphan(ctx, leaseUUID)
 	if err != nil {
-		metrics.ReconcilerCleanupSkipsTotal.
-			WithLabelValues(metrics.CleanupPassOrphan, metrics.CleanupSkipChainError).Inc()
+		metrics.ReconcilerCleanupSkips.Orphan.ChainError.Inc()
 		slog.Error("reconcile: failed to confirm orphan terminality",
 			"lease_uuid", leaseUUID, "error", err)
 		leaseErrors.Add(1)
@@ -2315,8 +2304,9 @@ func (r *Reconciler) processOrphan(
 		cleanupReason = metrics.CleanupSkipChainUnknownState
 	}
 	if cleanupReason != "" {
-		metrics.ReconcilerCleanupSkipsTotal.
-			WithLabelValues(metrics.CleanupPassOrphan, cleanupReason).Inc()
+		if skipped, ok := metrics.ReconcilerCleanupSkips.Orphan.ForReason(cleanupReason); ok {
+			skipped.Inc()
+		}
 		if disposition == placement.ReconciliationObservationChainNotFound {
 			slog.Warn("reconcile: orphan has no chain record; MANUAL CLEANUP MAY BE REQUIRED",
 				"lease_uuid", leaseUUID, "reason", cleanupReason)
@@ -2395,7 +2385,7 @@ func (r *Reconciler) cleanupOrphanedPayloads(ctx context.Context, chainLeases ma
 			// exact request. A PENDING lease then waits for a new upload, and an
 			// ACTIVE one for a rebuild from its owner's active release or a
 			// tenant update.
-			if !r.confirmTerminal(ctx, metrics.CleanupPassPayload, leaseUUID) {
+			if !r.confirmTerminal(ctx, payloadCleanupPass, leaseUUID) {
 				continue
 			}
 			payloadStore.Delete(leaseUUID)
@@ -2494,4 +2484,24 @@ func (r *Reconciler) Start(ctx context.Context) error {
 // RunOnce performs a single reconciliation. Use this at startup.
 func (r *Reconciler) RunOnce(ctx context.Context) error {
 	return r.ReconcileAll(ctx)
+}
+
+// fetchFailure is the series of a failed provision-list fetch: circuit_open
+// when fred short-circuited without dialing, error otherwise.
+func fetchFailure(fetches metrics.BackendFetchCounters, err error) prometheus.Counter {
+	if errors.Is(err, backend.ErrCircuitOpen) {
+		return fetches.CircuitOpen
+	}
+	return fetches.Error
+}
+
+// cleanupPass is a destructive cleanup pass: its name for logs and its
+// cleanup-skip series.
+type cleanupPass struct {
+	name  string
+	skips metrics.CleanupSkipReasonCounters
+}
+
+var payloadCleanupPass = cleanupPass{
+	name: metrics.CleanupPassPayload, skips: metrics.ReconcilerCleanupSkips.Payload,
 }

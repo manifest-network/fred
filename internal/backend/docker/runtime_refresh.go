@@ -17,7 +17,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/maintenanceid"
-	"github.com/manifest-network/fred/internal/metrics/background"
 	"github.com/manifest-network/fred/internal/util"
 )
 
@@ -397,7 +396,7 @@ func (b *Backend) runtimeInventoryLoop() {
 			return nil
 		}, "docker_runtime_inventory", func(any) {
 			runtimeInventoryTotal.WithLabelValues("error").Inc()
-			background.CleanupPanicsTotal.WithLabelValues("docker_runtime_inventory").Inc()
+			runtimeInventoryCleanupPanics.Inc()
 		})
 	}
 }
@@ -472,7 +471,7 @@ func (b *Backend) runRuntimeRefresh() {
 	defer controller.finish()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			background.CleanupPanicsTotal.WithLabelValues("docker_runtime_refresh").Inc()
+			runtimeRefreshCleanupPanics.Inc()
 			b.logger.Error("runtime refresh run panicked", "panic", recovered, "stack", string(debug.Stack()))
 		}
 	}()
@@ -545,7 +544,7 @@ func (b *Backend) refreshLeaseRuntime(ctx context.Context, lease string) (outcom
 	b.runtimeRefresh.begin(lease)
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			background.CleanupPanicsTotal.WithLabelValues("docker_runtime_refresh").Inc()
+			runtimeRefreshCleanupPanics.Inc()
 			b.logger.Error("runtime refresh panicked", "lease_uuid", lease,
 				"panic", recovered, "stack", string(debug.Stack()))
 			outcome = runtimeRefreshRunOutcome{row: runtimeRefreshUnsettledFailureRow(lease, admitted)}
