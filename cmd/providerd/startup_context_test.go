@@ -35,6 +35,15 @@ func TestProviderWorkUsesSignalContextAndCallbacksRetainDrainContext(t *testing.
 		if !ok || len(call.Args) == 0 {
 			return true
 		}
+		// The supervisor derives the work context and returns it second.
+		if constructor, ok := call.Fun.(*ast.Ident); ok && constructor.Name == "newComponents" {
+			work, workOK := assignment.Lhs[len(assignment.Lhs)-1].(*ast.Ident)
+			parent, parentOK := call.Args[0].(*ast.Ident)
+			if len(assignment.Lhs) == 2 && workOK && parentOK {
+				parents[work.Name] = parent.Name
+			}
+			return true
+		}
 		method, ok := call.Fun.(*ast.SelectorExpr)
 		if !ok {
 			return true
