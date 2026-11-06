@@ -25,6 +25,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- deps: bump `github.com/klauspost/compress` to v1.20.3 (from v1.19.1). Its zstd decoder could panic on a frame of two blocks (GO-2026-6865), which docker-backend reaches when it decodes a tenant image's zstd layer. The image preparation worker already recovers the panic, so the provision failed instead of the backend crashing.
+
 ## [0.14.1] - 2026-11-05
 
 ### Added
