@@ -47,9 +47,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workers.Add()
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 	select {
 	case err := <-reply:
 		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
@@ -69,9 +67,7 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
 	retryReply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: retryReply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, retryReply)
 	select {
 	case err := <-retryReply:
 		require.NoError(t, err)
@@ -173,9 +169,7 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 	})
 
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 	select {
 	case err := <-reply:
 		require.NoError(t, err)

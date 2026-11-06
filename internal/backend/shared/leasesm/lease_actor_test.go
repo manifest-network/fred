@@ -459,9 +459,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	// actor cancels the worker and answers pending. Only a later request may
 	// transition and run DoDeprovisionFn once the worker actually exits.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waiting for the worker (Restart path)")
@@ -477,9 +475,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 
 	select {
 	case err := <-reply:
@@ -543,12 +539,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	require.NoError(t, <-restoreAck)
 
 	deprovisionReply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{
-			Reply: deprovisionReply,
-			fence: actorCloseFence(actor),
-		})
-	})
+	requireCloseAccepted(t, actor, deprovisionReply)
 	close(restoreWorkMayReturn)
 	select {
 	case <-terminalDeferEntered:
@@ -564,9 +555,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	require.True(t, IsLifecyclePending(<-deprovisionReply))
 	close(allowTerminalDefer)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: deprovisionReply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, deprovisionReply)
 	select {
 	case err := <-deprovisionReply:
 		require.NoError(t, err)
@@ -1180,9 +1169,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	// Route Deprovision through the actor. Its pending response keeps teardown
 	// fenced until a retry independently observes the drained barrier.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
 		"OnExit must call workCancel before waitForWorkers")
@@ -1198,9 +1185,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 
 	select {
 	case err := <-reply:
@@ -1466,9 +1451,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	// Deprovision preempts the in-flight worker (whose workCancel must still
 	// be request #1's), returning pending while it drains.
 	reply := make(chan error, 1)
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
 		"onExitProvisioning must cancel the FIRST (in-flight) %s worker", op)
@@ -1479,9 +1462,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 	require.True(t, IsLifecyclePending(<-reply))
 	close(worker1Release)
 	<-actor.workers.Zero()
-	requireAccepted(t, func() bool {
-		return actor.tryEnqueue(deprovisionMsg{Reply: reply, fence: actorCloseFence(actor)})
-	})
+	requireCloseAccepted(t, actor, reply)
 	select {
 	case err := <-reply:
 		require.NoError(t, err)
@@ -1525,7 +1506,7 @@ func runReplaceLosesToDeprovisionTest(t *testing.T, op string) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(actorCloseFence(actor)))
+	require.NoError(t, actor.handleDeprovision(actorCloseFence(t, actor)))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
@@ -1898,7 +1879,7 @@ func TestRestoreRequested_RejectedFromBadState(t *testing.T) {
 		},
 	})
 
-	require.NoError(t, actor.handleDeprovision(actorCloseFence(actor)))
+	require.NoError(t, actor.handleDeprovision(actorCloseFence(t, actor)))
 	require.Equal(t, backend.ProvisionStatusDeprovisioning, actor.State(),
 		"test precondition: SM must be Deprovisioning")
 
