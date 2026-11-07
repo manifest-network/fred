@@ -1030,7 +1030,7 @@ func backendForReconcileTest(t *testing.T, mgr volumeManager, dataPath, lease, s
 			Items:     []backend.LeaseItem{{SKU: sku, Quantity: 1, ServiceName: svc}},
 		}},
 	})
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	b.cfg.VolumeDataPath = dataPath
 	b.cfg.SKUProfiles[sku] = SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: diskMB}
 	return b
@@ -1877,7 +1877,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 	dir = filepath.Join(dataPath, retName)
 
 	b, rs := newBackendWithRetention(t)
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	b.cfg.VolumeDataPath = dataPath
 	b.cfg.SKUProfiles["ret-sku"] = SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: 20}
 	require.NoError(t, putRetentionForTest(t, rs, shared.RetentionEntry{
@@ -2036,7 +2036,7 @@ func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
 
 	// Wire a Backend with real btrfs volumes and the custom small-SKU profiles.
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
 	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
@@ -2165,7 +2165,7 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 	require.NoError(t, err)
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
 	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
@@ -2293,7 +2293,7 @@ func TestIntegration_DemotePromote_ZFS(t *testing.T) {
 	require.NoError(t, mgr.Validate())
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
 	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
 	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}

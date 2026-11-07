@@ -113,7 +113,7 @@ func newRestoreQuotaBackend(t *testing.T, mgr *xfsVolumeManager) (*Backend, <-ch
 	// same concrete XFS fixture. The storage guard rejects a manager/config pair
 	// whose root cannot be proven identical.
 	b.cfg.VolumeDataPath = mgr.dataPath
-	b.volumes = mgr
+	useVolumeManager(b, mgr)
 	var mu sync.Mutex
 	var down []string
 	b.compose = happyComposeMock(t, mock, &mu, &down, nil)
@@ -367,7 +367,7 @@ func TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems(t *test
 			t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
 
 			b := newBackendForTest(&mockDockerClient{}, nil)
-			b.volumes = mgr
+			useVolumeManager(b, mgr)
 			rec := &shared.RetentionEntry{
 				OriginalLeaseUUID: orig,
 				NewLeaseUUID:      destination,

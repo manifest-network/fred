@@ -525,6 +525,15 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	return b
 }
 
+// useVolumeManager installs volumes on a test Backend the way New does: it
+// also binds restore_demote_refused_total for volumes' kind. A fixture that
+// assigns b.volumes alone keeps the series of the manager it replaced, so a
+// demote refusal counts under the wrong backend label.
+func useVolumeManager(b *Backend, volumes volumeReader) {
+	b.volumes = volumes
+	b.restoreDemoteRefusals = bindRestoreDemoteRefusals(volumes.Kind())
+}
+
 func TestRecoverState_Serialized(t *testing.T) {
 	// Verify that concurrent recoverState calls are serialized by recoverMu.
 	// Use an atomic counter to track the maximum number of concurrent calls
