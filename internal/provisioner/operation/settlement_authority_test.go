@@ -84,3 +84,83 @@ func TestSettlementAuthorityDeprovisionDerivesOperationIdentity(t *testing.T) {
 	require.Equal(t, initiation.ID(), claimed.Claim().Metadata().ID())
 	require.True(t, authority.ReleaseDeprovision(claimed.Claim()))
 }
+
+func TestCallbackSuccessExcludesStaleTimeoutButAllowsSettlement(t *testing.T) {
+	registry := newTestRegistry()
+	authority, err := registry.BindSettlementAuthority()
+	require.NoError(t, err)
+	initiation := requireInitiated(t, registry, testTrackSpec("lease-1"))
+	require.True(t, registry.beginCall(initiation))
+	require.Equal(t, InitiationActivated, registry.activate(initiation))
+	candidates := authority.TimedOut(0)
+	require.Len(t, candidates, 1)
+
+	callback := authority.TryClaimCallback("lease-1", initiation.ID())
+	require.True(t, callback.Claimed())
+	require.True(t, authority.ObserveCallbackSuccess(callback.Claim()))
+	require.True(t, authority.ObserveCallbackSuccess(callback.Claim()), "observation is idempotent")
+	require.True(t, authority.ReleaseCallback(callback.Claim()))
+	require.Empty(t, authority.TimedOut(0))
+	require.Equal(t, SettlementBusy, authority.TryClaimTimeout(candidates[0]).Outcome())
+
+	// Positive evidence only excludes timeout: a subsequent callback or an
+	// explicit deprovision may still settle the operation.
+	retry := authority.TryClaimCallback("lease-1", initiation.ID())
+	require.True(t, retry.Claimed())
+	require.True(t, authority.ReleaseCallback(retry.Claim()))
+	deprovision := authority.TryClaimDeprovision("lease-1")
+	require.True(t, deprovision.Claimed())
+	require.True(t, authority.FinishDeprovision(deprovision.Claim()))
+
+	// Success belongs to the operation, not the lease UUID forever.
+	replacement := requireInitiated(t, registry, testTrackSpec("lease-1"))
+	require.True(t, registry.beginCall(replacement))
+	require.Equal(t, InitiationActivated, registry.activate(replacement))
+	require.False(t, authority.ObserveCallbackSuccess(callback.Claim()))
+	require.Equal(t, SettlementOperationMismatch, authority.TryClaimTimeout(candidates[0]).Outcome())
+	candidates = authority.TimedOut(0)
+	require.Len(t, candidates, 1)
+	require.True(t, authority.TryClaimTimeout(candidates[0]).Claimed())
+}
+
+func TestCallbackSuccessRequiresExactLiveClaim(t *testing.T) {
+	registry := newTestRegistry()
+	authority, err := registry.BindSettlementAuthority()
+	require.NoError(t, err)
+	foreign := newTestRegistry()
+	foreignAuthority, err := foreign.BindSettlementAuthority()
+	require.NoError(t, err)
+	initiation := requireInitiated(t, registry, testTrackSpec("lease-1"))
+	require.True(t, registry.beginCall(initiation))
+	require.Equal(t, InitiationActivated, registry.activate(initiation))
+
+	callback := authority.TryClaimCallback("lease-1", initiation.ID())
+	require.True(t, callback.Claimed())
+	require.False(t, authority.ObserveCallbackSuccess(CallbackClaim{}))
+	require.False(t, foreignAuthority.ObserveCallbackSuccess(callback.Claim()))
+	require.False(t, (SettlementAuthority{}).ObserveCallbackSuccess(callback.Claim()))
+	require.True(t, authority.ReleaseCallback(callback.Claim()))
+	retry := authority.TryClaimCallback("lease-1", initiation.ID())
+	require.True(t, retry.Claimed())
+	require.False(t, authority.ObserveCallbackSuccess(callback.Claim()), "a released nonce cannot change a reacquired claim")
+	require.True(t, authority.ReleaseCallback(retry.Claim()))
+	candidates := authority.TimedOut(0)
+	require.Len(t, candidates, 1)
+	require.True(t, authority.TryClaimTimeout(candidates[0]).Claimed())
+}
+
+func TestInlineCallbackSuccessSurvivesActivation(t *testing.T) {
+	registry := newTestRegistry()
+	authority, err := registry.BindSettlementAuthority()
+	require.NoError(t, err)
+	initiation := requireInitiated(t, registry, testTrackSpec("lease-1"))
+	require.True(t, registry.beginCall(initiation))
+	callback := authority.TryClaimCallback("lease-1", initiation.ID())
+	require.True(t, callback.Claimed())
+	require.True(t, authority.ObserveCallbackSuccess(callback.Claim()))
+	require.True(t, authority.ReleaseCallback(callback.Claim()))
+	require.Equal(t, InitiationActivated, registry.activate(initiation))
+	require.Empty(t, authority.TimedOut(0))
+	// Exercise the live claim guard independently of candidate filtering.
+	require.Equal(t, SettlementBusy, registry.tryClaimTimeout("lease-1", initiation.ID()).Outcome())
+}

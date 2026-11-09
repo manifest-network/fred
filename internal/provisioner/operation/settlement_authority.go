@@ -329,6 +329,14 @@ func (authority SettlementAuthority) TryClaimCallback(
 	}
 }
 
+// ObserveCallbackSuccess prevents timeout settlement for this exact operation,
+// even if acknowledgment fails and the callback claim is subsequently released.
+// The authenticated callback coordinator calls it before attempting acknowledgment.
+func (authority SettlementAuthority) ObserveCallbackSuccess(claim CallbackClaim) bool {
+	return authority.valid() && claim.Valid() && claim.core.issuer == authority.marker &&
+		authority.registry.observeCallbackSuccess(claim.core.claim)
+}
+
 func (authority SettlementAuthority) ReleaseCallback(claim CallbackClaim) bool {
 	return authority.valid() && claim.Valid() && claim.core.issuer == authority.marker &&
 		authority.registry.releaseSettlement(claim.core.claim)

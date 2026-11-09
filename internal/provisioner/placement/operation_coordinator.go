@@ -1884,6 +1884,11 @@ func (coordinator *OperationCoordinator) validCallbackClaim(
 		claim.registry.Metadata().ID() == claim.placement.operationID
 }
 
+func (coordinator *OperationCoordinator) observeCallbackSuccess(claim CallbackSettlementClaim) bool {
+	return coordinator.validCallbackClaim(claim) &&
+		coordinator.operations.ObserveCallbackSuccess(claim.registry)
+}
+
 // ReleaseCallback releases both unconsumed claims. It is the only valid action
 // after retryable chain work fails.
 func (coordinator *OperationCoordinator) releaseCallback(claim CallbackSettlementClaim) bool {

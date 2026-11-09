@@ -284,6 +284,9 @@ type trackedOperation struct {
 	initiation       Initiation
 	claim            SettlementClaim
 	terminalFinished bool
+	// Set only under the exact live callback claim; releasing the claim must
+	// not give timeout authority back to an operation that reported success.
+	successAuthenticated bool
 }
 
 // Registry is the sole owner of process-local lifecycle-operation state and
@@ -775,6 +778,11 @@ func (registry *Registry) tryClaimSettlement(
 		if tracked.record.Phase != PhaseActive {
 			return SettlementResult{outcome: SettlementBusy}
 		}
+		// Check live evidence while claiming, not just while collecting timeout
+		// candidates: a candidate may predate the successful callback.
+		if actor == settlementTimeout && tracked.successAuthenticated {
+			return SettlementResult{outcome: SettlementBusy}
+		}
 	default:
 		return SettlementResult{outcome: SettlementInvalid}
 	}
@@ -791,6 +799,24 @@ func (registry *Registry) tryClaimSettlement(
 		claim:   claim,
 		outcome: SettlementClaimed,
 	}
+}
+
+// observeCallbackSuccess preserves positive evidence before acknowledgment can
+// fail or panic. Only the current callback owner can record it; released,
+// foreign and superseded claims cannot change this or a replacement operation.
+func (registry *Registry) observeCallbackSuccess(claim SettlementClaim) bool {
+	if !claim.Valid() || claim.actor != settlementCallback || claim.token.registry != registry.identity {
+		return false
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	tracked, exists := registry.operations[claim.token.leaseUUID]
+	if !exists || tracked.claim != claim {
+		return false
+	}
+	tracked.successAuthenticated = true
+	registry.operations[claim.token.leaseUUID] = tracked
+	return true
 }
 
 // releaseSettlement releases only the exact settlement claim. A claim released
@@ -954,7 +980,7 @@ func (registry *Registry) timedOut(timeout time.Duration) []Record {
 	defer registry.mu.RUnlock()
 	var timedOut []Record
 	for _, tracked := range registry.operations {
-		if tracked.record.Phase == PhaseActive && now.Sub(tracked.record.StartedAt) > timeout {
+		if tracked.record.Phase == PhaseActive && !tracked.successAuthenticated && now.Sub(tracked.record.StartedAt) > timeout {
 			timedOut = append(timedOut, tracked.record.clone())
 		}
 	}
