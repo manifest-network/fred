@@ -205,8 +205,22 @@
   {
     "model": "restore_source_recovery.qnt",
     "variant": "fixed",
-    "invariant": "acceptedSourceCanRecover and onlyOwnedTerminalDataRestored",
+    "invariant": "acceptedSourceCanRecover and consumedSourceCanRetry and onlyOwnedTerminalSourceDispatched",
     "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "restore_source_recovery.qnt",
+    "variant": "retentionGatedRetry",
+    "invariant": "consumedSourceCanRetry",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "restore_source_recovery.qnt",
+    "variant": "uncheckedRecoveryOwnership",
+    "invariant": "onlyOwnedTerminalSourceDispatched",
+    "expect_violation": true,
     "step": "step"
   }
 ]

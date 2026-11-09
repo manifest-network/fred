@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- providerd now permits restores from retained `REJECTED` leases and recovers interrupted restores from `EXPIRED` or `REJECTED` sources. Admission and recovery share the same exact-observation terminal-state policy, so a restore that commits after its destination is rejected no longer strands the retained data under that lease. Tenant/provider ownership, source placement, and backend retention checks still apply (ENG-2130).
+- providerd now permits restores from retained `REJECTED` leases and recovers interrupted restores from `EXPIRED` or `REJECTED` sources. Admission and recovery share the same exact-observation terminal-state policy, so provision or restore work that commits after timeout rejection or tenant cancellation no longer strands retained data under the rejected lease. Tenant/provider ownership, source placement, and backend retention checks still apply (ENG-2130).
 
 - providerd retries the remaining eligible leases together when an acknowledgment batch fails because a member left PENDING. Exact lease/provider observations resolve ACTIVE or ineligible members before retrying; every retry shrinks the batch and shares the original flush deadline, preserving duplicate-caller results and fee/gas failure handling (ENG-2127).
 

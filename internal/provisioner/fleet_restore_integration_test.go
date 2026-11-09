@@ -146,8 +146,20 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 }
 
 // The fleet backend models Docker's commit/retention outcome; Fred's restore,
-// timeout, inventory, orphan cleanup, and signed HTTP paths are production code.
+// timeout, inventory, orphan cleanup, and Fred-to-backend signed HTTP paths are
+// production code. Tenant cancellation is represented by its chain outcome.
 func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
+	t.Parallel()
+	for _, reason := range []string{"callback timeout", billingtypes.RejectionReasonCancelledByTenant} {
+		t.Run(reason, func(t *testing.T) {
+			t.Parallel()
+			testFleetRestoreFromRejectedCommittedDestination(t, reason)
+		})
+	}
+}
+
+func testFleetRestoreFromRejectedCommittedDestination(t *testing.T, reason string) {
+	t.Helper()
 	f := newFleet(t, fleetOptions{})
 	const source, rejected, destination = "retained-original", "rejected-restore", "restored-again"
 	owner := f.backendAt(2)
@@ -165,15 +177,18 @@ func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
 	f.chain.RejectLeasesFunc = func(ctx context.Context, ids []string, reason string) (uint64, []string, error) {
 		count, hashes, err := reject(ctx, ids, reason)
 		if err == nil {
-			f.leaseMu.Lock()
 			for _, id := range ids {
-				lease := f.leases[id]
-				lease.State = billingtypes.LEASE_STATE_REJECTED
-				f.leases[id] = lease
+				f.rejectLease(id, reason)
 			}
-			f.leaseMu.Unlock()
 		}
 		return count, hashes, err
+	}
+	if reason == billingtypes.RejectionReasonCancelledByTenant {
+		// CancelLease is a tenant chain transaction. Model its resulting state;
+		// a later provider rejection must receive the ledger's not-pending error.
+		f.chain.RejectLeasesFunc = func(context.Context, []string, string) (uint64, []string, error) {
+			return 0, nil, billingtypes.ErrLeaseNotPending
+		}
 	}
 	setTestProviderControlPlane(t, f.execution, f.chain, nil)
 	authority, err := restoreAuthorityForTest(f.execution, nil)
@@ -184,6 +199,9 @@ func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
 		SourceLeaseUUID: fleetLeaseUUID(source), TargetLeaseUUID: fleetLeaseUUID(rejected), Tenant: "tenant-1",
 	})
 	require.True(t, result.Accepted(), "%v", result.Cause())
+	if reason == billingtypes.RejectionReasonCancelledByTenant {
+		f.rejectLease(rejected, reason)
+	}
 	timeouts, err := f.execution.TimeoutCoordinator()
 	require.NoError(t, err)
 	candidates := timeouts.TimedOut(time.Nanosecond)
@@ -191,7 +209,11 @@ func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
 	settled := timeouts.Settle(t.Context(), candidates[0])
 	require.True(t, settled.Settled(), "%v", settled.Err())
 	_, rejectedLeases, _ := f.chainCalls()
-	require.Contains(t, rejectedLeases, fleetLeaseUUID(rejected))
+	if reason == billingtypes.RejectionReasonCancelledByTenant {
+		require.Empty(t, rejectedLeases, "tenant cancellation must not record a provider rejection")
+	} else {
+		require.Contains(t, rejectedLeases, fleetLeaseUUID(rejected))
+	}
 
 	// The backend commits after rejection, before Fred's next orphan sweep.
 	request, ok := owner.restoreRequest(rejected)
@@ -208,6 +230,8 @@ func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
 	// Docker's committed-destination close consumes the original finalizer and
 	// retains the bytes under the rejected destination. Represent that backend
 	// outcome in inventory; this test does not emulate Docker volume operations.
+	// TestDeprovision_ReadyRestoreDestinationFinalizesSourceBeforeClose in the
+	// Docker package verifies the finalizer handoff and retained-volume rename.
 	owner.mock.SetRetentions([]backend.RetainedLease{{LeaseUUID: request.LeaseUUID}})
 	require.NoError(t, f.sweep())
 	f.assertPlacementPinned(rejected, owner.name)

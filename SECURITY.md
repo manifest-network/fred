@@ -59,7 +59,7 @@ authorize mutations. See
 For `POST /restore`, the token names the `PENDING` target lease, while the
 unsigned request body selects a retained source lease. No separate source
 token is required: the source must belong to the same tenant and provider,
-be `CLOSED` or `EXPIRED`, and satisfy the restore eligibility checks. Access
+be `CLOSED`, `EXPIRED`, or `REJECTED`, and satisfy the restore eligibility checks. Access
 to the target can therefore authorize moving another eligible lease's
 retained data into it.
 

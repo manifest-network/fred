@@ -89,13 +89,28 @@ in `internal/provisioner/ack_batch_retry_test.go`.
 `restore_retention.qnt` preserves the original stranded-data counterexample.
 `restore_source_recovery.qnt` adds admission followed by interrupted dispatch and
 restart recovery, which the original model did not cover. The historical and
-admission-only variants must violate recovery parity; the shared-policy variant
-must preserve it while refusing success after authority or retained data is lost.
-Its single ownership flag abstracts exact UUID, tenant, provider, and backend
-checks, which the Go regressions exercise separately. The fleet regression runs
-Fred's actual timeout, orphan cleanup, inventory, restore, and signed HTTP paths;
-its backend fixture represents the committed-destination retention outcome and
-does not execute Docker volume operations.
+admission-only variants must violate recovery parity. The shared-policy variant
+preserves parity and refuses dispatch after source authority is lost. Negative
+controls also detect an ownership-check bypass and an added retention gate that
+would block exact retries after the same operation consumed the source.
+
+`Redelivered` means Fred authorized a retry with the same durable operation ID,
+not backend acceptance or successful restoration. Recovery does not query retained
+data and deliberately permits an absent source placement. The model distinguishes
+retained data, data consumed by the same operation, and reaped data; the backend's
+idempotent replay and missing-data responses are outside this model. Its ownership
+flag abstracts exact UUID, tenant, provider, and compatible source placement/backend
+checks, which the Go regressions exercise separately. It assumes the other recovery
+gates (including the PENDING target and exact durable generation) are satisfied.
+
+The fleet regression runs Fred's actual timeout, orphan cleanup, inventory, restore
+application service, and Fred-to-backend HMAC HTTP paths. It covers provider timeout
+rejection and the chain outcome of tenant cancellation; it does not execute the
+ledger's `CancelLease` transaction or the tenant API handler. Its backend fixture
+represents the committed-destination retention outcome and does not execute Docker
+volume operations. Docker's
+`TestDeprovision_ReadyRestoreDestinationFinalizesSourceBeforeClose` separately checks
+the source-finalizer handoff and destination retained-volume rename.
 
 ## Provenance
 

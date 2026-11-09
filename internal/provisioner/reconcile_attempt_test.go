@@ -884,13 +884,18 @@ func TestReconciler_PreservesRestoreAttemptWhenSourceIsUnknownToChain(t *testing
 	assert.Zero(t, redeliveryRuntime(t, store).Count())
 }
 
-func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T) {
+func TestReconciler_RestoreRedeliveryRequiresExactSourceAuthority(t *testing.T) {
 	type sourceCase struct {
 		name                      string
+		wantDispatch              bool
 		sourceHasPendingOperation bool
 		chainSource               billingtypes.Lease
 	}
 	tests := []sourceCase{
+		{
+			name: "exact rejected source", wantDispatch: true,
+			chainSource: redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_REJECTED),
+		},
 		{
 			name: "wrong tenant",
 			chainSource: func() billingtypes.Lease {
@@ -945,6 +950,12 @@ func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T)
 				registry,
 			)
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+			if test.wantDispatch {
+				require.Len(t, backendA.restoreCalls, 1)
+				assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
+				assert.True(t, redeliveryRuntime(t, store).Contains(redeliveryTarget))
+				return
+			}
 			assert.Empty(t, backendA.restoreCalls)
 			assert.Equal(t, placement.StateAttempting,
 				store.Lookup(redeliveryTarget).State())
