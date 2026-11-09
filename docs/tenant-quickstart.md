@@ -399,7 +399,7 @@ counts.
 
 ## Step 7: Restart, update, or restore
 
-Restart and update operate on an `ACTIVE` lease whose provision is `ready` or `failed`. Restore adopts retained data from a closed or expired source into a fresh `PENDING` lease.
+Restart and update operate on an `ACTIVE` lease whose provision is `ready` or `failed`. Restore adopts retained data from a closed, expired, or rejected source into a fresh `PENDING` lease.
 
 ### Restart — same manifest, fresh containers
 
@@ -436,7 +436,7 @@ Before creating a restore target, query [`GET /v1/leases/{uuid}/status`](#step-2
 
 `POST /v1/leases/{lease_uuid}/restore` adopts the retained data into a fresh `PENDING` lease belonging to the same tenant and provider. Request body: `{"from_lease_uuid": "<source lease UUID>"}`. The target must match the source's service names and quantities, though its SKU (disk tier) may differ. The call uses a fresh ADR-036 bearer token for the target lease and is replay-protected. Restore runs on the backend that holds the source data.
 
-The source must be `CLOSED` or `EXPIRED` with eligible retained data. Its UUID
+The source must be `CLOSED`, `EXPIRED`, or `REJECTED` with eligible retained data. Its UUID
 is selected by the unsigned request body; it needs no token of its own.
 
 ```bash

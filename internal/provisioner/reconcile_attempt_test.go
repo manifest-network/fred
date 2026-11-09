@@ -343,13 +343,25 @@ func persistAmbiguousRestoreAttempt(
 	target billingtypes.Lease,
 ) operation.OperationID {
 	t.Helper()
+	return persistAmbiguousRestoreAttemptFromState(t, dbPath, router, backendClient, target, billingtypes.LEASE_STATE_CLOSED)
+}
+
+func persistAmbiguousRestoreAttemptFromState(
+	t testing.TB,
+	dbPath string,
+	router *backend.Router,
+	backendClient *mockReconcilerBackend,
+	target billingtypes.Lease,
+	sourceState billingtypes.LeaseState,
+) operation.OperationID {
+	t.Helper()
 	store := openRedeliveryStore(t, dbPath)
 	_, execution := seedTestTypedConfirmedPlacementsWithExecution(
 		t, store, router, map[string]string{
 			redeliverySource: backendClient.Name(),
 		},
 	)
-	source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+	source := redeliveryLease(redeliverySource, sourceState)
 	chain := redeliveryChain([]billingtypes.Lease{target}, map[string]billingtypes.Lease{
 		redeliverySource: source,
 	})
@@ -803,6 +815,14 @@ func TestReconciler_RedeliveryRequiresExactTargetProvider(t *testing.T) {
 }
 
 func TestReconciler_RedeliversRestoreWithDurableSourceAndRecoveredKind(t *testing.T) {
+	for _, sourceState := range []billingtypes.LeaseState{billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_EXPIRED, billingtypes.LEASE_STATE_REJECTED} {
+		t.Run(sourceState.String(), func(t *testing.T) {
+			testRedeliversRestoreWithDurableSourceAndRecoveredKind(t, sourceState)
+		})
+	}
+}
+
+func testRedeliversRestoreWithDurableSourceAndRecoveredKind(t *testing.T, sourceState billingtypes.LeaseState) {
 	backendA := &mockReconcilerBackend{
 		name:          "backend-a",
 		restoreAccept: true,
@@ -812,7 +832,7 @@ func TestReconciler_RedeliversRestoreWithDurableSourceAndRecoveredKind(t *testin
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	originalTarget := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
 	originalTarget.Items[0].CustomDomain = "restore-original.example.test"
-	operationID := persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, originalTarget)
+	operationID := persistAmbiguousRestoreAttemptFromState(t, dbPath, router, backendA, originalTarget, sourceState)
 
 	store := openRedeliveryStore(t, dbPath)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
@@ -824,7 +844,7 @@ func TestReconciler_RedeliversRestoreWithDurableSourceAndRecoveredKind(t *testin
 	target := originalTarget
 	target.Items = append([]billingtypes.LeaseItem(nil), originalTarget.Items...)
 	target.Items[0].CustomDomain = "restore-changed-after-dispatch.example.test"
-	source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+	source := redeliveryLease(redeliverySource, sourceState)
 	registry := operation.NewRegistry()
 	reconciler := redeliveryReconciler(
 		t, store, router,
@@ -864,38 +884,49 @@ func TestReconciler_PreservesRestoreAttemptWhenSourceIsUnknownToChain(t *testing
 	assert.Zero(t, redeliveryRuntime(t, store).Count())
 }
 
-func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T) {
-	tests := []struct {
+func TestReconciler_RestoreRedeliveryRequiresExactSourceAuthority(t *testing.T) {
+	type sourceCase struct {
 		name                      string
+		wantDispatch              bool
 		sourceHasPendingOperation bool
 		chainSource               billingtypes.Lease
-		wantErrorMatch            string
-	}{
+	}
+	tests := []sourceCase{
+		{
+			name: "exact rejected source", wantDispatch: true,
+			chainSource: redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_REJECTED),
+		},
 		{
 			name: "wrong tenant",
 			chainSource: func() billingtypes.Lease {
-				lease := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+				lease := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_REJECTED)
 				lease.Tenant = "another-tenant"
 				return lease
 			}(),
-			wantErrorMatch: "tenant and provider",
 		},
 		{
 			name: "wrong provider",
 			chainSource: func() billingtypes.Lease {
-				lease := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED)
+				lease := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_REJECTED)
 				lease.ProviderUuid = "b40f1a67-e1aa-4711-84d1-398dbca14c2f"
 				return lease
 			}(),
-			wantErrorMatch: "tenant and provider",
 		},
 		{
 			name:                      "source has pending operation",
 			sourceHasPendingOperation: true,
-			chainSource:               redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_CLOSED),
-			wantErrorMatch:            "source placement",
+			chainSource:               redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_REJECTED),
 		},
 	}
+
+	for _, state := range []billingtypes.LeaseState{
+		billingtypes.LEASE_STATE_PENDING, billingtypes.LEASE_STATE_ACTIVE,
+		billingtypes.LEASE_STATE_UNSPECIFIED, billingtypes.LeaseState(99),
+	} {
+		tests = append(tests, sourceCase{name: state.String(), chainSource: redeliveryLease(redeliverySource, state)})
+	}
+	wrongID := redeliveryLease("wrong-source", billingtypes.LEASE_STATE_REJECTED)
+	tests = append(tests, sourceCase{name: "wrong UUID", chainSource: wrongID})
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -903,7 +934,7 @@ func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T)
 			router := redeliveryRouter(t, backendA)
 			dbPath := filepath.Join(t.TempDir(), "placements.db")
 			target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
-			_ = persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
+			operationID := persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
 			if test.sourceHasPendingOperation {
 				source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_ACTIVE)
 				persistAmbiguousProvisionAttempt(t, dbPath, router, backendA, source)
@@ -919,6 +950,16 @@ func TestReconciler_RestoreRedeliveryRejectsChangedSourceAuthority(t *testing.T)
 				registry,
 			)
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
+			if test.wantDispatch {
+				require.Len(t, backendA.restoreCalls, 1)
+				request := backendA.restoreCalls[0]
+				assert.Equal(t, redeliveryTarget, request.LeaseUUID)
+				assert.Equal(t, redeliverySource, request.FromLeaseUUID)
+				assert.Equal(t, operationID, requireCallbackOperationID(t, request.CallbackURL))
+				assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
+				assert.True(t, redeliveryRuntime(t, store).Contains(redeliveryTarget))
+				return
+			}
 			assert.Empty(t, backendA.restoreCalls)
 			assert.Equal(t, placement.StateAttempting,
 				store.Lookup(redeliveryTarget).State())

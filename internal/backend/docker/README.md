@@ -490,7 +490,7 @@ the same open-time shape/mode checks but no continuous lineage re-attestation.
 
 | Field | YAML Key | Type | Default | Description |
 |---|---|---|---|---|
-| RetainOnClose | `retain_on_close` | bool | `false` | When true, managed volumes are renamed into a `fred-retained-` namespace on lease close/expire instead of being destroyed. Tenants can restore data into a new lease via `POST /v1/leases/{new_lease_uuid}/restore`. |
+| RetainOnClose | `retain_on_close` | bool | `false` | When true, managed volumes are renamed into a `fred-retained-` namespace when deprovisioning a closed, expired, or rejected lease instead of being destroyed. Tenants can restore data into a new lease via `POST /v1/leases/{new_lease_uuid}/restore`. |
 | RetentionDBPath | `retention_db_path` | string | `"retention.db"` | Path to the identity-bound authoritative retention database; always required even when `retain_on_close` is false |
 | RetentionMaxAge | `retention_max_age` | duration | `2160h` (90 days) | How long retained volumes are kept before the grace reaper destroys them. When `> 0` it also gates restore eligibility — a retained record older than this is no longer restorable. Set to `0` to disable age-based reaping **and** the age gate: retained volumes are then kept **indefinitely** and stay restorable until evicted, unless a per-tenant cap (`max_retained_leases_per_tenant > 0`) is configured to evict them. |
 | RetentionReapInterval | `retention_reap_interval` | duration | `1h` | Cadence of the background retention sweep, which destroys expired retained volumes and reconciles in-flight restores. If set to `0` it falls back to `retention_max_age`, then to a hard-coded `1h`. The sweep still runs (to reconcile restores) when `retain_on_close` is set even with `retention_max_age: 0`. |
@@ -689,7 +689,7 @@ See [Manifest Guide](../../../docs/manifest-guide.md) for the full tenant-facing
 
 ## Soft-delete & Restore
 
-When `retain_on_close: true` is set, the backend performs a **soft-delete** instead of a hard destroy at lease close or auto-expire time:
+When `retain_on_close: true` is set, the backend performs a **soft-delete** instead of a hard destroy when deprovisioning a closed, expired, or rejected lease:
 
 1. Canonical volumes that are **writable-path-only** — they hold only the ephemeral `_wp/` scaffolding (a read-only-rootfs writable-path mount) and no declared-`VOLUME` durable data — are **destroyed (reclaimed)**, not retained. Restore reseeds `_wp` from the image anyway (the ENG-367 wipe-contract), so retaining such a volume preserves nothing restorable and only pollutes the retention record, a per-tenant slot, the retained-disk budget, and the volume root. The detector (`isWritablePathOnly`) is conservative toward RETAIN — it destroys only *provably* `_wp`-only volumes, never a stateful one (ENG-406). If uncertainty nevertheless leaves an exact diskless scratch name in a retention row, its pinned allowance stays in physical pool accounting and quota backfill until destruction; that fail-closed exception is not retention entitlement. Observable via `fred_docker_backend_retention_writable_path_reclaimed_total`.
 2. The remaining managed volumes for the lease are **renamed** from `fred-<lease_uuid>-…` into a `fred-retained-<lease_uuid>-…` namespace and kept on disk.
@@ -700,10 +700,10 @@ When `retain_on_close: true` is set, the backend performs a **soft-delete** inst
 
 ### Restore flow
 
-To restore data from a closed lease into a new lease:
+To restore retained data from a `CLOSED`, `EXPIRED`, or `REJECTED` lease into a new lease:
 
-1. Open a **fresh lease on the same provider** by requesting the **same service names and quantities** as the original closed lease. The new lease UUID (`new_lease_uuid`) will be in `PENDING` state.
-2. Call `POST /v1/leases/{new_lease_uuid}/restore` with body `{"from_lease_uuid": "<original_closed_lease_uuid>"}`. Fred validates the request and delegates to the backend.
+1. Open a **fresh lease on the same provider** by requesting the **same service names and quantities** as the original source lease. The new lease UUID (`new_lease_uuid`) will be in `PENDING` state.
+2. Call `POST /v1/leases/{new_lease_uuid}/restore` with body `{"from_lease_uuid": "<source_lease_uuid>"}`. Fred validates the request and delegates to the backend.
 3. After durable admission, the lease actor renames the retained volumes into the new lease's namespace and re-deploys the **retained manifest** (the exact deployment that was running at close time) onto them. The new lease becomes active with the same data. To change the image or configuration after restore, use the normal update path once the lease is active.
 
 The source close must finish before a new restore can claim its data. A close
@@ -1946,7 +1946,7 @@ Re-deploys a lease with a new manifest (image/config change). The `payload` fiel
 
 ### `POST /restore` (authenticated)
 
-Restores a closed lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original closed lease), the exact operation `callback_url`, and the typed `lifecycle_callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. Under the configured transport trust boundary the coded response makes the exact attempt clearable; it is not an HMAC-authenticated backend response. See [Soft-delete & Restore](#soft-delete--restore).
+Restores a closed, expired, or rejected lease's retained volumes into a fresh lease. Body carries `from_lease_uuid` (the original source lease), the exact operation `callback_url`, and the typed `lifecycle_callback_url`. Async — result via callback. Returns `202` (`{"status": "restoring"}`). `422` is **overloaded**: a **bare** `422` (no `code`) means no retained data exists (`ErrNotRetained`), while `422` with body `{"code":"demote_exceeds_tier"}` means the retained data exceeds the requested smaller SKU tier (`ErrDemoteDataExceedsTier`, see [Restore flow](#restore-flow)). Also `409` for invalid state / already provisioned, `400` (validation), and `503` with `code="insufficient_resources"` for a synchronous capacity refusal. Under the configured transport trust boundary the coded response makes the exact attempt clearable; it is not an HMAC-authenticated backend response. See [Soft-delete & Restore](#soft-delete--restore).
 
 The completion URL must carry a canonical UUIDv4 `operation_id`; a tokenless
 request cannot create an operation intent or reserve the retained source.

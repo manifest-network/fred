@@ -1115,6 +1115,20 @@ func (f *fleet) closeLease(uuid string) {
 	f.leases[uuid] = lease
 }
 
+// rejectLease models chain inclusion of a provider rejection or tenant cancellation.
+func (f *fleet) rejectLease(uuid, reason string) {
+	f.t.Helper()
+	uuid = fleetLeaseUUID(uuid)
+	f.leaseMu.Lock()
+	defer f.leaseMu.Unlock()
+	lease, ok := f.leases[uuid]
+	require.True(f.t, ok, "rejectLease: no lease %q on chain", uuid)
+	require.Equal(f.t, billingtypes.LEASE_STATE_PENDING, lease.State)
+	lease.State = billingtypes.LEASE_STATE_REJECTED
+	lease.RejectionReason = reason
+	f.leases[uuid] = lease
+}
+
 // removeLease makes the chain deny all knowledge of a lease. Note this is NOT
 // how a lease ends on the real chain — x/billing never deletes one — so it
 // models a phantom provision, a wrong/reset chain, or an RPC node behind the

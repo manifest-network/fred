@@ -630,7 +630,7 @@ Get provision diagnostics for a specific lease. Used by fred to serve `GET /v1/l
 ```
 
 **Fields:**
-- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed or expired lease whose data is retained, alongside `items` (the restore shape).
+- `status` - Provision status: `provisioning`, `ready`, `failing`, `failed`, `unknown`, `restarting`, `updating`, or `deprovisioning`. A backend that implements soft-delete/retention (see `/restore` below) also returns `retained` for a closed, expired, or rejected lease whose data is retained, alongside `items` (the restore shape).
 - `retained_until` (optional) - RFC3339 retention deadline for retained data with a configured age limit. Omit it when age-based expiry is disabled; do not encode a zero timestamp as a deadline. Other retention policy and capacity limits still apply.
 - `tenant` - The owning tenant's address; Fred never copies it into a tenant-facing response. A `retained` record needs it: when the chain has no record of the lease, Fred serves the tenant's status and provision reads from a `retained` record only if its `tenant` is nonempty and equals the caller's.
 - `partition` (omitempty) - Retained records only: the tenant's own retention-partition key, which Fred shows to that tenant with the retained record.
@@ -993,7 +993,7 @@ List the leases whose data this backend currently retains. Fred's reconciler pol
 Every page must carry a `retentions` array: return `{"retentions": []}` (never `null`) when nothing is retained. The `continue`, canonical-UUID and no-duplicate rules of the `GET /provisions` inventory shape apply here too.
 
 **Fields:**
-- `lease_uuid` - The closed or expired lease whose data is retained.
+- `lease_uuid` - The closed, expired, or rejected lease whose data is retained.
 - `provider_uuid`, `tenant` (optional) - The retained lease's provider and owning tenant. Fred uses them only as evidence in offline placement repair (`placement-repair`), never in a tenant-facing response: a missing value is routing-only evidence, and a nonempty value that contradicts Fred's durable record is refused as a conflict.
 
 **Pagination:** `GET /retentions` is keyset-paginated, mirroring `GET /provisions`. Query params: `limit` (max page size) and `continue` (a lease UUID — the `continue` cursor returned by the previous page). The JSON response carries a top-level `continue` field set to the last record's lease UUID, omitted once the list is exhausted. Fred's client walks the pages requesting `limit` = `RetentionsPageLimit` (default 1000) and fail-closes each page body at 1 MiB, reassembling the complete set (complete-or-error) so the reconciler never routes off partial retention data. (ENG-451)

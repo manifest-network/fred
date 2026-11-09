@@ -48,7 +48,8 @@ its corresponding product change has shipped.
 | `ack_retry_budget.qnt` | ENG-2127: deadlines, exact evidence, bounded retries | Follow-up model of the implemented retry |
 | `lease_settlement.qnt` | ENG-2129: timeout after authenticated Success | Fixed in PR #296; witness wrappers exercise the original race |
 | [`inline_callback_completion.qnt`](../../internal/provisioner/operation/testdata/inline_callback_completion.qnt) | ENG-2129: synchronous completion after an inline callback | Fixed in PR #296; remains beside operation regression tests, included by this runner |
-| `restore_retention.qnt` | ENG-2130: terminal destination strands retained data | Proposed fix remains unimplemented |
+| `restore_retention.qnt` | ENG-2130: terminal destination strands retained data | Shared terminal-source eligibility implemented alongside the recovery model |
+| `restore_source_recovery.qnt` | ENG-2130: admitted EXPIRED/REJECTED sources must remain recoverable after restart | Shared eligibility used by admission and recovery |
 | `billing_ledger.qnt` | ENG-2131: fractional seconds lost at withdrawal | Proposed manifest-ledger change; requires a chain upgrade |
 | `custom_domain_handoff.qnt` | ENG-2132: overlapping and restored stale routes | Deferred architectural change; partial-fix mutants are included |
 | `billing_fairness.qnt` | ENG-858: reservation contract | Candidate contract, awaiting a product decision |
@@ -83,12 +84,51 @@ partway through sequential exact reads. These models do not prove network
 liveness, model chain reorganization, or replace the actual acknowledgment tests
 in `internal/provisioner/ack_batch_retry_test.go`.
 
+## ENG-2130 correspondence and limits
+
+`restore_retention.qnt` preserves the original stranded-data counterexample.
+`restore_source_recovery.qnt` adds admission followed by interrupted dispatch and
+restart recovery, which the original model did not cover. The historical and
+admission-only variants must violate recovery parity. The shared-policy variant
+preserves parity and refuses dispatch after source authority is lost. Negative
+controls also detect an ownership-check bypass and an added retention gate that
+would block exact retries after the same operation consumed the source.
+
+`Redelivered` means Fred authorized a retry with the same durable operation ID,
+not backend acceptance or successful restoration. Recovery does not query retained
+data and deliberately permits an absent source placement. The model distinguishes
+retained data, data consumed by the same operation, and reaped data; the backend's
+idempotent replay and missing-data responses are outside this model. Its ownership
+flag abstracts exact UUID, tenant, provider, and compatible source placement/backend
+checks. Go regressions separately exercise identity mismatches; the recovery-source
+gate tests cover confirmed matching/foreign backends, pending source operations,
+ambiguous placement, and absent placement. The model assumes the other recovery
+gates (including the PENDING target and exact durable generation) are satisfied.
+
+The source-state observation is constant in this model. It tests admission/recovery
+policy parity, but cannot detect a missing terminal-state recheck after a lagging or
+reset RPC node reports a different state. The terminal half of the dispatch invariant
+therefore follows from admission; Go recovery regressions separately exercise changed
+nonterminal and unknown observations. In `fixed`, the premise of
+`consumedSourceCanRetry` is unreachable because eligible consumed sources are
+redelivered, never preserved. The `retentionGatedRetry` negative control makes that
+premise reachable and demonstrates that the property detects an erroneous gate.
+
+The fleet regression runs Fred's actual timeout, orphan cleanup, inventory, restore
+application service, and Fred-to-backend HMAC HTTP paths. It covers provider timeout
+rejection and the chain outcome of tenant cancellation; it does not execute the
+ledger's `CancelLease` transaction or the tenant API handler. Its backend fixture
+represents the committed-destination retention outcome and does not execute Docker
+volume operations. Docker's
+`TestDeprovision_ReadyRestoreDestinationFinalizesSourceBeforeClose` separately checks
+the source-finalizer handoff and destination retained-volume rename.
+
 ## Provenance
 
 The eight original `.qnt` files and `ack_current_cex.itf.json` are copied verbatim
 from `fred-quint.zip`; `SOURCE.sha256` identifies that archive. They modeled Fred
 at `a802bca` and manifest-ledger billing at `43e2e1a`. [FINDINGS.md](FINDINGS.md)
 preserves the original report with a provenance note. The settlement witness
-wrappers, inline-callback model, budget model, and runner were added during review
+wrappers, inline-callback model, budget and restore-recovery models, and runner were added during review
 and remediation. No private session transcript or agent execution prompt is
 required to run the suite.

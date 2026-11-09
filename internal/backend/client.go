@@ -945,9 +945,9 @@ const (
 	ProvisionStatusRestarting     ProvisionStatus = "restarting"
 	ProvisionStatusUpdating       ProvisionStatus = "updating"
 	ProvisionStatusDeprovisioning ProvisionStatus = "deprovisioning"
-	// ProvisionStatusRetained is published to the tenant at lease close/expire
-	// time to signal that managed volumes may have been kept under a
-	// fred-retained- namespace if the backend has retain_on_close enabled.
+	// ProvisionStatusRetained is published to the tenant when a closed, expired,
+	// or rejected lease is deprovisioned to signal that managed volumes may have
+	// been kept under a fred-retained- namespace if retain_on_close is enabled.
 	// This is a best-effort hint; the backend may not have retention configured.
 	ProvisionStatusRetained ProvisionStatus = "retained"
 )

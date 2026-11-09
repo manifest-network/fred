@@ -439,13 +439,13 @@ func (recovery *AttemptRecoveryCoordinator) validateRestoreSource(
 	observation := recovery.controlPlane.observeLease(
 		queryCtx, sourceLeaseUUID, target.Tenant,
 	)
-	source, exact := exactLeaseFromObservation(observation)
+	source, exact := observation.(observedExactLease)
 	if !exact {
 		return fmt.Errorf("re-read restore recovery source: %w",
 			exactLeaseObservationError(observation))
 	}
-	if source.State != billingtypes.LEASE_STATE_CLOSED {
-		return errors.New("restore recovery source is not a closed retained lease")
+	if !source.mayHoldRetainedData() {
+		return errors.New("restore recovery source is not eligible to hold retained data")
 	}
 	return nil
 }
