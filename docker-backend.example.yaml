@@ -317,10 +317,11 @@ releases_max_age: 2160h
 # SOFT-DELETE & RETENTION (optional)
 # =============================================================================
 # When retain_on_close is enabled, managed volumes are renamed into a
-# fred-retained- namespace at lease close/expire time instead of being
-# destroyed. Tenants can restore their data into a new lease via:
+# fred-retained- namespace when deprovisioning a closed, expired, or rejected
+# lease instead of being destroyed. Tenants can restore their data into a new
+# lease via:
 #   POST /v1/leases/{new_lease_uuid}/restore
-# with body: {"from_lease_uuid": "<original_closed_lease_uuid>"}
+# with body: {"from_lease_uuid": "<source_lease_uuid>"}
 #
 # Limitations:
 #   - Retention is best-effort and capacity-bounded (see max_retained_leases_per_tenant).
@@ -328,7 +329,8 @@ releases_max_age: 2160h
 #     providerd preserves that source affinity across its multi-backend fleet.
 #   - Retained data is a single copy on local disk — retention is not a backup.
 
-# Enable soft-delete on lease close/expire. Default: false.
+# Enable soft-delete when deprovisioning closed, expired, or rejected leases.
+# Default: false.
 # retain_on_close: false
 
 # Path to the identity-bound authoritative retention database. The file is

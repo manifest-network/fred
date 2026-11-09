@@ -100,8 +100,19 @@ data and deliberately permits an absent source placement. The model distinguishe
 retained data, data consumed by the same operation, and reaped data; the backend's
 idempotent replay and missing-data responses are outside this model. Its ownership
 flag abstracts exact UUID, tenant, provider, and compatible source placement/backend
-checks, which the Go regressions exercise separately. It assumes the other recovery
+checks. Go regressions separately exercise identity mismatches; the recovery-source
+gate tests cover confirmed matching/foreign backends, pending source operations,
+ambiguous placement, and absent placement. The model assumes the other recovery
 gates (including the PENDING target and exact durable generation) are satisfied.
+
+The source-state observation is constant in this model. It tests admission/recovery
+policy parity, but cannot detect a missing terminal-state recheck after a lagging or
+reset RPC node reports a different state. The terminal half of the dispatch invariant
+therefore follows from admission; Go recovery regressions separately exercise changed
+nonterminal and unknown observations. In `fixed`, the premise of
+`consumedSourceCanRetry` is unreachable because eligible consumed sources are
+redelivered, never preserved. The `retentionGatedRetry` negative control makes that
+premise reachable and demonstrates that the property detects an erroneous gate.
 
 The fleet regression runs Fred's actual timeout, orphan cleanup, inventory, restore
 application service, and Fred-to-backend HMAC HTTP paths. It covers provider timeout

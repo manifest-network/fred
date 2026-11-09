@@ -8,7 +8,7 @@ import billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types
 // observation and unknown future states are ineligible.
 //
 // Provision or restore can commit after timeout rejection, tenant cancellation,
-// or expiry. Closing that lease retains its data, so all three terminal
+// or expiry. Deprovisioning that lease can retain its data, so all three terminal
 // states must remain eligible. This grants no retention or dispatch authority:
 // placement still binds the owning backend, which checks the actual retained
 // data, tenant, retention lifetime, and restore constraints.

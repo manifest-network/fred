@@ -172,22 +172,23 @@ func testFleetRestoreFromRejectedCommittedDestination(t *testing.T, reason strin
 		return nil // Accept the operation; its asynchronous commit is delayed below.
 	})
 
-	// Model chain inclusion when the real timeout coordinator rejects the lease.
-	reject := f.chain.RejectLeasesFunc
-	f.chain.RejectLeasesFunc = func(ctx context.Context, ids []string, reason string) (uint64, []string, error) {
-		count, hashes, err := reject(ctx, ids, reason)
-		if err == nil {
-			for _, id := range ids {
-				f.rejectLease(id, reason)
-			}
-		}
-		return count, hashes, err
-	}
+	// Cancellation has already made the lease terminal when timeout settlement
+	// attempts rejection. The ledger refuses it and Fred must read back the lease.
 	if reason == billingtypes.RejectionReasonCancelledByTenant {
-		// CancelLease is a tenant chain transaction. Model its resulting state;
-		// a later provider rejection must receive the ledger's not-pending error.
 		f.chain.RejectLeasesFunc = func(context.Context, []string, string) (uint64, []string, error) {
 			return 0, nil, billingtypes.ErrLeaseNotPending
+		}
+	} else {
+		// Model successful chain inclusion of the provider's timeout rejection.
+		reject := f.chain.RejectLeasesFunc
+		f.chain.RejectLeasesFunc = func(ctx context.Context, ids []string, rejectionReason string) (uint64, []string, error) {
+			count, hashes, err := reject(ctx, ids, rejectionReason)
+			if err == nil {
+				for _, id := range ids {
+					f.rejectLease(id, rejectionReason)
+				}
+			}
+			return count, hashes, err
 		}
 	}
 	setTestProviderControlPlane(t, f.execution, f.chain, nil)
@@ -207,11 +208,13 @@ func testFleetRestoreFromRejectedCommittedDestination(t *testing.T, reason strin
 	candidates := timeouts.TimedOut(time.Nanosecond)
 	require.Len(t, candidates, 1)
 	settled := timeouts.Settle(t.Context(), candidates[0])
-	require.True(t, settled.Settled(), "%v", settled.Err())
-	_, rejectedLeases, _ := f.chainCalls()
 	if reason == billingtypes.RejectionReasonCancelledByTenant {
-		require.Empty(t, rejectedLeases, "tenant cancellation must not record a provider rejection")
+		require.Equal(t, placement.TimeoutLeaseTerminal, settled.Disposition())
+		require.ErrorIs(t, settled.Err(), billingtypes.ErrLeaseNotPending)
 	} else {
+		require.Equal(t, placement.TimeoutRejected, settled.Disposition())
+		require.NoError(t, settled.Err())
+		_, rejectedLeases, _ := f.chainCalls()
 		require.Contains(t, rejectedLeases, fleetLeaseUUID(rejected))
 	}
 

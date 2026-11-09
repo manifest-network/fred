@@ -934,7 +934,7 @@ func TestReconciler_RestoreRedeliveryRequiresExactSourceAuthority(t *testing.T) 
 			router := redeliveryRouter(t, backendA)
 			dbPath := filepath.Join(t.TempDir(), "placements.db")
 			target := redeliveryLease(redeliveryTarget, billingtypes.LEASE_STATE_PENDING)
-			_ = persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
+			operationID := persistAmbiguousRestoreAttempt(t, dbPath, router, backendA, target)
 			if test.sourceHasPendingOperation {
 				source := redeliveryLease(redeliverySource, billingtypes.LEASE_STATE_ACTIVE)
 				persistAmbiguousProvisionAttempt(t, dbPath, router, backendA, source)
@@ -952,6 +952,10 @@ func TestReconciler_RestoreRedeliveryRequiresExactSourceAuthority(t *testing.T) 
 			require.NoError(t, reconciler.ReconcileAll(t.Context()))
 			if test.wantDispatch {
 				require.Len(t, backendA.restoreCalls, 1)
+				request := backendA.restoreCalls[0]
+				assert.Equal(t, redeliveryTarget, request.LeaseUUID)
+				assert.Equal(t, redeliverySource, request.FromLeaseUUID)
+				assert.Equal(t, operationID, requireCallbackOperationID(t, request.CallbackURL))
 				assert.Equal(t, placement.StateConfirmed, store.Lookup(redeliveryTarget).State())
 				assert.True(t, redeliveryRuntime(t, store).Contains(redeliveryTarget))
 				return
