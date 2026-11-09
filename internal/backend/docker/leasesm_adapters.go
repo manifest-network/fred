@@ -198,7 +198,7 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 		return false
 	}
 	wasReady := p.Status == backend.ProvisionStatusReady
-	wasProvisioning := p.Status == backend.ProvisionStatusProvisioning
+	wasStarting := awaitsReadyDeathRedispatch(p.Status)
 	fn(&p.ProvisionState)
 	isReady := p.Status == backend.ProvisionStatusReady
 	// Readiness is a property of the projection mutation, so its gauge delta is
@@ -211,13 +211,13 @@ func (s *backendProvisionStore) UpdateFn(leaseUUID string, fn func(*leasesm.Prov
 	case wasReady && !isReady:
 		activeProvisions.Dec()
 	}
-	if wasProvisioning && isReady {
-		// A provision's Ready entry: a container that died after the worker's
-		// last inspection was in no Ready projection when its die event came,
+	if wasStarting && isReady {
+		// A provision or replacement's Ready entry: a container that died after
+		// the worker's last inspection was in no Ready projection when its die event came,
 		// so it could not be routed. The event loop records a death before
 		// its dispatcher looks it up under this lock, so such a death was
 		// recorded before this entry. Hand it back to the dispatcher now that
-		// the projection names it (ENG-1125).
+		// the projection names it (ENG-1125, ENG-2126).
 		s.backend.redispatchStartupDeaths(p.ContainerIDs)
 	}
 	return true

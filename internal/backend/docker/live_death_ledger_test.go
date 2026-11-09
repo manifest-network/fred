@@ -88,15 +88,14 @@ func TestLiveDeathLedger_AwaitWaitsOnlyWhileConnected(t *testing.T) {
 	})
 }
 
-// provisioningForReadyRace puts the harness lease back in its provision,
-// before the actor's Ready transition. published says whether the provision
-// worker has already published the new cohort's container IDs, as it does
-// just before it reports success.
-func provisioningForReadyRace(h *budgetEventHarness, published bool) {
+// startingForReadyRace puts the harness lease before the actor's Ready
+// transition. published says whether the worker has already published the
+// new cohort's container IDs, as it does just before it reports success.
+func startingForReadyRace(h *budgetEventHarness, status backend.ProvisionStatus, published bool) {
 	h.b.provisionsMu.Lock()
 	defer h.b.provisionsMu.Unlock()
 	provisioning := h.b.provisions[budgetTestLease]
-	provisioning.Status = backend.ProvisionStatusProvisioning
+	provisioning.Status = status
 	provisioning.ContainerIDs = nil
 	provisioning.ServiceContainers = nil
 	if published {
@@ -115,7 +114,7 @@ func enterReadyForRace(h *budgetEventHarness) bool {
 	})
 }
 
-// The Ready race (ENG-1125): a container that dies after the provision's last
+// The Ready race (ENG-1125, ENG-2126): a container that dies after the worker's last
 // startup inspection is in no Ready projection when its die event arrives, so
 // the event loop cannot route it, whether or not the worker has published the
 // cohort's IDs yet. The dispatcher is done with that death before the Ready
@@ -125,34 +124,42 @@ func enterReadyForRace(h *budgetEventHarness) bool {
 // the death of a Ready workload, with its live provenance. The dispatcher
 // does not count the death it left to the Ready entry as dropped.
 func TestReadyEntryRedispatchesARecordedStartupDeath(t *testing.T) {
-	for _, published := range []bool{false, true} {
-		t.Run(fmt.Sprintf("ids published %t", published), func(t *testing.T) {
-			h := newUnstartedBudgetEventHarness(t)
-			provisioningForReadyRace(h, published)
-			verifications := countStorageVerifications(h.b)
-			h.start(func(b *Backend) { b.containerEventLoop() })
-			h.awaitSubscriptions(1)
-			tenantBefore, dropsBefore := failureCount("tenant_workload"), eventLoopDrops()
+	for _, status := range []backend.ProvisionStatus{
+		backend.ProvisionStatusProvisioning,
+		backend.ProvisionStatusRestarting, // restart and restore share this Ready entry
+		backend.ProvisionStatusUpdating,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			for _, published := range []bool{false, true} {
+				t.Run(fmt.Sprintf("ids published %t", published), func(t *testing.T) {
+					h := newUnstartedBudgetEventHarness(t)
+					startingForReadyRace(h, status, published)
+					verifications := countStorageVerifications(h.b)
+					h.start(func(b *Backend) { b.containerEventLoop() })
+					h.awaitSubscriptions(1)
+					tenantBefore, dropsBefore := failureCount("tenant_workload"), eventLoopDrops()
 
-			verified := verifications.Load()
-			h.setContainer("exited", 1, false)
-			h.send(containerEventStart, containerEventDie)
-			h.sendFor("probe", containerEventDie)
-			require.Eventually(t, func() bool { return verifications.Load()-verified >= 2 },
-				5*time.Second, time.Millisecond, "the dispatcher never reached the death after c1's")
-			assert.Equal(t, backend.ProvisionStatusProvisioning, h.status(), "an unroutable death changes nothing")
-			h.b.liveDeaths.mu.Lock()
-			_, recorded := h.b.liveDeaths.deathsByID["c1"]
-			h.b.liveDeaths.mu.Unlock()
-			require.True(t, recorded, "the dispatcher saw a death the ledger does not hold")
+					verified := verifications.Load()
+					h.setContainer("exited", 1, false)
+					h.send(containerEventStart, containerEventDie)
+					h.sendFor("probe", containerEventDie)
+					require.Eventually(t, func() bool { return verifications.Load()-verified >= 2 },
+						5*time.Second, time.Millisecond, "the dispatcher never reached the death after c1's")
+					assert.Equal(t, status, h.status(), "an unroutable death changes nothing")
+					h.b.liveDeaths.mu.Lock()
+					_, recorded := h.b.liveDeaths.deathsByID["c1"]
+					h.b.liveDeaths.mu.Unlock()
+					require.True(t, recorded, "the dispatcher saw a death the ledger does not hold")
 
-			require.True(t, enterReadyForRace(h))
-			h.awaitStatus(backend.ProvisionStatusFailed)
-			h.requireWire(1, backend.TerminalVerdictRetry)
-			assert.Equal(t, 1.0, failureCount("tenant_workload")-tenantBefore)
-			assert.Equal(t, dropsBefore, eventLoopDrops(), "a death left to the Ready entry is not a lost death")
-			assert.Empty(t, h.b.liveDeaths.takeLiveDeaths([]string{"c1"}), "the ledger handed the death out once")
-			require.NoError(t, h.b.recoverState(context.Background()))
+					require.True(t, enterReadyForRace(h))
+					h.awaitStatus(backend.ProvisionStatusFailed)
+					h.requireWire(1, backend.TerminalVerdictRetry)
+					assert.Equal(t, 1.0, failureCount("tenant_workload")-tenantBefore)
+					assert.Equal(t, dropsBefore, eventLoopDrops(), "a death left to the Ready entry is not a lost death")
+					assert.Empty(t, h.b.liveDeaths.takeLiveDeaths([]string{"c1"}), "the ledger handed the death out once")
+					require.NoError(t, h.b.recoverState(context.Background()))
+				})
+			}
 		})
 	}
 }
@@ -168,7 +175,7 @@ func TestReadyEntryRedispatchesARecordedStartupDeath(t *testing.T) {
 func TestLiveDeathIsRecordedBeforeItIsDispatched(t *testing.T) {
 	h := newUnstartedBudgetEventHarness(t)
 	h.events = make(chan ContainerEvent) // a send returns once the reader took the event
-	provisioningForReadyRace(h, false)
+	startingForReadyRace(h, backend.ProvisionStatusProvisioning, false)
 	verifications := countStorageVerifications(h.b)
 	h.start(func(b *Backend) { b.containerEventLoop() })
 	h.awaitSubscriptions(1)

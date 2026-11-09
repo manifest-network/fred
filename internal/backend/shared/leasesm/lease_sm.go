@@ -41,7 +41,6 @@ const (
 	evProvisionCompleted
 	evProvisionErrored
 	evDiagGathered
-	evContainersRemoved
 	// evCohortDiverged is a recovery-authored, substrate-agnostic signal that
 	// observed instances no longer match the durable desired release. It is
 	// separate from evContainerDied so no fake instance identity or inspection
@@ -92,8 +91,6 @@ func (e leaseEvent) String() string {
 		return "ProvisionErrored"
 	case evDiagGathered:
 		return "DiagGathered"
-	case evContainersRemoved:
-		return "ContainersRemoved"
 	case evCohortDiverged:
 		return "CohortDiverged"
 	case evReplaceCompleted:
@@ -275,7 +272,7 @@ func newLeaseSM(actor *LeaseActor) *leaseSM {
 	// actor's serial inbox is what guarantees Status consistency.
 	sm.Configure(backend.ProvisionStatusRestarting).
 		OnEntryFrom(evRestartRequested, lsm.onEnterRestarting).
-		// Restore (ENG-325) enters Restarting from Provisioning and reuses the
+		// Restore (ENG-325) enters Restarting from Reserved and reuses the
 		// SAME entry action: applyReplaceEntry writes Status=Restarting + the
 		// callback URL pair. The provision store derives readiness accounting
 		// directly from the resulting status transitions.
