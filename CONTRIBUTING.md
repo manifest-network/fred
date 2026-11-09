@@ -92,6 +92,15 @@ CI also runs the short suite with `-coverprofile=coverage.out`, reports aggregat
 
 PR CI checks GoReleaser configuration and builds snapshot binaries, archives and the container image without publishing or signing. Tagged releases must point to a commit in `main` history, then pass the same full CI and integration workflows on that exact commit before publishing. Repository tag-creation and release permissions must remain restricted to trusted maintainers.
 
+### Formal models
+
+The [Quint suite](models/quint/README.md) tracks the lifecycle, acknowledgment,
+retention, routing, and billing models used to investigate race conditions.
+Install its pinned tool with `npm ci --prefix models/quint --ignore-scripts`, then
+run `make test-models`. The suite checks both invariants and expected historical
+counterexamples. Models of proposed fixes are labeled separately from shipped
+behavior; sampled traces supplement Go regression tests, not replace them.
+
 ### Race detector
 
 **Run the full unit suite under `-race -short` regularly.** Stress tests OOM under `-race` because they allocate large fixtures; they self-skip via `testing.Short()`.

@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
+
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/metrics"
 	"github.com/manifest-network/fred/internal/metrics/background"
@@ -480,6 +482,12 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 		}
 
 		acknowledged, txHashes, err := l.chainClient.AcknowledgeLeases(ctx, leaseUUIDs)
+		if errors.Is(err, billingtypes.ErrLeaseNotPending) {
+			pendingLeases, acknowledged, txHashes, err = l.retryChangedAckBatch(ctx, pendingLeases, dupChans, err)
+			if len(pendingLeases) == 0 {
+				return // Exact observations already delivered every caller's result.
+			}
+		}
 
 		if err == nil {
 			var txHash string
@@ -515,7 +523,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 			if errors.As(err, &chainErr) && (chainErr.IsInsufficientFee() || chainErr.IsOutOfGas()) {
 				l.series.FeeGasErrors.Inc()
 				slog.Warn("batch acknowledgment failed with fee/gas error; surfacing to callers (not individualizing)",
-					"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
+					"lane", laneIdx, "count", len(pendingLeases), "error", err,
 				)
 				result := ackResult{err: err}
 				for _, req := range pendingLeases {
@@ -534,7 +542,7 @@ func (l *ackLane) batchLoop(ctx context.Context, laneIdx int) (crashed bool) {
 			}
 			l.series.IndividualFallbacks.Inc()
 			slog.Warn("batch acknowledgment failed, falling back to individual acks",
-				"lane", laneIdx, "count", len(leaseUUIDs), "error", err,
+				"lane", laneIdx, "count", len(pendingLeases), "error", err,
 			)
 			l.acknowledgeIndividually(ctx, pendingLeases, dupChans, laneIdx)
 		}

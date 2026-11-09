@@ -105,6 +105,12 @@ test:
 	@echo "Running tests..."
 	$(GOTEST) -v ./...
 
+# Sample formal models and require historical counterexamples to reproduce.
+# Install the pinned tool first: npm ci --prefix models/quint --ignore-scripts
+.PHONY: test-models
+test-models:
+	python3 models/quint/run.py
+
 # Run volume unit tests (no special requirements)
 test-volume:
 	@echo "Running volume unit tests..."
@@ -249,6 +255,7 @@ help:
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test                    - Run tests"
+	@echo "  test-models             - Run the pinned Quint simulation suite"
 	@echo "  test-volume             - Run volume unit tests"
 	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, btrfs/xfs/zfs tools)"
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"

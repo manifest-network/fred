@@ -1,0 +1,191 @@
+[
+  {
+    "model": "lease_death_routing.qnt",
+    "variant": "current",
+    "invariant": "deadReadyContainerIsInFlight",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "lease_death_routing.qnt",
+    "variant": "fixed",
+    "invariant": "deadReadyContainerIsInFlight",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "ack_lane_flush.qnt",
+    "variant": "current",
+    "invariant": "noSpuriousAckError",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "ack_lane_flush.qnt",
+    "variant": "fixed",
+    "invariant": "noSpuriousAckError",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "restore_retention.qnt",
+    "variant": "current",
+    "invariant": "retainedDataStaysRestorable",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "restore_retention.qnt",
+    "variant": "fixed",
+    "invariant": "retainedDataStaysRestorable",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "billing_ledger.qnt",
+    "variant": "current",
+    "invariant": "providerPaidForEverySecond",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "billing_ledger.qnt",
+    "variant": "fixed",
+    "invariant": "providerPaidForEverySecond",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "current",
+    "invariant": "exclusiveRoute",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "fixed",
+    "invariant": "exclusiveRoute",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "current",
+    "invariant": "settledClearRemovesRoute",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "fixed",
+    "invariant": "settledClearRemovesRoute",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "billing_fairness.qnt",
+    "variant": "current",
+    "invariant": "guaranteeHonored",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "billing_fairness.qnt",
+    "variant": "fixed",
+    "invariant": "guaranteeHonored",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "lease_death_routing.qnt",
+    "variant": "current",
+    "invariant": "deadReadyContainerIsInFlight",
+    "expect_violation": false,
+    "step": "provisionOnlyStep"
+  },
+  {
+    "model": "restore_retention.qnt",
+    "variant": "noTimeoutReject",
+    "invariant": "retainedDataStaysRestorable",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "settlement_witness.qnt",
+    "variant": "settlement_witness",
+    "invariant": "noRejectAfterAuthenticatedSuccess",
+    "expect_violation": true,
+    "step": "witnessStep"
+  },
+  {
+    "model": "settlement_witness_fixed.qnt",
+    "variant": "settlement_witness_fixed",
+    "invariant": "noRejectAfterAuthenticatedSuccess",
+    "expect_violation": false,
+    "step": "witnessStep"
+  },
+  {
+    "model": "lease_settlement.qnt",
+    "variant": "fixed",
+    "invariant": "noRejectAfterAuthenticatedSuccess and quiescentIsConsistent",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "maintenance_commands.qnt",
+    "variant": "maintenance",
+    "invariant": "payloadOnlyFromSucceededUpdate and receiptsAgreeWithBackend and noLostUpdate and noImmortalPending",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "stripOnly",
+    "invariant": "exclusiveRoute",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "custom_domain_handoff.qnt",
+    "variant": "exclusiveOnly",
+    "invariant": "settledClearRemovesRoute",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "ack_retry_budget.qnt",
+    "variant": "fixed",
+    "invariant": "deadlineRespected and retryRequiresEvidence and retriesBounded and successRequiresActive",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "ack_retry_budget.qnt",
+    "variant": "missingDeadlineCheck",
+    "invariant": "deadlineRespected",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "../../internal/provisioner/operation/testdata/inline_callback_completion.qnt",
+    "variant": "current",
+    "invariant": "noTimeoutAfterSuccess",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "../../internal/provisioner/operation/testdata/inline_callback_completion.qnt",
+    "variant": "registryOnly",
+    "invariant": "successKeepsSettlementAuthority",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "../../internal/provisioner/operation/testdata/inline_callback_completion.qnt",
+    "variant": "fixed",
+    "invariant": "noTimeoutAfterSuccess and successKeepsSettlementAuthority",
+    "expect_violation": false,
+    "step": "step"
+  }
+]
