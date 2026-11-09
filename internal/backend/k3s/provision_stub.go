@@ -44,62 +44,62 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	// canceled/timeout HTTP request can still produce a recorded provision
 	// + spawned goroutine + signed callback after the caller has hung up.
 	if err := ctx.Err(); err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return err
 	}
 
 	if req.LeaseUUID == "" {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return fmt.Errorf("%w: lease_uuid is required", backend.ErrValidation)
 	}
 	unlockCommand := b.commandFence.Lock(req.LeaseUUID).Release
 	defer unlockCommand()
 	if req.CallbackURL == "" {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return fmt.Errorf("%w: callback_url is required", backend.ErrValidation)
 	}
 	lifecycleCallbackURL, err := backend.ResolveLifecycleCallbackURL(
 		req.CallbackURL, req.LifecycleCallbackURL,
 	)
 	if err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return fmt.Errorf("%w: %w", backend.ErrValidation, err)
 	}
 	req.LifecycleCallbackURL = lifecycleCallbackURL
 	if exactRetry, probeErr := b.probeProvisionIntent(req); probeErr != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return probeErr
 	} else if exactRetry {
-		provisionsTotal.WithLabelValues("accepted").Inc()
+		provisionOutcomes.accepted.Inc()
 		return nil
 	}
 	if len(req.Items) == 0 {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return fmt.Errorf("%w: items is required", backend.ErrValidation)
 	}
 	if err := backend.NormalizeProvisionRequest(&req); err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return err
 	}
 	intent, proceed, err := b.beginProvisionIntent(req)
 	if err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return err
 	}
 	if !proceed {
-		provisionsTotal.WithLabelValues("accepted").Inc()
+		provisionOutcomes.accepted.Inc()
 		return nil
 	}
 	releaseCandidate, err := b.operationSettlement.PrepareOperationRelease(intent)
 	if err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return b.refuseProvisionIntent(intent, fmt.Errorf(
 			"prepare exact provision failure authority: %w", err,
 		))
 	}
 	operationFailure, err := b.operationSettlement.RefuseOperationExecution(releaseCandidate)
 	if err != nil {
-		provisionsTotal.WithLabelValues("rejected").Inc()
+		provisionOutcomes.rejected.Inc()
 		return b.refuseProvisionIntent(intent, fmt.Errorf(
 			"mint exact pre-effect provision failure: %w", err,
 		))
@@ -117,7 +117,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	if existing, exists := b.provisions[req.LeaseUUID]; exists {
 		if existing.Status != backend.ProvisionStatusFailed {
 			b.provisionsMu.Unlock()
-			provisionsTotal.WithLabelValues("rejected").Inc()
+			provisionOutcomes.rejected.Inc()
 			return b.refuseProvisionIntent(intent, backend.ErrAlreadyProvisioned)
 		}
 		// Carry forward FailCount across the replacement so the runStubProvisioner
@@ -160,7 +160,7 @@ func (b *Backend) Provision(ctx context.Context, req backend.ProvisionRequest) e
 	b.wg.Add(1)
 	b.provisionsMu.Unlock()
 
-	provisionsTotal.WithLabelValues("accepted").Inc()
+	provisionOutcomes.accepted.Inc()
 	go b.runStubProvisioner(p)
 	return nil
 }

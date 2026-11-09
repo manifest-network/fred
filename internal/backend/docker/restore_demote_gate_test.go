@@ -30,9 +30,10 @@ func assertDemoteRefused(t *testing.T, backendKind, reason string, fn func()) {
 // gateBackend builds a Backend whose volumes mock returns a fixed usage.
 func gateBackend(usage int64, usageErr error) *Backend {
 	b := newBackendForTest(&mockDockerClient{}, nil) // cfg.SKUProfiles = defaultTestSKUProfiles()
-	b.volumes = &mockVolumeManager{
+	volumes := &mockVolumeManager{
 		UsageFn: func(context.Context, string) (int64, error) { return usage, usageErr },
 	}
+	useVolumeManager(b, volumes)
 	return b
 }
 
@@ -73,7 +74,7 @@ func gProfiles(b *Backend, skus ...string) map[string]SKUProfile {
 func TestCheckDemoteFit_PromoteSkipsMeasurement(t *testing.T) {
 	called := false
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }}
+	useVolumeManager(b, &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }})
 
 	rec := gRec(b, "orig1", []backend.LeaseItem{gItem("docker-micro", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
 	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)} // 512→2048: promote
@@ -91,7 +92,7 @@ func TestCheckDemoteFit_RetiredOldSKUUsesItsFrozenProfile(t *testing.T) {
 	// and needs no measurement.
 	called := false
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }}
+	useVolumeManager(b, &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }})
 	items := []backend.LeaseItem{gItem("docker-retired", "app", 1)}
 	rec := &shared.RetentionEntry{
 		OriginalLeaseUUID:   "orig1",
@@ -113,7 +114,7 @@ func TestCheckDemoteFit_UnfrozenRecordRefusesWithoutMeasuring(t *testing.T) {
 	// invalid authority. The gate refuses it instead of sizing it from config.
 	called := false
 	b := newBackendForTest(&mockDockerClient{}, nil)
-	b.volumes = &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }}
+	useVolumeManager(b, &mockVolumeManager{UsageFn: func(context.Context, string) (int64, error) { called = true; return 0, nil }})
 	rec := &shared.RetentionEntry{
 		OriginalLeaseUUID:   "orig1",
 		Items:               []backend.LeaseItem{gItem("docker-micro", "app", 1)},

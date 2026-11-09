@@ -793,11 +793,12 @@ func (b *Backend) doClosePhysical(
 			}
 			partition := ""
 			if budget.MaxPartitions > 0 {
-				var reason, rawDetail string
+				var reason shared.PartitionCollapseReason
+				var rawDetail string
 				partition, reason, rawDetail = shared.ExtractPartition(b.partitionSource, shared.PartitionInputs{Manifest: stackManifest})
 				switch {
 				case reason != "":
-					retentionPartitionCollapsedTotal.WithLabelValues(reason).Inc()
+					partitionCollapses.inc(reason)
 					// rawDetail is pre-truncated by ExtractPartition (no site may log
 					// the untruncated tenant-supplied value); logger carries lease_uuid.
 					logger.Warn("retention partition collapsed to default bucket",
@@ -821,10 +822,10 @@ func (b *Backend) doClosePhysical(
 			// race) only evicts the tenant's oldest, which the next close would evict
 			// anyway. Fail-open on a snapshot read error: eviction never blocks a close.
 			if snapErr != nil {
-				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
+				capCheckFailures.evict.Inc()
 				logger.Warn("retention cap eviction skipped: tenant snapshot unavailable (fail-open)", "tenant", tenant, "error", snapErr)
 			} else if err := b.evictRetentionsToCap(ctx, tenant, budget, partition, evictionCandidates, leaseUUID); err != nil {
-				retentionCapCheckFailedTotal.WithLabelValues(capCheckEvict).Inc()
+				capCheckFailures.evict.Inc()
 				logger.Warn("retention cap eviction failed", "tenant", tenant, "error", err)
 			}
 

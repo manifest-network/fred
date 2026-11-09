@@ -129,9 +129,7 @@ func refuseWithoutTenantSeccomp(sink tenantSeccompSink, err error) error {
 	if _, authored := tenantSeccompRefusal(err); authored {
 		return err
 	}
-	if label := sink.label(); label != "" {
-		tenantSeccompProfileRefusalsTotal.WithLabelValues(label).Inc()
-	}
+	seccompProfileRefusals.inc(sink)
 	return &physicalOperationError{callback: msgTenantSeccompUnavailable, reason: backend.ReasonInternal, cause: err}
 }
 
@@ -333,8 +331,6 @@ const (
 	tenantSeccompCensusError = "error"
 )
 
-var tenantSeccompCensusOutcomes = []string{tenantSeccompCensusOK, tenantSeccompCensusError}
-
 // tenantSeccompCensusLoop runs the census once when Start launches it, after
 // recovery, and then every tenantSeccompCensusInterval until shutdown.
 func (b *Backend) tenantSeccompCensusLoop() {
@@ -346,7 +342,7 @@ func (b *Backend) tenantSeccompCensusLoop() {
 			b.runTenantSeccompCensus(&reported)
 			return nil
 		}, "docker_seccomp_census", func(any) {
-			tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
+			seccompCensusPasses.error.Inc()
 			seccompCensusCleanupPanics.Inc()
 		})
 		select {
@@ -367,12 +363,12 @@ func (b *Backend) runTenantSeccompCensus(reported *tenantSeccompCensusReport) {
 		if b.stopCtx.Err() != nil {
 			return
 		}
-		tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusError).Inc()
+		seccompCensusPasses.error.Inc()
 		b.logger.Warn("tenant seccomp census failed; keeping the last completed count", "error", err)
 		return
 	}
 	tenantContainersWithoutCurrentSeccomp.Set(float64(census.withoutCurrent))
-	tenantSeccompCensusTotal.WithLabelValues(tenantSeccompCensusOK).Inc()
+	seccompCensusPasses.ok.Inc()
 	reported.log(b.logger, census.withoutCurrent)
 }
 

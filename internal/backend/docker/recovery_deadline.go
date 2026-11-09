@@ -115,13 +115,13 @@ type maintenanceReadinessKey struct {
 
 type maintenanceReadinessObservationKey struct {
 	intent maintenanceIntentKey
-	branch string
+	branch seriesLabel
 }
 
-func (b *Backend) observeMaintenanceReadinessPending(intent shared.MaintenanceIntentClaim, branch string) {
-	maintenanceReadinessPendingTotal.WithLabelValues(branch).Inc()
+func (b *Backend) observeMaintenanceReadinessPending(intent shared.MaintenanceIntentClaim, branch maintenanceReadinessBranch) {
+	branch.pending.Inc()
 	_, first := b.maintenanceReadinessWarnings.observeDeadline(
-		maintenanceReadinessObservationKey{intent: keyForMaintenanceIntent(intent), branch: branch}, time.Time{}, false,
+		maintenanceReadinessObservationKey{intent: keyForMaintenanceIntent(intent), branch: branch.seriesLabel}, time.Time{}, false,
 	)
 	if first {
 		b.logger.Warn("maintenance recovery is waiting for readiness evidence",

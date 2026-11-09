@@ -290,7 +290,7 @@ func (b *Backend) teardownLeaseContainers(
 	leaseUUID string,
 	recordedIDs []string,
 	stopTimeout time.Duration,
-	operation string,
+	operation teardownOperation,
 	logger *slog.Logger,
 ) ([]string, error) {
 	_, teardown, _, _ := backgroundCapabilitiesForTest(b)

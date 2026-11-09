@@ -13,7 +13,7 @@ import (
 func (l *Loader) admitPreparedBudget(source string, verificationBytes, importBytes int64) (imagebudget.Budget, error) {
 	ceiling := 2 * l.budget.Bytes()
 	if importBytes > ceiling {
-		imagePreparationRefusals.WithLabelValues("import_allocation").Inc()
+		importAllocationRefusals.Inc()
 		slog.Warn("image import allocation exceeds admission limit", "source", source, "import_bytes", importBytes, "limit_bytes", ceiling, "reason", "import_allocation")
 		return imagebudget.Budget{}, errors.New("image import allocation exceeds twice the image byte limit")
 	}

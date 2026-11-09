@@ -41,7 +41,7 @@ func TestIntegration_Docker_RestoreFailureRemovesCreatedBtrfsVolume(t *testing.T
 		f.b.cfg.VolumeDataPath = mount
 		f.b.cfg.VolumeMountPath = mount
 		f.b.cfg.VolumeFilesystem = "btrfs"
-		f.b.volumes = mgr
+		useVolumeManager(f.b, mgr)
 		sourceName := retainedName(canonicalVolumeName(f.source, "db", 0))
 		sourcePath, created, err := mgr.Create(t.Context(), sourceName, 1024)
 		require.NoError(t, err)

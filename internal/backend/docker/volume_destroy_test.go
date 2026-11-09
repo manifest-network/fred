@@ -215,7 +215,7 @@ func TestVolumeOp_Destroy_RefusesAVolumeAnotherLeaseOwns(t *testing.T) {
 		DestroyFn: func(_ context.Context, id string) error { destroyed = append(destroyed, id); return nil },
 	}
 
-	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteDeprovisionDestroy, destroyRefusedClaimed))
+	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteDeprovisionDestroy.String(), destroyRefusedClaimed))
 	op := b.volumeOp(volumeClaimTargetLease, slog.Default())
 	installTestStorageMutationAdapters(b)
 	rep := op.destroy(volumeDestroyCapabilityForTest(b), context.Background(), destroySiteDeprovisionDestroy,
@@ -230,7 +230,7 @@ func TestVolumeOp_Destroy_RefusesAVolumeAnotherLeaseOwns(t *testing.T) {
 	assert.NoError(t, rep.err(), "a claimed volume is not an error — another owner has it, and that resolves itself")
 	assert.True(t, rep.leftOnDisk(), "but the bytes ARE still on disk, so the caller must keep them counted")
 	assert.InDelta(t, before+1,
-		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteDeprovisionDestroy, destroyRefusedClaimed)), 0.0001)
+		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteDeprovisionDestroy.String(), destroyRefusedClaimed)), 0.0001)
 }
 
 // TestVolumeOp_Destroy_UnclaimedIsDestroyable covers the collector's case: owner "" may
@@ -247,7 +247,7 @@ func TestVolumeOp_Destroy_UnreadableClaims_DestroysNothing(t *testing.T) {
 		},
 	}
 
-	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping, destroyRefusedUnreadable))
+	before := testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping.String(), destroyRefusedUnreadable))
 	rep := destroyVolumesForTest(b, "u1", context.Background(), destroySiteReaping, "fred-u1-app-0", "fred-u1-app-1")
 
 	assert.Empty(t, rep.Destroyed)
@@ -256,7 +256,7 @@ func TestVolumeOp_Destroy_UnreadableClaims_DestroysNothing(t *testing.T) {
 		"unlike a claimed volume, an unprovable one IS a failure: the caller could not do its job and must retry")
 	assert.True(t, rep.leftOnDisk())
 	assert.InDelta(t, before+2,
-		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping, destroyRefusedUnreadable)), 0.0001,
+		testutil.ToFloat64(volumeDestroyRefusedTotal.WithLabelValues(destroySiteReaping.String(), destroyRefusedUnreadable)), 0.0001,
 		"counted per volume, so the refusal is visible at the same granularity as the decision")
 }
 
@@ -495,7 +495,7 @@ func TestDestroyChokePoint_InFlightRestoreDataIsUnreachableByAnyPath(t *testing.
 			// primitive refuses the name IF it ever arrives is the honest version, and it
 			// is what protects the site if that structural argument ever stops holding.
 			drive: func(t *testing.T, b *Backend) {
-				destroyVolumesForTest(b, chokePointDestinationLease, context.Background(), destroySiteProvisionCleanup,
+				destroyVolumesForTest(b, chokePointDestinationLease, context.Background(), destroySiteProvisionCleanup(),
 					chokePointAdopted, chokePointOwn)
 			},
 			wantReaped: chokePointOwn,

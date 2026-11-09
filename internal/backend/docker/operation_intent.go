@@ -912,7 +912,7 @@ func (b *Backend) recoverOperationIntentClaims(
 			if authorityErr := b.terminalStorageAuthorityError(); authorityErr != nil {
 				return authorityErr
 			}
-			operationIntentRecoveryCleanupRetriesTotal.WithLabelValues(string(decision.claim.Kind())).Inc()
+			operationCleanupRetries.inc(decision.claim.Kind())
 			b.logger.Warn("operation recovery cleanup remains pending",
 				"lease_uuid", decision.claim.LeaseUUID(),
 				"kind", decision.claim.Kind(), "error", cause)
@@ -1198,7 +1198,7 @@ func (b *Backend) operationIntentRecoveryTimedOut(
 	claim shared.OperationIntentClaim,
 	classification operationIntentSubstrate,
 	deadline time.Time,
-	timeoutReason string,
+	timeoutReason operationRecoveryTimeout,
 ) operationIntentSubstrate {
 	classification.status = backend.CallbackStatusFailed
 	classification.errMsg = interruptedOperationFailure
@@ -1207,7 +1207,7 @@ func (b *Backend) operationIntentRecoveryTimedOut(
 		waitKind = classification.waitEvidence.kind()
 	}
 	classification.waitEvidence = nil
-	operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(timeoutReason).Inc()
+	timeoutReason.exhausted.Inc()
 	b.logger.Warn("bounded interrupted operation recovery classified exact substrate as failed",
 		"lease_uuid", claim.LeaseUUID(),
 		"operation_fingerprint", claim.OperationID().Fingerprint(),

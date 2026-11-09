@@ -1500,17 +1500,19 @@ func TestRetentionIndex_TransitionMutatorsStayConsistent(t *testing.T) {
 
 func TestRetentionIndex_ReIndexRebuildsAndFiresHook(t *testing.T) {
 	dir := t.TempDir()
-	var gotTrigger string
+	var gotTrigger RetentionReindexTrigger
 	var gotCount int
 	s, err := newUnboundRetentionStoreForTest(RetentionStoreConfig{
-		DBPath:    dir + "/retention.db",
-		OnReindex: func(count int, _ time.Duration, trigger string) { gotCount, gotTrigger = count, trigger },
+		DBPath: dir + "/retention.db",
+		OnReindex: func(count int, _ time.Duration, trigger RetentionReindexTrigger) {
+			gotCount, gotTrigger = count, trigger
+		},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	require.NoError(t, s.putForTest(sampleEntry("u1")))
 	require.NoError(t, s.ReIndex())
-	assert.Equal(t, "manual", gotTrigger)
+	assert.Equal(t, RetentionReindexManual, gotTrigger)
 	assert.Equal(t, 1, gotCount)
 	byTenant, _ := s.indexSnapshot()
 	assert.ElementsMatch(t, []string{"u1"}, byTenant["tenant-a"])

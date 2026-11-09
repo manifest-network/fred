@@ -496,19 +496,21 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	}
 
 	b := &Backend{
-		cfg:                 cfg,
-		docker:              mock,
-		compose:             &mockComposeExecutor{},
-		pool:                pool,
-		volumes:             &noopVolumeManager{},
-		logger:              slog.Default(),
-		provisions:          provs,
-		operationSettlement: noopOperationIntentJournal{},
-		actors:              make(map[string]*leasesm.LeaseActor),
-		stopCtx:             stopCtx,
-		stopCancel:          stopCancel,
-		storageIdentity:     storageID,
-		storeAuthorityGate:  storeAuthorityGate,
+		cfg:     cfg,
+		docker:  mock,
+		compose: &mockComposeExecutor{},
+		pool:    pool,
+		volumes: &noopVolumeManager{},
+		// New binds the configured volume backend's demote-refusal series.
+		restoreDemoteRefusals: bindRestoreDemoteRefusals((&noopVolumeManager{}).Kind()),
+		logger:                slog.Default(),
+		provisions:            provs,
+		operationSettlement:   noopOperationIntentJournal{},
+		actors:                make(map[string]*leasesm.LeaseActor),
+		stopCtx:               stopCtx,
+		stopCancel:            stopCancel,
+		storageIdentity:       storageID,
+		storeAuthorityGate:    storeAuthorityGate,
 	}
 	b.storageVerifier = testDockerRuntimeStorageVerifier{identity: func() backendidentity.ID {
 		return b.storageIdentity
@@ -521,6 +523,15 @@ func newBackendForTest(mock *mockDockerClient, provisions map[string]*provision)
 	b.gatherer = &dockerDiagnosticsGatherer{backend: b}
 	b.provisionStore = &backendProvisionStore{backend: b}
 	return b
+}
+
+// useVolumeManager installs volumes on a test Backend the way New does: it
+// also binds restore_demote_refused_total for volumes' kind. A fixture that
+// assigns b.volumes alone keeps the series of the manager it replaced, so a
+// demote refusal counts under the wrong backend label.
+func useVolumeManager(b *Backend, volumes volumeReader) {
+	b.volumes = volumes
+	b.restoreDemoteRefusals = bindRestoreDemoteRefusals(volumes.Kind())
 }
 
 func TestRecoverState_Serialized(t *testing.T) {

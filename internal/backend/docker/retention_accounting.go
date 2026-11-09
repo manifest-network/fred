@@ -601,8 +601,8 @@ func (b *Backend) boundPartition(tenant, partition string, budget retentionBudge
 		return "" // nothing to bound / non-aggregator (budget-first extraction already skipped)
 	}
 	if snapErr != nil {
-		retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonStoreError).Inc()
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBound).Inc()
+		partitionCollapses.inc(shared.PartitionReasonStoreError)
+		capCheckFailures.bound.Inc()
 		logger.Warn("partition bound: tenant snapshot unavailable; collapsing to default bucket (close proceeds)",
 			"tenant", tenant, "error", snapErr)
 		return ""
@@ -618,7 +618,7 @@ func (b *Backend) boundPartition(tenant, partition string, budget retentionBudge
 		return partition // existing bucket: admit, no new cardinality
 	}
 	if len(distinct) >= budget.MaxPartitions {
-		retentionPartitionCollapsedTotal.WithLabelValues(shared.PartitionReasonOverLimit).Inc()
+		partitionCollapses.inc(shared.PartitionReasonOverLimit)
 		logger.Warn("partition bound: distinct-partition ceiling reached; collapsing to default bucket",
 			"tenant", tenant, "partition", shared.TruncatePartitionRaw(partition), "max_partitions", budget.MaxPartitions)
 		return ""
@@ -642,7 +642,7 @@ func (b *Backend) boundPartition(tenant, partition string, budget retentionBudge
 // gate is the dangerous direction. On a store read error it fails OPEN (does not
 // refuse) and counts the fail-open: refuse-to-retain destroys data, so uncertainty
 // must never trigger it.
-func (b *Backend) breachRetentionCaps(tenant, partition string, items []backend.LeaseItem, budget retentionBudget) (scope string, breached bool) {
+func (b *Backend) breachRetentionCaps(tenant, partition string, items []backend.LeaseItem, budget retentionBudget) (scope retentionRefusalScope, breached bool) {
 	return b.breachRetentionCapsWithResourceProfiles(tenant, partition, items, nil, budget)
 }
 
@@ -651,26 +651,26 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 	items []backend.LeaseItem,
 	resourceProfiles []shared.SKUResourceSnapshot,
 	budget retentionBudget,
-) (scope string, breached bool) {
+) (scope retentionRefusalScope, breached bool) {
 	l0, l1, l2 := b.cfg.MaxRetainedDiskMB, budget.DiskCapMB, budget.PerPartDiskMB
 	if partition == "" {
 		l2 = 0 // I6: the default bucket is governed solely by L0/L1
 	}
 	if l0 <= 0 && l1 <= 0 && l2 <= 0 {
-		return "", false // no disk cap at any scope: zero store I/O (legacy fast path)
+		return retentionRefusalScope{}, false // no disk cap at any scope: zero store I/O (legacy fast path)
 	}
 	incoming, incomingUnresolved, incomingErr := b.closeFootprintDiskMB(items, resourceProfiles)
 	if incomingErr != nil {
 		b.logger.Warn("retention cap check: incoming footprint is invalid; not refusing (data-safe)",
 			"error", incomingErr)
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-		return "", false
+		capCheckFailures.breach.Inc()
+		return retentionRefusalScope{}, false
 	}
 	if len(incomingUnresolved) > 0 {
 		b.logger.Warn("retention cap check: incoming footprint references unresolved SKU profiles; not refusing (data-safe)",
 			"unknown_skus", incomingUnresolved)
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-		return "", false
+		capCheckFailures.breach.Inc()
+		return retentionRefusalScope{}, false
 	}
 	// globalMB (the only cross-tenant sum) is consumed solely under l0 > 0; the L1
 	// and L2 sums are both accumulated inside `e.Tenant == tenant`. So when the
@@ -688,8 +688,8 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 	}
 	if err != nil {
 		b.logger.Warn("retention cap check: store read failed; not refusing (data-safe)", "error", err)
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-		return "", false
+		capCheckFailures.breach.Inc()
+		return retentionRefusalScope{}, false
 	}
 	var globalMB, tenantMB, partMB int64
 	for _, e := range entries {
@@ -700,23 +700,23 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 		if sumErr != nil {
 			b.logger.Warn("retention cap check: durable footprint is invalid; not refusing (data-safe)",
 				"lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
-			retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-			return "", false
+			capCheckFailures.breach.Inc()
+			return retentionRefusalScope{}, false
 		}
 		globalMB, sumErr = addLeaseDiskMB(globalMB, emb, 1)
 		if sumErr != nil {
 			b.logger.Warn("retention cap check: global footprint overflow; not refusing (data-safe)",
 				"lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
-			retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-			return "", false
+			capCheckFailures.breach.Inc()
+			return retentionRefusalScope{}, false
 		}
 		if e.Tenant == tenant {
 			tenantMB, sumErr = addLeaseDiskMB(tenantMB, emb, 1)
 			if sumErr != nil {
 				b.logger.Warn("retention cap check: tenant footprint overflow; not refusing (data-safe)",
 					"tenant", tenant, "lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
-				retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-				return "", false
+				capCheckFailures.breach.Inc()
+				return retentionRefusalScope{}, false
 			}
 			if l2 > 0 && e.Partition == partition {
 				partMB, sumErr = addLeaseDiskMB(partMB, emb, 1)
@@ -724,8 +724,8 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 					b.logger.Warn("retention cap check: partition footprint overflow; not refusing (data-safe)",
 						"tenant", tenant, "partition", shared.TruncatePartitionRaw(partition),
 						"lease_uuid", e.OriginalLeaseUUID, "error", sumErr)
-					retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-					return "", false
+					capCheckFailures.breach.Inc()
+					return retentionRefusalScope{}, false
 				}
 			}
 		}
@@ -735,8 +735,8 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 	partWithIncoming, partErr := addLeaseDiskMB(partMB, incoming, 1)
 	if err := errors.Join(globalErr, tenantErr, partErr); err != nil {
 		b.logger.Warn("retention cap check: incoming aggregate overflows; not refusing (data-safe)", "error", err)
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckBreach).Inc()
-		return "", false
+		capCheckFailures.breach.Inc()
+		return retentionRefusalScope{}, false
 	}
 	switch {
 	case l0 > 0 && globalWithIncoming > l0:
@@ -746,7 +746,7 @@ func (b *Backend) breachRetentionCapsWithResourceProfiles(
 	case l2 > 0 && partWithIncoming > l2:
 		return refuseScopePartition, true
 	default:
-		return "", false
+		return retentionRefusalScope{}, false
 	}
 }
 
@@ -755,13 +755,13 @@ func (b *Backend) shouldRefuseRetentionWithResourceProfiles(
 	items []backend.LeaseItem,
 	resourceProfiles []shared.SKUResourceSnapshot,
 	budget retentionBudget,
-) (scope string, refuse bool) {
+) (scope retentionRefusalScope, refuse bool) {
 	l2 := budget.PerPartDiskMB
 	if partition == "" {
 		l2 = 0 // I6
 	}
 	if b.cfg.MaxRetainedDiskMB <= 0 && budget.DiskCapMB <= 0 && l2 <= 0 {
-		return "", false // no disk cap at any scope: never refuse, skip the per-close store read
+		return retentionRefusalScope{}, false // no disk cap at any scope: never refuse, skip the per-close store read
 	}
 	// Refuse-to-retain DESTROYS the closing lease's volumes, so the data-safe
 	// direction under any uncertainty is to NOT refuse. A read error means we
@@ -772,11 +772,11 @@ func (b *Backend) shouldRefuseRetentionWithResourceProfiles(
 	if err != nil {
 		b.logger.Warn("retention store read failed in refuse-to-retain decision; not refusing (data-safe)",
 			"lease_uuid", leaseUUID, "error", err)
-		retentionCapCheckFailedTotal.WithLabelValues(capCheckRefuseGet).Inc()
-		return "", false
+		capCheckFailures.refuseGet.Inc()
+		return retentionRefusalScope{}, false
 	}
 	if rec != nil {
-		return "", false
+		return retentionRefusalScope{}, false
 	}
 	return b.breachRetentionCapsWithResourceProfiles(
 		tenant, partition, items, resourceProfiles, budget,
@@ -797,7 +797,7 @@ func (b *Backend) shouldRefuseRetentionWithResourceProfiles(
 // passing an unfiltered one would have silently defeated it (ENG-658). The op makes the
 // check travel with the names. Returns the destroy report so the caller can tell
 // "bytes gone" from "bytes still there", which is what gates releasing the reservation.
-func (b *Backend) destroyOnRefuseToRetain(mutations volumeDestroyMutationCapability, ctx context.Context, op *volumeOp, canonical []string, leaseUUID, tenant, partition, scope string, logger *slog.Logger) destroyReport {
+func (b *Backend) destroyOnRefuseToRetain(mutations volumeDestroyMutationCapability, ctx context.Context, op *volumeOp, canonical []string, leaseUUID, tenant, partition string, scope retentionRefusalScope, logger *slog.Logger) destroyReport {
 	var capMB int64
 	switch scope {
 	case refuseScopeGlobal:
@@ -813,6 +813,6 @@ func (b *Backend) destroyOnRefuseToRetain(mutations volumeDestroyMutationCapabil
 	if scope == refuseScopeGlobal {
 		retentionRefusedTotal.Inc() // deployed L0-global-only meaning preserved
 	}
-	retentionRefusedByScopeTotal.WithLabelValues(scope).Inc()
+	scope.refused.Inc()
 	return op.destroy(mutations, ctx, destroySiteRetentionRefused, canonical...)
 }

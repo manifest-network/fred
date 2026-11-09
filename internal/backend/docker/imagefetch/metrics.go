@@ -35,15 +35,6 @@ var imageTagResolutions = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Mutable tag resolutions past their HEAD by manifest source: cache (announced digest already verified, no manifest GET), registry (GET of the uncached announced digest), fallback_unsupported or fallback_incomplete (HEAD refused with 405/501 or lacked a usable digest, type or length, so the tag was fetched)",
 }, []string{"source"})
 
-// Tag resolution sources. Each fallback names why the HEAD could not select
-// verified bytes; both cost one GET of the tag.
-const (
-	tagFromCache           = "cache"
-	tagFromRegistry        = "registry"
-	tagFallbackUnsupported = "fallback_unsupported"
-	tagFallbackIncomplete  = "fallback_incomplete"
-)
-
 // Registry endpoint classes, as counted by the endpoint label.
 const (
 	endpointManifest = "manifest"
@@ -51,23 +42,6 @@ const (
 	endpointPing     = "ping"
 	endpointOther    = "other"
 )
-
-func init() {
-	imagePreparationRefusals.WithLabelValues("import_allocation").Add(0)
-	for _, outcome := range []string{"success", "failure", "deadline", "shutdown"} {
-		imageImportTotal.WithLabelValues(outcome).Add(0)
-	}
-	for _, endpoint := range []string{endpointManifest, endpointBlob, endpointPing, endpointOther} {
-		for _, method := range []string{http.MethodGet, http.MethodHead} {
-			for _, status := range []string{"ok", "4xx", "429", "5xx", "error"} {
-				imageRegistryRequests.WithLabelValues(endpoint, method, status).Add(0)
-			}
-		}
-	}
-	for _, source := range []string{tagFromCache, tagFromRegistry, tagFallbackUnsupported, tagFallbackIncomplete} {
-		imageTagResolutions.WithLabelValues(source).Add(0)
-	}
-}
 
 // registryEndpoint classifies a registry URL path by its last API marker. A
 // repository name may itself contain a manifests or blobs component, but a
@@ -90,25 +64,19 @@ func registryEndpoint(path string) string {
 // observeRegistryExchange counts one dispatched wire exchange. Every label is
 // a bounded class; no registry host, repository, tag or tenant appears.
 func observeRegistryExchange(request *http.Request, response *http.Response, err error) {
-	endpoint := registryEndpoint(request.URL.Path)
-	method := "other"
-	if request.Method == http.MethodGet || request.Method == http.MethodHead {
-		method = request.Method
+	statuses := registryRequests.forEndpoint(registryEndpoint(request.URL.Path)).forMethod(request.Method)
+	switch {
+	case err != nil || response == nil:
+		statuses.error.Inc()
+	case response.StatusCode == http.StatusTooManyRequests:
+		statuses.tooManyRequests.Inc()
+	case response.StatusCode < 400:
+		statuses.ok.Inc()
+	case response.StatusCode < 500:
+		statuses.clientError.Inc()
+	default:
+		statuses.serverError.Inc()
 	}
-	status := "error"
-	if err == nil && response != nil {
-		switch {
-		case response.StatusCode == http.StatusTooManyRequests:
-			status = "429"
-		case response.StatusCode < 400:
-			status = "ok"
-		case response.StatusCode < 500:
-			status = "4xx"
-		default:
-			status = "5xx"
-		}
-	}
-	imageRegistryRequests.WithLabelValues(endpoint, method, status).Inc()
 }
 
 // observeImport records exactly one result for a dispatched exchange. Only the
@@ -117,26 +85,33 @@ func observeRegistryExchange(request *http.Request, response *http.Response, err
 // makes a stalled SDK visible before its transport releases the live owner.
 func observeImport(work context.Context) func(bool) {
 	var once sync.Once
-	record := func(outcome string) { once.Do(func() { imageImportTotal.WithLabelValues(outcome).Inc() }) }
-	interruption := func() string {
+	record := func(outcome prometheus.Counter) { once.Do(outcome.Inc) }
+	// interruption is the loader-owned interruption of work, if any. A done
+	// context's error is always one of the two.
+	interruption := func() (prometheus.Counter, bool) {
 		switch work.Err() {
 		case context.DeadlineExceeded:
-			return "deadline"
+			return importOutcomes.deadline, true
 		case context.Canceled:
-			return "shutdown"
+			return importOutcomes.shutdown, true
 		default:
-			return ""
+			return nil, false
 		}
 	}
-	stop := context.AfterFunc(work, func() { record(interruption()) })
+	stop := context.AfterFunc(work, func() {
+		if outcome, interrupted := interruption(); interrupted {
+			record(outcome)
+		}
+	})
 	return func(success bool) {
 		stop()
-		outcome := interruption()
-		if outcome == "" {
-			outcome = "failure"
-			if success {
-				outcome = "success"
-			}
+		outcome, interrupted := interruption()
+		switch {
+		case interrupted:
+		case success:
+			outcome = importOutcomes.success
+		default:
+			outcome = importOutcomes.failure
 		}
 		record(outcome)
 	}

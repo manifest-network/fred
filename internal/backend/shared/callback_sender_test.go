@@ -3691,23 +3691,23 @@ func TestSendCallbackV2PersistsOneOutcomeRepresentation(t *testing.T) {
 func TestReportDelivery_NilHook(t *testing.T) {
 	s := newTestSender(t, nil, http.DefaultClient, "secret")
 	// Should not panic
-	s.reportDelivery("success")
-	s.reportDelivery("failure")
+	s.reportDelivery(true)
+	s.reportDelivery(false)
 }
 
 func TestReportDelivery_WithHook(t *testing.T) {
-	var outcomes []string
+	var outcomes []bool
 	s := mustNewEphemeralCallbackSenderForTest(t, CallbackSenderConfig{
 		HTTPClient: http.DefaultClient,
 		Logger:     slog.Default(),
 
-		OnDelivery: func(outcome string) { outcomes = append(outcomes, outcome) },
+		OnDelivery: func(delivered bool) { outcomes = append(outcomes, delivered) },
 	})
 
-	s.reportDelivery("success")
-	s.reportDelivery("failure")
+	s.reportDelivery(true)
+	s.reportDelivery(false)
 
-	assert.Equal(t, []string{"success", "failure"}, outcomes)
+	assert.Equal(t, []bool{true, false}, outcomes)
 }
 
 type endlessCallbackResponseBody struct {
@@ -3797,7 +3797,7 @@ func TestReplayPendingCallbacks_DeliveryHookPanicPreservesFailedHead(t *testing.
 	sender := mustNewDurableCallbackSender(t, CallbackSenderConfig{
 		Store: store, HTTPClient: client, Secret: "secret", Logger: slog.Default(),
 		Backoff: &zeroBackoff,
-		OnDelivery: func(string) {
+		OnDelivery: func(bool) {
 			hookCalls.Add(1)
 			panic("delivery observer panic")
 		},

@@ -2351,7 +2351,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		if observationErr != nil {
 			return fmt.Errorf("construct container death observation: %w", observationErr)
 		}
-		b.dispatchContainerDeathObservation(observation, containerID, "reconcile")
+		b.dispatchContainerDeathObservation(observation, containerID, deathSourceReconcile)
 	}
 
 	stats := b.pool.Stats()
@@ -2415,7 +2415,7 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 			b.observeNetworkCleanupInterruption(ctx)
 			return
 		}
-		networkReclamationTotal.WithLabelValues("list_error").Inc()
+		networkReclamations.listError.Inc()
 		b.logger.Warn("failed to list managed networks for cleanup", "error", err)
 		return
 	}
@@ -2435,16 +2435,16 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 		var (
 			outcome networkRemoval
 			err     error
-			scope   string
+			scope   networkReclamationScope
 		)
 		if n.Labels[LabelNetworkScope] == networkScopeLease {
-			scope = "lease"
+			scope = leaseNetworkReclamation
 			var authority leaseNetworkAuthority
 			if authority, err = leaseNetworkCandidate(n, b.cfg.Name); err == nil {
 				outcome, err = b.removeOrphanedLeaseNetworkUsing(ctx, authority, removeLeaseNetwork)
 			}
 		} else if tenant := n.Labels[LabelTenant]; tenant != "" {
-			scope = "tenant"
+			scope = tenantNetworkReclamation
 			outcome, err = b.removeOrphanedTenantNetworkUsing(ctx, tenant, removeTenantNetwork)
 		} else {
 			continue
@@ -2454,24 +2454,24 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 				b.observeNetworkCleanupInterruption(ctx)
 				return
 			}
-			networkReclamationTotal.WithLabelValues("error").Inc()
+			networkReclamations.error.Inc()
 			b.logger.Warn("failed to remove orphaned network", "network", n.Name, "error", err)
 			continue
 		}
 		switch outcome {
 		case networkRemoved:
-			networkReclamationTotal.WithLabelValues("removed").Inc()
+			networkReclamations.removed.Inc()
 			b.logger.Info("removed orphaned network", "network", n.Name, "scope", scope)
 		case networkAbsent:
-			networkReclamationTotal.WithLabelValues("absent").Inc()
+			networkReclamations.absent.Inc()
 		case networkInUse:
-			networkReclamationTotal.WithLabelValues("in_use").Inc()
+			networkReclamations.inUse.Inc()
 		case networkOwned:
-			networkReclamationTotal.WithLabelValues(scope + "_active").Inc()
+			scope.active.Inc()
 		case networkBusy:
-			networkReclamationTotal.WithLabelValues(scope + "_busy").Inc()
+			scope.busy.Inc()
 		default:
-			networkReclamationTotal.WithLabelValues("error").Inc()
+			networkReclamations.error.Inc()
 			b.logger.Warn("unknown network removal outcome", "network", n.Name)
 		}
 	}
@@ -2479,7 +2479,7 @@ func (b *Backend) cleanupOrphanedNetworksUsing(
 
 func (b *Backend) observeNetworkCleanupInterruption(ctx context.Context) {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) && b.stopCtx.Err() == nil {
-		networkReclamationTotal.WithLabelValues("budget_exhausted").Inc()
+		networkReclamations.budgetExhausted.Inc()
 		b.logger.Warn("managed network cleanup budget exhausted", "error", ctx.Err())
 	}
 }
@@ -2498,14 +2498,14 @@ func (b *Backend) reconcileLoop() {
 		defer cancel()
 		if err := b.reconcileStateAndOperations(ctx); err != nil {
 			b.logger.Error("reconciliation failed", "error", err)
-			reconciliationTotal.WithLabelValues("error").Inc()
+			reconcilePasses.error.Inc()
 			return nil // logged with the backend's structured logger above
 		}
-		reconciliationTotal.WithLabelValues("success").Inc()
+		reconcilePasses.ok.Inc()
 		reconcilerLastSuccessTimestamp.SetToCurrentTime()
 		return nil
 	}, "docker_reconciliation", func(any) {
-		reconciliationTotal.WithLabelValues("error").Inc()
+		reconcilePasses.error.Inc()
 		reconciliationCleanupPanics.Inc()
 	})
 }

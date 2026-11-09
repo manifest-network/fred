@@ -626,7 +626,6 @@ func NewServer(b backendService, requestKeys hmacauth.VerifyKeys, logger *slog.L
 	if maxRequestBodySize <= 0 {
 		maxRequestBodySize = docker.DefaultMaxRequestBodySize
 	}
-	docker.InitRequestKeyMetrics(requestKeys)
 	return &Server{
 		backend:            b,
 		requestKeys:        requestKeys,
@@ -639,7 +638,7 @@ func NewServer(b backendService, requestKeys hmacauth.VerifyKeys, logger *slog.L
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	authMw := hmacAuthMiddleware(s.requestKeys, s.logger, s.maxRequestBodySize)
+	authMw := newHMACAuthMiddleware(s.requestKeys, s.logger, s.maxRequestBodySize)
 	protected := func(handler http.Handler) http.Handler {
 		if !s.storageIdentity.Valid() {
 			return authMw(handler)
@@ -1465,10 +1464,12 @@ func validateCallbackURL(rawURL string) error {
 	return nil
 }
 
-// hmacAuthMiddleware returns middleware that verifies HMAC-SHA256 signatures on
-// requests with keys: callback_secret, and callback_secret_next during a
-// rotation.
-func hmacAuthMiddleware(keys hmacauth.VerifyKeys, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
+// newHMACAuthMiddleware returns middleware that verifies HMAC-SHA256
+// signatures on requests with keys: callback_secret, and callback_secret_next
+// during a rotation. It binds the request signature series of exactly those
+// keys, so the slots it counts are the slots it verifies.
+func newHMACAuthMiddleware(keys hmacauth.VerifyKeys, logger *slog.Logger, maxRequestBodySize int64) func(http.Handler) http.Handler {
+	signatures := docker.BindRequestSignatureMetrics(keys)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Limit request body size
@@ -1476,7 +1477,7 @@ func hmacAuthMiddleware(keys hmacauth.VerifyKeys, logger *slog.Logger, maxReques
 
 			sig := r.Header.Get(hmacauth.SignatureHeader)
 			if sig == "" {
-				docker.RecordRequestSignatureMissing()
+				signatures.Missing()
 				logger.Warn("missing signature header", "remote", r.RemoteAddr, "path", r.URL.Path)
 				jsonError(w, http.StatusUnauthorized, "missing signature")
 				return
@@ -1490,7 +1491,7 @@ func hmacAuthMiddleware(keys hmacauth.VerifyKeys, logger *slog.Logger, maxReques
 			}
 
 			slot, err := hmacauth.VerifyRequestKeys(keys, r, body, sig, 5*time.Minute)
-			docker.RecordRequestSignatureChecked(slot, err)
+			signatures.Checked(slot, err)
 			if err != nil {
 				logger.Warn("signature verification failed",
 					"error", err,

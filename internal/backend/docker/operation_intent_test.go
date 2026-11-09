@@ -1278,7 +1278,7 @@ func TestProvisionIntentRecoveryDeadline_BoundsFutureAdmissionClock(t *testing.T
 
 func TestRecoverOperationIntent_CreatedProvisionCannotWedgeStartup(t *testing.T) {
 	metricBefore := testutil.ToFloat64(operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(
-		operationRecoveryTimeoutProvision,
+		operationRecoveryTimeoutProvision.String(),
 	))
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
@@ -1328,7 +1328,7 @@ func TestRecoverOperationIntent_CreatedProvisionCannotWedgeStartup(t *testing.T)
 	require.Len(t, pending, 1)
 	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 	assert.Equal(t, metricBefore+1, testutil.ToFloat64(
-		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(operationRecoveryTimeoutProvision),
+		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(operationRecoveryTimeoutProvision.String()),
 	))
 }
 
@@ -1834,7 +1834,7 @@ func TestStart_PendingRestoreOwnsEmptyInventoryUntilLateExactCohort(t *testing.T
 
 func TestRecoverOperationIntent_ProvisionHealthDeadlineIsTerminal(t *testing.T) {
 	metricBefore := testutil.ToFloat64(operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(
-		operationRecoveryTimeoutProvision,
+		operationRecoveryTimeoutProvision.String(),
 	))
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
@@ -1885,7 +1885,7 @@ func TestRecoverOperationIntent_ProvisionHealthDeadlineIsTerminal(t *testing.T) 
 	assert.GreaterOrEqual(t, inspectCalls, 2,
 		"the live lane must re-attest the still-unready cohort before exact cleanup")
 	assert.Equal(t, metricBefore+1, testutil.ToFloat64(
-		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(operationRecoveryTimeoutProvision),
+		operationIntentRecoveryTimeoutExhaustionsTotal.WithLabelValues(operationRecoveryTimeoutProvision.String()),
 	))
 }
 

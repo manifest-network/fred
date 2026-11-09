@@ -323,27 +323,139 @@ type LeaseProvisionStore interface {
 // methods at fixed sites; the substrate adapter shapes the
 // counter/label semantics.
 //
-// WorkerPanic's workerType is one of "provision" / "replace" / "diag"
-// (the three categories of worker goroutines the actor spawns).
-// ActorPanic is the distinct site for panics in the actor's own
-// message-handler goroutine (recovered by handle()'s defer); it has
-// no label because the actor goroutine is a single category.
-// TerminalEventDropped's event is a short tag identifying the event
-// type that was dropped (e.g., "diag_gathered", "provision_completed").
-// LeaseFailureRecorded fires once for every failure the terminal budget
+// Every label the actor reports is a closed set this package lists, so
+// a substrate creates each series at startup: SMTransition reports one
+// of Transitions(), WorkerPanic one of Workers() (the categories of
+// worker goroutines the actor spawns), and TerminalEventDropped one of
+// TerminalEvents(). ActorPanic is the distinct site for panics in the
+// actor's own message-handler goroutine (recovered by handle()'s
+// defer); it has no label because the actor goroutine is a single
+// category. LeaseFailureRecorded fires once for every failure the terminal budget
 // records, counted or not; the substrate labels it with cause.Label(), a closed
 // set (failurecause.Labels). PendingOperationUnstamped fires when a provision
 // or restore entered its in-flight state but its projection could not be
 // stamped with the operation it awaits (ENG-1125); any non-zero value is a bug.
 type SMMetrics interface {
-	SMTransition(source, dest, trigger string)
+	SMTransition(transition Transition)
 	ActorCreated()
-	WorkerPanic(workerType string)
+	WorkerPanic(worker Worker)
 	ActorPanic()
-	TerminalEventDropped(event string)
+	TerminalEventDropped(event TerminalEvent)
 	LeaseFailureRecorded(cause failurecause.Cause)
 	PendingOperationUnstamped()
 }
+
+// Worker is a category of worker goroutine the actor spawns and whose
+// panic it recovers.
+type Worker uint8
+
+const (
+	workerProvision Worker = iota + 1
+	workerReplace
+	workerDiag
+	workerSentinel
+)
+
+// Workers is every Worker, so a substrate can create each one's series at
+// startup.
+func Workers() []Worker {
+	workers := make([]Worker, 0, workerSentinel-1)
+	for worker := Worker(1); worker < workerSentinel; worker++ {
+		workers = append(workers, worker)
+	}
+	return workers
+}
+
+// Label is the worker's metric label.
+func (w Worker) Label() string {
+	switch w {
+	case workerProvision:
+		return "provision"
+	case workerReplace:
+		return "replace"
+	case workerDiag:
+		return "diag"
+	default:
+		return ""
+	}
+}
+
+// TerminalEvent is the terminal message a worker could not deliver to its
+// actor.
+type TerminalEvent uint8
+
+const (
+	terminalProvisionCompleted TerminalEvent = iota + 1
+	terminalProvisionErrored
+	terminalProvisionAmbiguous
+	terminalProvisionInvalidOutcome
+	terminalProvisionPanic
+	terminalProvisionNoResult
+	terminalReplaceCompleted
+	terminalReplaceRecovered
+	terminalReplaceFailed
+	terminalReplaceAmbiguous
+	terminalReplaceInvalidOutcome
+	terminalReplacePanic
+	terminalReplaceNoResult
+	terminalDiagGathered
+	terminalDiagPanic
+	terminalDiagNoResult
+	terminalEventSentinel
+)
+
+// TerminalEvents is every TerminalEvent, so a substrate can create each
+// one's series at startup.
+func TerminalEvents() []TerminalEvent {
+	events := make([]TerminalEvent, 0, terminalEventSentinel-1)
+	for event := TerminalEvent(1); event < terminalEventSentinel; event++ {
+		events = append(events, event)
+	}
+	return events
+}
+
+// Label is the event's metric label.
+func (e TerminalEvent) Label() string {
+	switch e {
+	case terminalProvisionCompleted:
+		return "provision_completed"
+	case terminalProvisionErrored:
+		return "provision_errored"
+	case terminalProvisionAmbiguous:
+		return "provision_ambiguous"
+	case terminalProvisionInvalidOutcome:
+		return "provision_invalid_outcome"
+	case terminalProvisionPanic:
+		return "provision_panic"
+	case terminalProvisionNoResult:
+		return "provision_no_result"
+	case terminalReplaceCompleted:
+		return "replace_completed"
+	case terminalReplaceRecovered:
+		return "replace_recovered"
+	case terminalReplaceFailed:
+		return "replace_failed"
+	case terminalReplaceAmbiguous:
+		return "replace_ambiguous"
+	case terminalReplaceInvalidOutcome:
+		return "replace_invalid_outcome"
+	case terminalReplacePanic:
+		return "replace_panic"
+	case terminalReplaceNoResult:
+		return "replace_no_result"
+	case terminalDiagGathered:
+		return "diag_gathered"
+	case terminalDiagPanic:
+		return "diag_panic"
+	case terminalDiagNoResult:
+		return "diag_no_result"
+	default:
+		return ""
+	}
+}
+
+// LogValue logs the event by its label.
+func (e TerminalEvent) LogValue() slog.Value { return slog.StringValue(e.Label()) }
 
 // LeaseActorConfig groups the dependencies a lease actor receives at
 // construction. The actor holds no substrate pointer: substrate-private

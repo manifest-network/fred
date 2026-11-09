@@ -2940,9 +2940,9 @@ func (b *Backend) prepareRestoreAdoptionRollbackForTest(
 		recordedIDs = slices.Clone(provision.ContainerIDs)
 	}
 	b.provisionsMu.RUnlock()
-	teardownOp := teardownOpRestoreRollback
+	teardownOp := teardownOpRestoreRollback()
 	if dropProvision {
-		teardownOp = teardownOpRestorePrelude
+		teardownOp = teardownOpRestorePrelude()
 	}
 	if _, err := b.teardownLeaseContainers(
 		ctx, leaseUUID, recordedIDs, stopTimeout, teardownOp, logger,

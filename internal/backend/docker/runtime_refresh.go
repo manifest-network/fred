@@ -341,7 +341,7 @@ func (c *runtimeRefreshController) finish() {
 	c.active = false
 	clear(c.inFlight)
 	for _, outcome := range c.leases {
-		runtimeRefreshTotal.WithLabelValues(string(outcome.row.Outcome)).Inc()
+		runtimeRefreshLeases.inc(outcome.row.Outcome)
 	}
 }
 
@@ -395,7 +395,7 @@ func (b *Backend) runtimeInventoryLoop() {
 			b.runRuntimeInventoryPass()
 			return nil
 		}, "docker_runtime_inventory", func(any) {
-			runtimeInventoryTotal.WithLabelValues("error").Inc()
+			runtimeInventoryPasses.error.Inc()
 			runtimeInventoryCleanupPanics.Inc()
 		})
 	}
@@ -410,11 +410,11 @@ func (b *Backend) runRuntimeInventoryPass() {
 		if b.stopCtx.Err() != nil {
 			return
 		}
-		runtimeInventoryTotal.WithLabelValues("error").Inc()
+		runtimeInventoryPasses.error.Inc()
 		b.logger.Warn("runtime inventory failed; keeping the last completed counts", "error", err)
 		return
 	}
-	runtimeInventoryTotal.WithLabelValues("ok").Inc()
+	runtimeInventoryPasses.ok.Inc()
 }
 
 // runtimeRefreshCandidates reads Docker and returns the leases eligible for a

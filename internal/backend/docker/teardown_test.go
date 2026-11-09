@@ -228,8 +228,8 @@ func TestTeardownLeaseContainers_NeverDestroysManagedVolumes(t *testing.T) {
 // ran and saved us" and "the fallback ran and did not" must be distinguishable, since
 // only the latter means containers are pinned on the host.
 func TestTeardownLeaseContainers_CountsOutcome(t *testing.T) {
-	recoveredBefore := testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeRecovered))
-	failedBefore := testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeFailed))
+	recoveredBefore := testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision.String(), teardownOutcomeRecovered))
+	failedBefore := testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision.String(), teardownOutcomeFailed))
 
 	listing := func(_ context.Context) ([]ContainerInfo, error) {
 		return []ContainerInfo{managedContainer("c-1", "lease-1")}, nil
@@ -255,7 +255,7 @@ func TestTeardownLeaseContainers_CountsOutcome(t *testing.T) {
 	require.Error(t, err)
 
 	assert.InDelta(t, recoveredBefore+1,
-		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeRecovered)), 0.0001)
+		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision.String(), teardownOutcomeRecovered)), 0.0001)
 	assert.InDelta(t, failedBefore+1,
-		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision, teardownOutcomeFailed)), 0.0001)
+		testutil.ToFloat64(teardownFallbackTotal.WithLabelValues(teardownOpDeprovision.String(), teardownOutcomeFailed)), 0.0001)
 }

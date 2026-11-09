@@ -61,37 +61,24 @@ const (
 	requestKeySlotNext    = "next"
 )
 
-// InitRequestKeyMetrics pre-creates the request key series for keys: the
-// current slot always, the next slot only while a next key is configured, so
-// a zero on "next" means unused rather than not configured.
-func InitRequestKeyMetrics(keys hmacauth.VerifyKeys) {
-	requestSignatureKeyTotal.WithLabelValues(requestKeySlotCurrent)
-	if keys.HasRotation() {
-		requestSignatureKeyTotal.WithLabelValues(requestKeySlotNext)
-		requestNextKeyConfigured.Set(1)
-		return
-	}
-	requestNextKeyConfigured.Set(0)
+// Missing counts a providerd request with no signature.
+func (RequestSignatureMetrics) Missing() {
+	requestAuthRefusals.inc(requestAuthFailureMissing)
 }
 
-// RecordRequestSignatureMissing counts a providerd request with no signature.
-func RecordRequestSignatureMissing() {
-	requestAuthFailuresTotal.WithLabelValues(requestAuthFailureMissing.label()).Inc()
-}
-
-// RecordRequestSignatureChecked counts one providerd request signature check:
-// the verifying key slot on success, or the closed refusal reason.
-func RecordRequestSignatureChecked(slot hmacauth.KeySlot, err error) {
+// Checked counts one providerd request signature check: the verifying key
+// slot on success, or the closed refusal reason.
+func (m RequestSignatureMetrics) Checked(slot hmacauth.KeySlot, err error) {
 	if err != nil {
-		if label := requestAuthFailureOf(err).label(); label != "" {
-			requestAuthFailuresTotal.WithLabelValues(label).Inc()
-		}
+		requestAuthRefusals.inc(requestAuthFailureOf(err))
 		return
 	}
 	switch slot {
 	case hmacauth.KeySlotCurrent:
-		requestSignatureKeyTotal.WithLabelValues(requestKeySlotCurrent).Inc()
+		m.current.Inc()
 	case hmacauth.KeySlotRotation:
-		requestSignatureKeyTotal.WithLabelValues(requestKeySlotNext).Inc()
+		if m.next != nil {
+			m.next.Inc()
+		}
 	}
 }

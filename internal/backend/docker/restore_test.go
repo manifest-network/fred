@@ -4337,7 +4337,7 @@ func TestReconcileRestoring_TeardownFallbackRecovers_CompletesRollback(t *testin
 // their capacity to someone else, and removeProvision puts them beyond every reaper.
 func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 	failedBefore := testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, teardownOutcomeFailed))
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile.String(), teardownOutcomeFailed))
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
@@ -4380,7 +4380,7 @@ func TestReconcileRestoring_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 		"capacity must not be handed back while the containers holding it may still be running")
 
 	assert.InDelta(t, failedBefore+1, testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile, teardownOutcomeFailed)), 0.0001,
+		teardownFallbackTotal.WithLabelValues(teardownOpRestoreReconcile.String(), teardownOutcomeFailed)), 0.0001,
 		"a stuck teardown is the operator's only signal that containers are pinned on the host")
 }
 
@@ -4565,7 +4565,7 @@ func TestReconcileRestoring_TeardownFails_RecordNotReapable(t *testing.T) {
 // exist here and the same precondition applies.
 func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.T) {
 	rollbackBefore := testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed))
+		teardownFallbackTotal.WithLabelValues("restore_rollback", teardownOutcomeFailed))
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
@@ -4609,7 +4609,7 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 	// The converse of the prelude test: this arm DOES hold state open for surviving
 	// containers, so it belongs in the blocking series an operator pages on.
 	assert.InDelta(t, rollbackBefore+1, testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed)), 0.0001,
+		teardownFallbackTotal.WithLabelValues("restore_rollback", teardownOutcomeFailed)), 0.0001,
 		"the worker arm blocks on a failed teardown, so it counts as restore_rollback")
 }
 
@@ -4624,9 +4624,9 @@ func TestRollbackRestoreAdoption_TeardownFails_LeavesRecordRestoring(t *testing.
 // clean again.
 func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *testing.T) {
 	preludeBefore := testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestorePrelude, teardownOutcomeFailed))
+		teardownFallbackTotal.WithLabelValues("restore_prelude", teardownOutcomeFailed))
 	rollbackBefore := testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed))
+		teardownFallbackTotal.WithLabelValues("restore_rollback", teardownOutcomeFailed))
 
 	mock := &mockDockerClient{
 		ListManagedContainersFn: func(_ context.Context) ([]ContainerInfo, error) {
@@ -4673,10 +4673,10 @@ func TestRollbackRestoreAdoption_PreludeFailure_TeardownErrorDoesNotWedge(t *tes
 	// NOT land in the series an operator pages on. It is counted under its own advisory
 	// operation instead (ENG-647, PR #217 review).
 	assert.InDelta(t, preludeBefore+1, testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestorePrelude, teardownOutcomeFailed)), 0.0001,
+		teardownFallbackTotal.WithLabelValues("restore_prelude", teardownOutcomeFailed)), 0.0001,
 		"an advisory prelude teardown failure must be counted under restore_prelude")
 	assert.InDelta(t, rollbackBefore, testutil.ToFloat64(
-		teardownFallbackTotal.WithLabelValues(teardownOpRestoreRollback, teardownOutcomeFailed)), 0.0001,
+		teardownFallbackTotal.WithLabelValues("restore_rollback", teardownOutcomeFailed)), 0.0001,
 		"and must NOT smear the blocking restore_rollback series, whose meaning is "+
 			"'containers are pinned and fred is holding state open for them'")
 }

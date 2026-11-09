@@ -101,8 +101,8 @@ func (r *manifestReader) resolveTag(ctx context.Context, tag name.Tag) (verified
 	if err != nil {
 		return verifiedManifest{}, err
 	}
-	if fallback != "" {
-		imageTagResolutions.WithLabelValues(fallback).Inc()
+	if fallback != noTagFallback {
+		fallback.resolved.Inc()
 		content, err := r.get(operation, client, tag)
 		if err != nil {
 			return verifiedManifest{}, err
@@ -115,11 +115,11 @@ func (r *manifestReader) resolveTag(ctx context.Context, tag name.Tag) (verified
 		return verifiedManifest{}, err
 	}
 	if release == nil {
-		imageTagResolutions.WithLabelValues(tagFromCache).Inc()
+		tagFromCache.resolved.Inc()
 		return cached, nil
 	}
 	r.hold(release)
-	imageTagResolutions.WithLabelValues(tagFromRegistry).Inc()
+	tagFromRegistry.resolved.Inc()
 	content, err := r.get(operation, client, r.repository.Digest(announced.String()))
 	if err != nil {
 		release()
@@ -196,28 +196,28 @@ func (r *manifestReader) authenticate(ctx context.Context) (*http.Client, error)
 
 // head returns the tag's announced SHA256 digest, or the fallback source that
 // selects a GET of the tag.
-func (r *manifestReader) head(ctx context.Context, client *http.Client, tag name.Tag) (digest.Digest, string, error) {
+func (r *manifestReader) head(ctx context.Context, client *http.Client, tag name.Tag) (digest.Digest, tagSource, error) {
 	request, err := r.request(ctx, http.MethodHead, tag.Identifier())
 	if err != nil {
-		return "", "", err
+		return "", noTagFallback, err
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return "", "", err
+		return "", noTagFallback, err
 	}
 	defer func() { _ = response.Body.Close() }()
 	switch {
 	case response.StatusCode == http.StatusMethodNotAllowed || response.StatusCode == http.StatusNotImplemented:
 		return "", tagFallbackUnsupported, nil
 	case response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices:
-		return "", "", registryauth.CheckError(response, http.StatusOK)
+		return "", noTagFallback, registryauth.CheckError(response, http.StatusOK)
 	}
 	announced, err := digest.Parse(response.Header.Get("Docker-Content-Digest"))
 	if response.StatusCode != http.StatusOK || err != nil || announced.Algorithm() != digest.SHA256 ||
 		response.Header.Get("Content-Type") == "" || response.ContentLength < 0 {
 		return "", tagFallbackIncomplete, nil
 	}
-	return announced, "", nil
+	return announced, noTagFallback, nil
 }
 
 // get returns registry bytes keyed by their own digest; callers decide how the
