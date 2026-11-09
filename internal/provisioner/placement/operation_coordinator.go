@@ -1078,10 +1078,7 @@ func (coordinator *OperationCoordinator) beginProvisionCall(
 func (coordinator *OperationCoordinator) callbackOwnsDispatch(
 	dispatch operation.DispatchOperation,
 ) bool {
-	metadata := dispatch.Metadata()
-	current, exists := coordinator.operations.Lookup(metadata.LeaseUUID())
-	return !exists || (current.ID() == metadata.ID() &&
-		current.Settlement() == operation.SettlementTerminal)
+	return coordinator.operations.CallbackOwnsDispatch(dispatch)
 }
 
 func (coordinator *OperationCoordinator) completeCallbackOwnedDispatch(

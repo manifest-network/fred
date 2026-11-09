@@ -191,6 +191,8 @@ const (
 	InitiationInvalid InitiationCompletion = iota
 	InitiationActivated
 	InitiationAborted
+	// InitiationSettling leaves settlement with a live callback claim or with
+	// authenticated success awaiting acknowledgment retry.
 	InitiationSettling
 	InitiationFinished
 )
@@ -505,9 +507,8 @@ func (registry *Registry) activate(initiation Initiation) InitiationCompletion {
 }
 
 // abortInitiation completes a local preflight failure or a synchronous backend
-// result that was not accepted. A callback that already claimed or finished
-// the exact operation wins, because it is stronger evidence than the caller's
-// cleanup path.
+// result that was not accepted. A live callback claim, finished callback, or
+// authenticated success awaiting acknowledgment wins over the cleanup path.
 func (registry *Registry) abortInitiation(initiation Initiation) InitiationCompletion {
 	return registry.completeInitiation(initiation, false)
 }
@@ -544,10 +545,12 @@ func (registry *Registry) completeInitiation(
 		registry.removeOperationLocked(initiation.token.leaseUUID)
 		return InitiationFinished
 	}
-	if tracked.claim.Valid() {
+	if tracked.claim.Valid() || tracked.successAuthenticated {
 		// The synchronous call has returned, so the call barrier may become
-		// active. The settlement capability still excludes close and timeout
-		// until the callback releases or finishes it.
+		// active. A live callback claim or its recorded success still owns
+		// settlement, even after a retryable acknowledgment released the claim.
+		// Retaining the exact record also prevents recovery from reinstalling
+		// this operation without its evidence.
 		tracked.record.Phase = PhaseActive
 		tracked.initiation = Initiation{}
 		registry.operations[initiation.token.leaseUUID] = tracked
@@ -562,6 +565,20 @@ func (registry *Registry) completeInitiation(
 
 	registry.removeOperationLocked(initiation.token.leaseUUID)
 	return InitiationAborted
+}
+
+// callbackOwnsDispatch derives ownership for the exact dispatch capability.
+// A finished inline callback leaves either a terminal marker or no record;
+// a retryable successful callback leaves positive evidence on the live record.
+func (registry *Registry) callbackOwnsDispatch(initiation Initiation) bool {
+	if !initiation.Valid() || initiation.token.registry != registry.identity {
+		return false
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	tracked, exists := registry.operations[initiation.token.leaseUUID]
+	return !exists || (tracked.token == initiation.token &&
+		(tracked.record.Settlement == SettlementTerminal || tracked.successAuthenticated))
 }
 
 // snapshot returns a causal operation boundary. Even a new registry with

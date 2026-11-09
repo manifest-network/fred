@@ -203,6 +203,14 @@ func (authority SettlementAuthority) BeginDispatchCall(dispatch DispatchOperatio
 		authority.registry.beginCall(dispatch.initiation)
 }
 
+// CallbackOwnsDispatch checks the exact issued dispatch against live callback
+// ownership, including success whose acknowledgment must be retried. The
+// coordinator must consult this before a synchronous result mutates placement.
+func (authority SettlementAuthority) CallbackOwnsDispatch(dispatch DispatchOperation) bool {
+	return authority.validDispatch(dispatch) &&
+		authority.registry.callbackOwnsDispatch(dispatch.initiation)
+}
+
 // ActivateDispatch completes an accepted synchronous return.
 func (authority SettlementAuthority) ActivateDispatch(
 	dispatch DispatchOperation,

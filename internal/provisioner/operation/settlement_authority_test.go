@@ -159,8 +159,58 @@ func TestInlineCallbackSuccessSurvivesActivation(t *testing.T) {
 	require.True(t, callback.Claimed())
 	require.True(t, authority.ObserveCallbackSuccess(callback.Claim()))
 	require.True(t, authority.ReleaseCallback(callback.Claim()))
-	require.Equal(t, InitiationActivated, registry.activate(initiation))
+	require.Equal(t, InitiationSettling, registry.activate(initiation))
 	require.Empty(t, authority.TimedOut(0))
 	// Exercise the live claim guard independently of candidate filtering.
 	require.Equal(t, SettlementBusy, registry.tryClaimTimeout("lease-1", initiation.ID()).Outcome())
+}
+
+func TestInlineSuccessCannotBeErasedByAbortOrSameOperationRecovery(t *testing.T) {
+	registry := newTestRegistry()
+	authority, err := registry.BindSettlementAuthority()
+	require.NoError(t, err)
+	spec := testTrackSpec("lease-1")
+	lease := authority.TryClaimLeaseNow(spec.LeaseUUID)
+	require.True(t, lease.Acquired())
+	initiated := registry.tryInitiateClaimed(lease.Claim(), spec.operationSpec())
+	require.True(t, initiated.Started())
+	initiation := initiated.Capability()
+	dispatch, joined := authority.JoinDispatch(initiation)
+	require.True(t, joined)
+	require.False(t, authority.CallbackOwnsDispatch(dispatch))
+	require.True(t, authority.BeginDispatchCall(dispatch))
+
+	callback := authority.TryClaimCallback(spec.LeaseUUID, initiation.ID())
+	require.True(t, callback.Claimed())
+	require.True(t, authority.ObserveCallbackSuccess(callback.Claim()))
+	require.True(t, authority.ReleaseCallback(callback.Claim()))
+	require.True(t, authority.CallbackOwnsDispatch(dispatch))
+	require.False(t, authority.CallbackOwnsDispatch(DispatchOperation{}))
+	foreign, err := newTestRegistry().BindSettlementAuthority()
+	require.NoError(t, err)
+	require.False(t, foreign.CallbackOwnsDispatch(dispatch))
+
+	// Abort consumes the call barrier, but success keeps this exact record
+	// active. Even the original lease capability cannot overwrite it.
+	require.Equal(t, InitiationSettling, authority.AbortDispatch(dispatch))
+	require.Equal(t, RecoveryBusy, authority.RecoverClaimed(lease.Claim(), initiation.ID(), spec.recovered()))
+	metadata, exists := authority.Lookup(spec.LeaseUUID)
+	require.True(t, exists)
+	require.Equal(t, initiation.ID(), metadata.ID())
+	require.Equal(t, PhaseActive, metadata.Phase())
+	require.Empty(t, authority.TimedOut(0))
+	require.Equal(t, SettlementBusy, registry.tryClaimTimeout(spec.LeaseUUID, initiation.ID()).Outcome())
+	require.True(t, authority.ReleaseLease(lease.Claim()))
+	require.Equal(t, LeaseClaimBusy, authority.TryClaimLeaseNow(spec.LeaseUUID).Outcome(),
+		"ordinary recovery must defer to the still-tracked operation")
+
+	replay := authority.TryClaimCallback(spec.LeaseUUID, initiation.ID())
+	require.True(t, replay.Claimed())
+	require.True(t, authority.FinishCallback(replay.Claim()))
+	// A later operation for the same lease cannot inherit the success.
+	replacement := requireInitiated(t, registry, spec)
+	require.False(t, authority.CallbackOwnsDispatch(dispatch))
+	require.True(t, registry.beginCall(replacement))
+	require.Equal(t, InitiationActivated, registry.activate(replacement))
+	require.Len(t, authority.TimedOut(0), 1)
 }

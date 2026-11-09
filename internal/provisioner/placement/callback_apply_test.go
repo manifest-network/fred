@@ -430,3 +430,85 @@ func TestFailedCallbackDoesNotExcludeTimeout(t *testing.T) {
 	require.Equal(t, TimeoutRejected, result.Disposition())
 	require.NoError(t, result.Err())
 }
+
+// Success can arrive while the synchronous backend call is still on the stack.
+// A retryable acknowledgment must keep ownership after that call returns, so
+// recovery cannot reinstall the same operation without its success evidence.
+func TestInlineSuccessSurvivesDispatchCompletionAfterAcknowledgmentFailure(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440302"
+	const sourceUUID = "550e8400-e29b-41d4-a716-446655440303"
+	for _, kind := range []operation.Kind{operation.KindProvision, operation.KindRestore} {
+		for _, outcome := range []string{"ambiguous", "refused", "accepted"} {
+			t.Run(kind.String()+"/"+outcome, func(t *testing.T) {
+				var fixture coordinatorFixture
+				var complete func() DispatchResult
+				switch kind {
+				case operation.KindProvision:
+					provision := newProvisionDispatchFixture(t, leaseUUID)
+					fixture = coordinatorFixture{store: provision.store, coordinator: provision.coordinator, initiation: provision.initiation}
+					call := requireProvisionCall(t, fixture.coordinator, provision.dispatch)
+					complete = func() DispatchResult {
+						result := backend.ConservativeProvisionCallOutcome(nil)
+						switch outcome {
+						case "ambiguous":
+							result = backend.ConservativeProvisionCallOutcome(context.DeadlineExceeded)
+						case "refused":
+							result = refusedProvisionOutcomeForTest(t)
+						}
+						return fixture.coordinator.completeProvision(call, result)
+					}
+				case operation.KindRestore:
+					restore := newRestoreDispatchFixture(t, sourceUUID, leaseUUID)
+					fixture = coordinatorFixture{store: restore.store, coordinator: restore.coordinator, initiation: restore.initiation}
+					call := requireRestoreCall(t, fixture.coordinator, restore.bound)
+					complete = func() DispatchResult {
+						result := backend.ConservativeRestoreCallOutcome(nil)
+						switch outcome {
+						case "ambiguous":
+							result = backend.ConservativeRestoreCallOutcome(context.DeadlineExceeded)
+						case "refused":
+							result = refusedRestoreOutcomeForTest(t)
+						}
+						return fixture.coordinator.completeRestore(call, result)
+					}
+				default:
+					t.Fatal("unsupported operation kind")
+				}
+				control := &callbackMutationControlPlane{
+					leases: []billingtypes.Lease{callbackLeaseForTest(leaseUUID, billingtypes.LEASE_STATE_PENDING)},
+					ackErr: errors.New("acknowledgment unavailable"),
+				}
+				callbacks, proof := prepareOperationCallbackForTest(t, fixture, leaseUUID, control, backend.CallbackStatusSuccess)
+				_, err := callbacks.Apply(t.Context(), proof)
+				require.ErrorIs(t, err, ErrCallbackAcknowledgeFailed)
+				metadata, exists := fixture.coordinator.Lookup(leaseUUID)
+				require.True(t, exists)
+				require.Equal(t, operation.PhaseCalling, metadata.Phase())
+				require.Equal(t, operation.SettlementUnclaimed, metadata.Settlement())
+
+				result := complete()
+				require.NoError(t, result.Err())
+				require.True(t, result.Superseded(), "authenticated success must own completion after releasing its claim")
+				metadata, exists = fixture.coordinator.Lookup(leaseUUID)
+				require.True(t, exists, "the exact protected operation must survive synchronous completion")
+				require.Equal(t, fixture.initiation.ID(), metadata.ID())
+				require.Equal(t, operation.PhaseActive, metadata.Phase())
+				require.Equal(t, StateAttempting, fixture.store.Lookup(leaseUUID).State())
+				if kind == operation.KindRestore {
+					require.NotContains(t, fixture.store.restoreClaims, sourceUUID, "the synchronous source reservation must be released")
+				}
+				timeouts, err := fixture.coordinator.execution.TimeoutCoordinator()
+				require.NoError(t, err)
+				require.Empty(t, timeouts.TimedOut(0))
+				require.Zero(t, control.rejects)
+
+				control.ackErr = nil
+				callbackResult, err := callbacks.Apply(t.Context(), proof)
+				require.NoError(t, err)
+				require.Equal(t, CallbackOperationSucceeded, callbackResult.OperationOutcome())
+				require.Equal(t, StateConfirmed, fixture.store.Lookup(leaseUUID).State())
+				require.False(t, fixture.coordinator.RuntimeController().Contains(leaseUUID))
+			})
+		}
+	}
+}
