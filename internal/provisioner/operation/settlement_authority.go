@@ -203,6 +203,14 @@ func (authority SettlementAuthority) BeginDispatchCall(dispatch DispatchOperatio
 		authority.registry.beginCall(dispatch.initiation)
 }
 
+// CallbackOwnsDispatch checks the exact issued dispatch against live callback
+// ownership, including success whose acknowledgment must be retried. The
+// coordinator must consult this before a synchronous result mutates placement.
+func (authority SettlementAuthority) CallbackOwnsDispatch(dispatch DispatchOperation) bool {
+	return authority.validDispatch(dispatch) &&
+		authority.registry.callbackOwnsDispatch(dispatch.initiation)
+}
+
 // ActivateDispatch completes an accepted synchronous return.
 func (authority SettlementAuthority) ActivateDispatch(
 	dispatch DispatchOperation,
@@ -327,6 +335,14 @@ func (authority SettlementAuthority) TryClaimCallback(
 		}},
 		outcome: SettlementClaimed,
 	}
+}
+
+// ObserveCallbackSuccess prevents timeout settlement for this exact operation,
+// even if acknowledgment fails and the callback claim is subsequently released.
+// The authenticated callback coordinator calls it before attempting acknowledgment.
+func (authority SettlementAuthority) ObserveCallbackSuccess(claim CallbackClaim) bool {
+	return authority.valid() && claim.Valid() && claim.core.issuer == authority.marker &&
+		authority.registry.observeCallbackSuccess(claim.core.claim)
 }
 
 func (authority SettlementAuthority) ReleaseCallback(claim CallbackClaim) bool {

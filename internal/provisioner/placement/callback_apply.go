@@ -374,6 +374,12 @@ func (coordinator *AuthenticatedCallbackCoordinator) settleClaimed(
 
 	switch callback.Status() {
 	case backend.CallbackStatusSuccess:
+		// Retain authenticated success under the exact claim before any chain
+		// work. Retryable acknowledgment failure releases ownership, not this
+		// evidence; even a previously collected timeout candidate must defer.
+		if !coordinator.coordinator.observeCallbackSuccess(claim) {
+			return result, ErrCallbackSettlementLost
+		}
 		_, _, acknowledgeErr := coordinator.controlPlane.acknowledgeLease(ctx, callback.LeaseUUID())
 		if acknowledgeErr == nil {
 			return completedSuccess(true)

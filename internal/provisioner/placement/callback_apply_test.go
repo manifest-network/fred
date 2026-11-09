@@ -83,6 +83,7 @@ type callbackMutationControlPlane struct {
 	reads     int
 	ackErr    error
 	rejectErr error
+	rejects   int
 }
 
 func (control *callbackMutationControlPlane) GetLease(
@@ -102,6 +103,7 @@ func (control *callbackMutationControlPlane) GetLease(
 func (control *callbackMutationControlPlane) RejectLeases(
 	context.Context, []string, string,
 ) (uint64, []string, error) {
+	control.rejects++
 	return 0, nil, control.rejectErr
 }
 
@@ -118,6 +120,18 @@ func applyOperationCallbackForTest(
 	control *callbackMutationControlPlane,
 	status backend.CallbackStatus,
 ) (CallbackResult, error) {
+	t.Helper()
+	callbacks, proof := prepareOperationCallbackForTest(t, fixture, leaseUUID, control, status)
+	return callbacks.Apply(t.Context(), proof)
+}
+
+func prepareOperationCallbackForTest(
+	t *testing.T,
+	fixture coordinatorFixture,
+	leaseUUID string,
+	control *callbackMutationControlPlane,
+	status backend.CallbackStatus,
+) (*AuthenticatedCallbackCoordinator, hmacauth.VerifiedRequest) {
 	t.Helper()
 	execution := bindExecutionForTest(t, fixture.coordinator, executionRuntime("backend-a"))
 	setProviderControlPlaneForTest(t, execution, control)
@@ -139,7 +153,7 @@ func applyOperationCallbackForTest(
 		storageID.String(), "/callbacks/provision", 5*time.Minute, time.Minute, now,
 	)
 	require.NoError(t, err)
-	return callbacks.Apply(t.Context(), proof)
+	return callbacks, proof
 }
 
 func callbackLeaseForTest(leaseUUID string, state billingtypes.LeaseState) billingtypes.Lease {
@@ -358,4 +372,143 @@ func TestLifecycleCallbackIsRetriedWhileRuntimeAuthorityIsWithdrawn(t *testing.T
 		"an error is what makes the callback endpoint answer 503")
 	assert.Equal(t, CallbackLifecycleRetryable, result.LifecycleOutcome())
 	assert.Equal(t, LifecycleVerdictUnusable, result.LifecycleVerdict())
+}
+
+// A candidate collected before Success must lose its authority even after a
+// retryable acknowledgment releases both claims. Replay still owns settlement.
+func TestAuthenticatedSuccessPreventsTimeoutAfterAcknowledgmentFailure(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440300"
+	fixture := newCoordinatorFixture(t, leaseUUID)
+	control := &callbackMutationControlPlane{
+		leases: []billingtypes.Lease{callbackLeaseForTest(leaseUUID, billingtypes.LEASE_STATE_PENDING)},
+		ackErr: errors.New("acknowledgment unavailable"),
+	}
+	callbacks, proof := prepareOperationCallbackForTest(t, fixture, leaseUUID, control, backend.CallbackStatusSuccess)
+	timeouts, err := fixture.coordinator.execution.TimeoutCoordinator()
+	require.NoError(t, err)
+	candidates := timeouts.TimedOut(0)
+	require.Len(t, candidates, 1)
+
+	_, err = callbacks.Apply(t.Context(), proof)
+	require.ErrorIs(t, err, ErrCallbackAcknowledgeFailed)
+	require.Equal(t, StateAttempting, fixture.store.Lookup(leaseUUID).State())
+	metadata, exists := fixture.coordinator.Lookup(leaseUUID)
+	require.True(t, exists)
+	require.Equal(t, operation.SettlementUnclaimed, metadata.Settlement())
+
+	result := timeouts.Settle(t.Context(), candidates[0])
+	require.Equal(t, TimeoutSkipped, result.Disposition(), "the stale candidate must not reject an authenticated success")
+	require.Zero(t, control.rejects)
+	require.Empty(t, timeouts.TimedOut(0), "later sweeps must leave this operation to callback replay")
+
+	control.ackErr = nil
+	callbackResult, err := callbacks.Apply(t.Context(), proof)
+	require.NoError(t, err)
+	require.Equal(t, CallbackOperationSucceeded, callbackResult.OperationOutcome())
+	require.Equal(t, StateConfirmed, fixture.store.Lookup(leaseUUID).State())
+	require.False(t, fixture.coordinator.RuntimeController().Contains(leaseUUID))
+}
+
+func TestFailedCallbackDoesNotExcludeTimeout(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440301"
+	fixture := newCoordinatorFixture(t, leaseUUID)
+	control := &callbackMutationControlPlane{
+		leases:    []billingtypes.Lease{callbackLeaseForTest(leaseUUID, billingtypes.LEASE_STATE_PENDING)},
+		rejectErr: errors.New("rejection unavailable"),
+	}
+	callbacks, proof := prepareOperationCallbackForTest(t, fixture, leaseUUID, control, backend.CallbackStatusFailed)
+	_, err := callbacks.Apply(t.Context(), proof)
+	require.Error(t, err)
+	require.True(t, fixture.coordinator.RuntimeController().Contains(leaseUUID))
+
+	timeouts, err := fixture.coordinator.execution.TimeoutCoordinator()
+	require.NoError(t, err)
+	candidates := timeouts.TimedOut(0)
+	require.Len(t, candidates, 1, "an authenticated failure is not evidence of success")
+	control.rejectErr = nil
+	result := timeouts.Settle(t.Context(), candidates[0])
+	require.Equal(t, TimeoutRejected, result.Disposition())
+	require.NoError(t, result.Err())
+}
+
+// Success can arrive while the synchronous backend call is still on the stack.
+// A retryable acknowledgment must keep ownership after that call returns, so
+// recovery cannot reinstall the same operation without its success evidence.
+func TestInlineSuccessSurvivesDispatchCompletionAfterAcknowledgmentFailure(t *testing.T) {
+	const leaseUUID = "550e8400-e29b-41d4-a716-446655440302"
+	const sourceUUID = "550e8400-e29b-41d4-a716-446655440303"
+	for _, kind := range []operation.Kind{operation.KindProvision, operation.KindRestore} {
+		for _, outcome := range []string{"ambiguous", "refused", "accepted"} {
+			t.Run(kind.String()+"/"+outcome, func(t *testing.T) {
+				var fixture coordinatorFixture
+				var complete func() DispatchResult
+				switch kind {
+				case operation.KindProvision:
+					provision := newProvisionDispatchFixture(t, leaseUUID)
+					fixture = coordinatorFixture{store: provision.store, coordinator: provision.coordinator, initiation: provision.initiation}
+					call := requireProvisionCall(t, fixture.coordinator, provision.dispatch)
+					complete = func() DispatchResult {
+						result := backend.ConservativeProvisionCallOutcome(nil)
+						switch outcome {
+						case "ambiguous":
+							result = backend.ConservativeProvisionCallOutcome(context.DeadlineExceeded)
+						case "refused":
+							result = refusedProvisionOutcomeForTest(t)
+						}
+						return fixture.coordinator.completeProvision(call, result)
+					}
+				case operation.KindRestore:
+					restore := newRestoreDispatchFixture(t, sourceUUID, leaseUUID)
+					fixture = coordinatorFixture{store: restore.store, coordinator: restore.coordinator, initiation: restore.initiation}
+					call := requireRestoreCall(t, fixture.coordinator, restore.bound)
+					complete = func() DispatchResult {
+						result := backend.ConservativeRestoreCallOutcome(nil)
+						switch outcome {
+						case "ambiguous":
+							result = backend.ConservativeRestoreCallOutcome(context.DeadlineExceeded)
+						case "refused":
+							result = refusedRestoreOutcomeForTest(t)
+						}
+						return fixture.coordinator.completeRestore(call, result)
+					}
+				default:
+					t.Fatal("unsupported operation kind")
+				}
+				control := &callbackMutationControlPlane{
+					leases: []billingtypes.Lease{callbackLeaseForTest(leaseUUID, billingtypes.LEASE_STATE_PENDING)},
+					ackErr: errors.New("acknowledgment unavailable"),
+				}
+				callbacks, proof := prepareOperationCallbackForTest(t, fixture, leaseUUID, control, backend.CallbackStatusSuccess)
+				_, err := callbacks.Apply(t.Context(), proof)
+				require.ErrorIs(t, err, ErrCallbackAcknowledgeFailed)
+				metadata, exists := fixture.coordinator.Lookup(leaseUUID)
+				require.True(t, exists)
+				require.Equal(t, operation.PhaseCalling, metadata.Phase())
+				require.Equal(t, operation.SettlementUnclaimed, metadata.Settlement())
+
+				result := complete()
+				require.NoError(t, result.Err())
+				require.True(t, result.Superseded(), "authenticated success must own completion after releasing its claim")
+				metadata, exists = fixture.coordinator.Lookup(leaseUUID)
+				require.True(t, exists, "the exact protected operation must survive synchronous completion")
+				require.Equal(t, fixture.initiation.ID(), metadata.ID())
+				require.Equal(t, operation.PhaseActive, metadata.Phase())
+				require.Equal(t, StateAttempting, fixture.store.Lookup(leaseUUID).State())
+				if kind == operation.KindRestore {
+					require.NotContains(t, fixture.store.restoreClaims, sourceUUID, "the synchronous source reservation must be released")
+				}
+				timeouts, err := fixture.coordinator.execution.TimeoutCoordinator()
+				require.NoError(t, err)
+				require.Empty(t, timeouts.TimedOut(0))
+				require.Zero(t, control.rejects)
+
+				control.ackErr = nil
+				callbackResult, err := callbacks.Apply(t.Context(), proof)
+				require.NoError(t, err)
+				require.Equal(t, CallbackOperationSucceeded, callbackResult.OperationOutcome())
+				require.Equal(t, StateConfirmed, fixture.store.Lookup(leaseUUID).State())
+				require.False(t, fixture.coordinator.RuntimeController().Contains(leaseUUID))
+			})
+		}
+	}
 }

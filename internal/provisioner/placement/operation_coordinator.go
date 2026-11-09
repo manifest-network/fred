@@ -1078,10 +1078,7 @@ func (coordinator *OperationCoordinator) beginProvisionCall(
 func (coordinator *OperationCoordinator) callbackOwnsDispatch(
 	dispatch operation.DispatchOperation,
 ) bool {
-	metadata := dispatch.Metadata()
-	current, exists := coordinator.operations.Lookup(metadata.LeaseUUID())
-	return !exists || (current.ID() == metadata.ID() &&
-		current.Settlement() == operation.SettlementTerminal)
+	return coordinator.operations.CallbackOwnsDispatch(dispatch)
 }
 
 func (coordinator *OperationCoordinator) completeCallbackOwnedDispatch(
@@ -1882,6 +1879,11 @@ func (coordinator *OperationCoordinator) validCallbackClaim(
 	return coordinator.Valid() && claim.Valid() && claim.issuer == coordinator.marker &&
 		claim.registry.Metadata().LeaseUUID() == claim.placement.leaseUUID &&
 		claim.registry.Metadata().ID() == claim.placement.operationID
+}
+
+func (coordinator *OperationCoordinator) observeCallbackSuccess(claim CallbackSettlementClaim) bool {
+	return coordinator.validCallbackClaim(claim) &&
+		coordinator.operations.ObserveCallbackSuccess(claim.registry)
 }
 
 // ReleaseCallback releases both unconsumed claims. It is the only valid action

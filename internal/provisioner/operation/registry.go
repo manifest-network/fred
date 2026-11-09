@@ -191,6 +191,8 @@ const (
 	InitiationInvalid InitiationCompletion = iota
 	InitiationActivated
 	InitiationAborted
+	// InitiationSettling leaves settlement with a live callback claim or with
+	// authenticated success awaiting acknowledgment retry.
 	InitiationSettling
 	InitiationFinished
 )
@@ -284,6 +286,9 @@ type trackedOperation struct {
 	initiation       Initiation
 	claim            SettlementClaim
 	terminalFinished bool
+	// Set only under the exact live callback claim; releasing the claim must
+	// not give timeout authority back to an operation that reported success.
+	successAuthenticated bool
 }
 
 // Registry is the sole owner of process-local lifecycle-operation state and
@@ -502,9 +507,8 @@ func (registry *Registry) activate(initiation Initiation) InitiationCompletion {
 }
 
 // abortInitiation completes a local preflight failure or a synchronous backend
-// result that was not accepted. A callback that already claimed or finished
-// the exact operation wins, because it is stronger evidence than the caller's
-// cleanup path.
+// result that was not accepted. A live callback claim, finished callback, or
+// authenticated success awaiting acknowledgment wins over the cleanup path.
 func (registry *Registry) abortInitiation(initiation Initiation) InitiationCompletion {
 	return registry.completeInitiation(initiation, false)
 }
@@ -541,10 +545,12 @@ func (registry *Registry) completeInitiation(
 		registry.removeOperationLocked(initiation.token.leaseUUID)
 		return InitiationFinished
 	}
-	if tracked.claim.Valid() {
+	if tracked.claim.Valid() || tracked.successAuthenticated {
 		// The synchronous call has returned, so the call barrier may become
-		// active. The settlement capability still excludes close and timeout
-		// until the callback releases or finishes it.
+		// active. A live callback claim or its recorded success still owns
+		// settlement, even after a retryable acknowledgment released the claim.
+		// Retaining the exact record also prevents recovery from reinstalling
+		// this operation without its evidence.
 		tracked.record.Phase = PhaseActive
 		tracked.initiation = Initiation{}
 		registry.operations[initiation.token.leaseUUID] = tracked
@@ -559,6 +565,20 @@ func (registry *Registry) completeInitiation(
 
 	registry.removeOperationLocked(initiation.token.leaseUUID)
 	return InitiationAborted
+}
+
+// callbackOwnsDispatch derives ownership for the exact dispatch capability.
+// A finished inline callback leaves either a terminal marker or no record;
+// a retryable successful callback leaves positive evidence on the live record.
+func (registry *Registry) callbackOwnsDispatch(initiation Initiation) bool {
+	if !initiation.Valid() || initiation.token.registry != registry.identity {
+		return false
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	tracked, exists := registry.operations[initiation.token.leaseUUID]
+	return !exists || (tracked.token == initiation.token &&
+		(tracked.record.Settlement == SettlementTerminal || tracked.successAuthenticated))
 }
 
 // snapshot returns a causal operation boundary. Even a new registry with
@@ -775,6 +795,11 @@ func (registry *Registry) tryClaimSettlement(
 		if tracked.record.Phase != PhaseActive {
 			return SettlementResult{outcome: SettlementBusy}
 		}
+		// Check live evidence while claiming, not just while collecting timeout
+		// candidates: a candidate may predate the successful callback.
+		if actor == settlementTimeout && tracked.successAuthenticated {
+			return SettlementResult{outcome: SettlementBusy}
+		}
 	default:
 		return SettlementResult{outcome: SettlementInvalid}
 	}
@@ -791,6 +816,24 @@ func (registry *Registry) tryClaimSettlement(
 		claim:   claim,
 		outcome: SettlementClaimed,
 	}
+}
+
+// observeCallbackSuccess preserves positive evidence before acknowledgment can
+// fail or panic. Only the current callback owner can record it; released,
+// foreign and superseded claims cannot change this or a replacement operation.
+func (registry *Registry) observeCallbackSuccess(claim SettlementClaim) bool {
+	if !claim.Valid() || claim.actor != settlementCallback || claim.token.registry != registry.identity {
+		return false
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	tracked, exists := registry.operations[claim.token.leaseUUID]
+	if !exists || tracked.claim != claim {
+		return false
+	}
+	tracked.successAuthenticated = true
+	registry.operations[claim.token.leaseUUID] = tracked
+	return true
 }
 
 // releaseSettlement releases only the exact settlement claim. A claim released
@@ -954,7 +997,7 @@ func (registry *Registry) timedOut(timeout time.Duration) []Record {
 	defer registry.mu.RUnlock()
 	var timedOut []Record
 	for _, tracked := range registry.operations {
-		if tracked.record.Phase == PhaseActive && now.Sub(tracked.record.StartedAt) > timeout {
+		if tracked.record.Phase == PhaseActive && !tracked.successAuthenticated && now.Sub(tracked.record.StartedAt) > timeout {
 			timedOut = append(timedOut, tracked.record.clone())
 		}
 	}
