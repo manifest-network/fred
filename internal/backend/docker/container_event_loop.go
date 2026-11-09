@@ -295,7 +295,7 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		return
 	}
 	leaseUUID, status, found := b.findLeaseByContainerID(containerID)
-	if !found || status == backend.ProvisionStatusProvisioning {
+	if !found || awaitsReadyDeathRedispatch(status) {
 		// No actor can take this death now: no projection names the
 		// container, or only a provision that is not Ready yet, which routing
 		// refuses. The recorder wrote the death into the live-death ledger
@@ -322,6 +322,17 @@ func (b *Backend) dispatchLiveContainerDeath(death failurecause.Provenance) {
 		return
 	}
 	b.dispatchContainerDeathObservation(observation, containerID, deathSourceEventLoop)
+}
+
+// awaitsReadyDeathRedispatch identifies the startup states whose Ready entry
+// hands recorded deaths back to the dispatcher. Restore uses Restarting too.
+func awaitsReadyDeathRedispatch(status backend.ProvisionStatus) bool {
+	switch status {
+	case backend.ProvisionStatusProvisioning, backend.ProvisionStatusRestarting, backend.ProvisionStatusUpdating:
+		return true
+	default:
+		return false
+	}
 }
 
 // redispatchStartupDeaths hands the recorded live deaths of a new Ready
