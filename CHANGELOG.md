@@ -23,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- providerd now permits restores from retained `REJECTED` leases and recovers interrupted restores from `EXPIRED` or `REJECTED` sources. Admission and recovery share the same exact-observation terminal-state policy, so a restore that commits after its destination is rejected no longer strands the retained data under that lease. Tenant/provider ownership, source placement, and backend retention checks still apply (ENG-2130).
+
 - providerd retries the remaining eligible leases together when an acknowledgment batch fails because a member left PENDING. Exact lease/provider observations resolve ACTIVE or ineligible members before retrying; every retry shrinks the batch and shares the original flush deadline, preserving duplicate-caller results and fee/gas failure handling (ENG-2127).
 
 - providerd no longer rejects a provision or restore on callback timeout after authenticating its Success callback when chain acknowledgment fails. Success remains attached to the exact tracked operation after callback claims are released, including when an inline callback precedes an ambiguous or refused synchronous return. Completion preserves callback ownership and the durable attempt, so recovery cannot reinstall that operation without its evidence. Even a timeout candidate collected before the callback cannot reject it; callback replay can retry acknowledgment (ENG-2129).

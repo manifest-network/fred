@@ -742,9 +742,6 @@ func TestServiceAuthorizesSourceBeforeTakingLeaseClaims(t *testing.T) {
 		{name: "source is pending", prepare: func(f *fixture) {
 			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_PENDING
 		}, outcome: OutcomeNotRetained},
-		{name: "source is rejected", prepare: func(f *fixture) {
-			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_REJECTED
-		}, outcome: OutcomeNotRetained},
 		{name: "source state is unspecified", prepare: func(f *fixture) {
 			f.targets.leases[testSource].State = billingtypes.LEASE_STATE_UNSPECIFIED
 		}, outcome: OutcomeNotRetained},
@@ -774,7 +771,15 @@ func TestServiceAuthorizesSourceBeforeTakingLeaseClaims(t *testing.T) {
 	}
 }
 
-func TestServiceExpiredSourcePreservesRestoreAdmission(t *testing.T) {
+func TestServiceTerminalSourcePreservesRestoreAdmission(t *testing.T) {
+	for _, state := range []billingtypes.LeaseState{billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_EXPIRED, billingtypes.LEASE_STATE_REJECTED} {
+		t.Run(state.String(), func(t *testing.T) {
+			testServiceTerminalSourcePreservesRestoreAdmission(t, state)
+		})
+	}
+}
+
+func testServiceTerminalSourcePreservesRestoreAdmission(t *testing.T, state billingtypes.LeaseState) {
 	tests := []struct {
 		name       string
 		prepare    func(*testing.T, *fixture)
@@ -801,7 +806,7 @@ func TestServiceExpiredSourcePreservesRestoreAdmission(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t, true)
-			fixture.targets.leases[testSource].State = billingtypes.LEASE_STATE_EXPIRED
+			fixture.targets.leases[testSource].State = state
 			if test.prepare != nil {
 				test.prepare(t, fixture)
 			}
@@ -826,7 +831,7 @@ func TestServiceExpiredSourcePreservesRestoreAdmission(t *testing.T) {
 			}
 			if test.outcome == OutcomeNotRetained {
 				assert.ErrorIs(t, result.Cause(), backend.ErrNotRetained,
-					"chain expiry cannot substitute for the backend's retention decision")
+					"terminal chain state cannot substitute for the backend's retention decision")
 			}
 			assert.Equal(t, placement.StateAbsent, fixture.store.Lookup(testTarget).State())
 			assert.False(t, fixture.runtime.Contains(testTarget))

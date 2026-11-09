@@ -187,5 +187,26 @@
     "invariant": "noTimeoutAfterSuccess and successKeepsSettlementAuthority",
     "expect_violation": false,
     "step": "step"
+  },
+  {
+    "model": "restore_source_recovery.qnt",
+    "variant": "current",
+    "invariant": "acceptedSourceCanRecover",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "restore_source_recovery.qnt",
+    "variant": "admissionOnly",
+    "invariant": "acceptedSourceCanRecover",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "restore_source_recovery.qnt",
+    "variant": "fixed",
+    "invariant": "acceptedSourceCanRecover and onlyOwnedTerminalDataRestored",
+    "expect_violation": false,
+    "step": "step"
   }
 ]

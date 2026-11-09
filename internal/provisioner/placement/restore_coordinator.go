@@ -176,11 +176,7 @@ func (authority *RestoreCoordinator) ExecuteApplication(
 	)
 	switch observed := sourceObservation.(type) {
 	case observedExactLease:
-		switch observed.lease.State {
-		case billingtypes.LEASE_STATE_CLOSED, billingtypes.LEASE_STATE_EXPIRED:
-			// Both states can retain data after deprovisioning. The owning
-			// backend must still verify that this source has restorable data.
-		default:
+		if !observed.mayHoldRetainedData() {
 			return RestoreApplicationResult{disposition: RestoreApplicationNotRetained}
 		}
 	case observedLeaseUnauthorized:

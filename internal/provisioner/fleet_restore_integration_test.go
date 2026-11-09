@@ -145,6 +145,94 @@ func TestFleet_RestoreCarriesTypedOperationAcrossHTTPAndSettlesInlineCallback(t 
 
 }
 
+// The fleet backend models Docker's commit/retention outcome; Fred's restore,
+// timeout, inventory, orphan cleanup, and signed HTTP paths are production code.
+func TestFleet_RestoreFromRejectedCommittedDestination(t *testing.T) {
+	f := newFleet(t, fleetOptions{})
+	const source, rejected, destination = "retained-original", "rejected-restore", "restored-again"
+	owner := f.backendAt(2)
+	f.addLease(source, billingtypes.LEASE_STATE_CLOSED)
+	owner.seedRetention(source)
+	require.NoError(t, f.sweep())
+	f.assertPlacementPinned(source, owner.name)
+	f.addLease(rejected, billingtypes.LEASE_STATE_PENDING)
+	owner.setRestoreHook(func(context.Context, backend.RestoreRequest) error {
+		return nil // Accept the operation; its asynchronous commit is delayed below.
+	})
+
+	// Model chain inclusion when the real timeout coordinator rejects the lease.
+	reject := f.chain.RejectLeasesFunc
+	f.chain.RejectLeasesFunc = func(ctx context.Context, ids []string, reason string) (uint64, []string, error) {
+		count, hashes, err := reject(ctx, ids, reason)
+		if err == nil {
+			f.leaseMu.Lock()
+			for _, id := range ids {
+				lease := f.leases[id]
+				lease.State = billingtypes.LEASE_STATE_REJECTED
+				f.leases[id] = lease
+			}
+			f.leaseMu.Unlock()
+		}
+		return count, hashes, err
+	}
+	setTestProviderControlPlane(t, f.execution, f.chain, nil)
+	authority, err := restoreAuthorityForTest(f.execution, nil)
+	require.NoError(t, err)
+	service, err := restoreapp.NewService(restoreapp.Config{Coordinator: authority})
+	require.NoError(t, err)
+	result := service.Execute(t.Context(), restoreapp.Command{
+		SourceLeaseUUID: fleetLeaseUUID(source), TargetLeaseUUID: fleetLeaseUUID(rejected), Tenant: "tenant-1",
+	})
+	require.True(t, result.Accepted(), "%v", result.Cause())
+	timeouts, err := f.execution.TimeoutCoordinator()
+	require.NoError(t, err)
+	candidates := timeouts.TimedOut(time.Nanosecond)
+	require.Len(t, candidates, 1)
+	settled := timeouts.Settle(t.Context(), candidates[0])
+	require.True(t, settled.Settled(), "%v", settled.Err())
+	_, rejectedLeases, _ := f.chainCalls()
+	require.Contains(t, rejectedLeases, fleetLeaseUUID(rejected))
+
+	// The backend commits after rejection, before Fred's next orphan sweep.
+	request, ok := owner.restoreRequest(rejected)
+	require.True(t, ok)
+	require.NoError(t, owner.mock.Provision(t.Context(), backend.ProvisionRequest{
+		LeaseUUID: request.LeaseUUID, Tenant: request.Tenant,
+		ProviderUUID: request.ProviderUUID, Items: request.Items,
+	}))
+	owner.mock.SetProvisionStatus(request.LeaseUUID, backend.ProvisionStatusReady)
+	require.NoError(t, f.sweep())
+	require.Equal(t, 1, owner.deprovisionCount(rejected))
+	_, err = owner.mock.GetProvision(t.Context(), request.LeaseUUID)
+	require.Error(t, err)
+	// Docker's committed-destination close consumes the original finalizer and
+	// retains the bytes under the rejected destination. Represent that backend
+	// outcome in inventory; this test does not emulate Docker volume operations.
+	owner.mock.SetRetentions([]backend.RetainedLease{{LeaseUUID: request.LeaseUUID}})
+	require.NoError(t, f.sweep())
+	f.assertPlacementPinned(rejected, owner.name)
+
+	f.addLease(destination, billingtypes.LEASE_STATE_PENDING)
+	owner.setRestoreHook(func(_ context.Context, next backend.RestoreRequest) error {
+		if next.FromLeaseUUID != request.LeaseUUID {
+			return fmt.Errorf("restore must use the retained rejected destination")
+		}
+		return nil
+	})
+	result = service.Execute(t.Context(), restoreapp.Command{
+		SourceLeaseUUID: fleetLeaseUUID(rejected), TargetLeaseUUID: fleetLeaseUUID(destination), Tenant: "tenant-1",
+	})
+	require.True(t, result.Accepted(), "retained data stranded under rejected lease: %v", result.Cause())
+	f.assertPlacementPinned(destination, owner.name)
+	for _, server := range f.servers {
+		want := 0
+		if server == owner {
+			want = 1
+		}
+		require.Equal(t, want, server.restoreCount(destination))
+	}
+}
+
 type fleetRestoreAcknowledgerFunc func(context.Context, string) (bool, string, error)
 
 func (ack fleetRestoreAcknowledgerFunc) Acknowledge(
