@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- A reproducible Quint simulation suite tracks the lifecycle, acknowledgment, retention, routing, and billing models from the November formal-modeling review, including historical counterexamples and clearly labeled proposed fixes. Run it with `make test-models` after installing the pinned tool in `models/quint`.
+
 ### Changed
 
 - providerd exports every labeled counter series at 0 before its first event, so `increase()` and `rate()` see the first panic, refusal or failed sweep after a restart. Before, most series were created by their first increment, which `increase()` cannot see. Closed label sets exist from startup; a backend's series exist from the moment providerd builds its client, and an event naming a backend that was never configured counts in the new `fred_backend_unbound_events_total`, where any increase is a bug; snapshot series exist when `placement_snapshot_dir` is set, and grant-check series while the sub-signer maintenance worker runs, so a pool demoted to a single signer at startup exports none. The `fred_background_*` panic series of each component a binary runs, docker-backend's and k3s-backend's included, also exist from startup. `fred_api_requests_total` keeps creating a series per HTTP status on first use. **Deploy note:** `fred_reconciler_runs_total` now exists before the first sweep finishes, so a stall alert such as `sum without (outcome) (increase(fred_reconciler_runs_total[10m])) == 0` evaluates from startup and fires if the first sweep takes longer than its window plus hold. Size such an alert for the slowest first sweep before deploying this release.
@@ -20,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 ### Fixed
+
+- providerd retries the remaining eligible leases together when an acknowledgment batch fails because a member left PENDING. Exact lease/provider observations resolve ACTIVE or ineligible members before retrying; every retry shrinks the batch and shares the original flush deadline, preserving duplicate-caller results and fee/gas failure handling (ENG-2127).
 
 - providerd no longer rejects a provision or restore on callback timeout after authenticating its Success callback when chain acknowledgment fails. Success remains attached to the exact tracked operation after callback claims are released, including when an inline callback precedes an ambiguous or refused synchronous return. Completion preserves callback ownership and the durable attempt, so recovery cannot reinstall that operation without its evidence. Even a timeout candidate collected before the callback cannot reject it; callback replay can retry acknowledgment (ENG-2129).
 - docker-backend now redispatches container deaths that race the Ready transition after restart, update, or restore, as it already did for fresh provisions. These failures reach the actor with their live provenance and count toward the failure budget instead of waiting for the reconcile sweep (ENG-2126).

@@ -1,0 +1,10 @@
+{
+  "name": "fred-quint-models",
+  "private": true,
+  "scripts": {
+    "test": "python3 run.py"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.0"
+  }
+}
