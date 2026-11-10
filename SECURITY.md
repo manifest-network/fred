@@ -659,6 +659,18 @@ All responses include:
 | Idle timeout | 60s | Time to keep idle connections open |
 | Request timeout | 30s | Total handler processing time |
 
+### Request Head Limit
+
+providerd's API reads at most 64 KiB of request line and headers, over HTTP/1
+and HTTP/2. It answers a larger request head with
+`431 Request Header Fields Too Large` before any handler runs, so the request
+reaches neither the metrics nor the request log. The limit is a compile-time
+constant (`maxHeaderBytes` in `internal/api/server.go`); Go's default is 1 MiB.
+
+API log lines keep at most the first 32 bytes of a request method and the
+first 256 bytes of a path. The API metrics never label a raw method or path: see
+`fred_api_requests_total` in [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Container Hardening (Docker Backend)
 
 Every container created by the Docker backend runs with these security measures:

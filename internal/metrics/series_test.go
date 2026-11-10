@@ -1,7 +1,12 @@
 package metrics
 
 import (
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
+	"unsafe"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -88,6 +93,66 @@ func TestBindersCreateTheirWholeFamilyAtOnce(t *testing.T) {
 		ackBatchFeeGasErrorsTotal, ackBatchIndividualFallbacksTotal, ackBatcherLaneRestartsTotal,
 	} {
 		assert.Equal(t, 1, seriesWithLabel(t, vec, "lane", "series-test-lane"))
+	}
+}
+
+// TestAPIMethodLabelIsAFixedVocabulary pins ENG-2150: the method label takes
+// only the methods net/http names, and every other token, whatever its size,
+// becomes "other".
+func TestAPIMethodLabelIsAFixedVocabulary(t *testing.T) {
+	for _, method := range []string{
+		http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodConnect, http.MethodOptions, http.MethodTrace,
+	} {
+		assert.Equal(t, method, apiMethodLabel(method))
+	}
+	for name, method := range map[string]string{
+		"empty":              "",
+		"lowercase":          "get",
+		"invented":           "XQ1",
+		"extension method":   "PROPFIND",
+		"standard prefix":    "GETX",
+		"oversized token":    strings.Repeat("X", 900_000),
+		"standard plus null": "GET\x00",
+	} {
+		assert.Equal(t, apiMethodOther, apiMethodLabel(method), name)
+	}
+
+	// The label is the constant, not a slice of the request line the method
+	// came from, so a retained series never keeps that line alive.
+	line := "GET /v1/leases HTTP/1.1"
+	assert.NotSame(t, unsafe.StringData(line), unsafe.StringData(apiMethodLabel(line[:3])))
+}
+
+func TestAPIPathLabel(t *testing.T) {
+	for _, test := range []struct{ pattern, want string }{
+		{"POST /v1/leases/{lease_uuid}/update", "/v1/leases/{lease_uuid}/update"},
+		{"GET /health", "/health"},
+		{"/metrics", "/metrics"},
+		{"GET example.com/health", "/health"},
+		{"", apiPathUnmatched},
+	} {
+		assert.Equal(t, test.want, apiPathLabel(&http.Request{Pattern: test.pattern}), test.pattern)
+	}
+}
+
+// TestObserveAPIRequestBoundsEveryRequestLabel pins that invented methods and
+// unmatched paths share one series per status instead of creating one each.
+func TestObserveAPIRequestBoundsEveryRequestLabel(t *testing.T) {
+	const status = http.StatusMethodNotAllowed
+	shared := apiRequestsTotal.WithLabelValues(apiMethodOther, apiPathUnmatched, "405")
+	before := testutil.ToFloat64(shared)
+	invented := []string{"XQ1-series-test", "XQ2-series-test", strings.Repeat("Y", 100_000)}
+	for _, method := range invented {
+		ObserveAPIRequest(&http.Request{Method: method, URL: &url.URL{Path: "/" + method}}, status, time.Millisecond)
+	}
+
+	assert.Equal(t, before+float64(len(invented)), testutil.ToFloat64(shared))
+	for _, method := range invented {
+		for _, collector := range []prometheus.Collector{apiRequestsTotal, apiRequestDuration} {
+			assert.Zero(t, seriesWithLabel(t, collector, "method", method), "no series per invented method")
+			assert.Zero(t, seriesWithLabel(t, collector, "path", "/"+method), "no series per unmatched path")
+		}
 	}
 }
 

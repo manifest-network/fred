@@ -667,8 +667,10 @@ var (
 		Help:      "1 while the backend has a verify-only previous callback key configured, 0 otherwise",
 	}, []string{"backend"})
 
-	// APIRequestDuration tracks API request latency.
-	APIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	// apiRequestDuration tracks API request latency. Its labels are request
+	// derived, so it is unexported like apiRequestsTotal: ObserveAPIRequest is
+	// the only writer of both.
+	apiRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace,
 		Subsystem: "api",
 		Name:      "request_duration_seconds",
