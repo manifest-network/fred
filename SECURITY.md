@@ -661,11 +661,14 @@ All responses include:
 
 ### Request Head Limit
 
-providerd's API reads at most 64 KiB of request line and headers, over HTTP/1
-and HTTP/2. It answers a larger request head with
-`431 Request Header Fields Too Large` before any handler runs, so the request
-reaches neither the metrics nor the request log. The limit is a compile-time
-constant (`maxHeaderBytes` in `internal/api/server.go`); Go's default is 1 MiB.
+providerd's API limits the request line and headers to 64 KiB, over HTTP/1 and
+HTTP/2. The limit is a compile-time constant (`maxHeaderBytes` in
+`internal/api/server.go`); Go's default is 1 MiB. Go enforces it with a small
+margin (4 KiB on HTTP/1, and a slightly different count on HTTP/2). A request
+over the limit is refused before Fred's handler runs, so it reaches neither the
+metrics nor the request log. The refusal is normally
+`431 Request Header Fields Too Large`; over HTTP/2, a header block far over the
+limit closes the connection instead.
 
 API log lines keep at most the first 32 bytes of a request method and the
 first 256 bytes of a path. The API metrics never label a raw method or path: see

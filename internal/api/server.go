@@ -44,9 +44,11 @@ const (
 	// ReadTimeout is tuned to 0 for streaming endpoints.
 	readHeaderTimeout = 5 * time.Second
 
-	// maxHeaderBytes caps the request line and headers the server reads, for
-	// HTTP/1 and HTTP/2 alike; past it Go answers 431 without calling the
-	// server's handler. Go's default is 1 MiB, enough for an unauthenticated
+	// maxHeaderBytes limits the request line and headers the server reads, for
+	// HTTP/1 and HTTP/2 alike, with a small margin Go adds (4 KiB on HTTP/1).
+	// Go refuses a request over it without calling the server's handler:
+	// normally with 431, though HTTP/2 closes the connection when a header
+	// block is far over. Go's default is 1 MiB, enough for an unauthenticated
 	// client to send a method or path of nearly that size on every request.
 	// Fred's credentials are under 1 KiB (a bearer token or a callback
 	// signature), and 64 KiB leaves room for cookies a browser may attach.

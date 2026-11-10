@@ -76,7 +76,7 @@ func TestServer_RejectsOversizedRequestHead(t *testing.T) {
 	startAndWaitForServer(t, s, addr)
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	// Go allows 4 KiB above MaxHeaderBytes before refusing.
+	// Go's HTTP/1 server allows 4 KiB above MaxHeaderBytes before refusing.
 	oversized := strings.Repeat("X", maxHeaderBytes+8<<10)
 	for name, head := range map[string]string{
 		"method": oversized + " /health HTTP/1.1\r\nHost: fred\r\n\r\n",

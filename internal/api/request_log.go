@@ -8,7 +8,7 @@ import (
 // The request method and path are chosen by the client, before any
 // authentication, so they reach a log line only through loggedMethod and
 // loggedPath. maxHeaderBytes already bounds the whole request head, but
-// without truncation every request could still write up to 64 KiB of log,
+// without truncation every request could still write nearly that much log,
 // and the rate limiter logs every request it refuses.
 const (
 	// maxLoggedMethodBytes is longer than any registered HTTP method.
