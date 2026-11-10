@@ -162,7 +162,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 		limiter := rl.getVisitor(ip)
 		if !limiter.Allow() {
-			slog.Warn("rate limit exceeded", "ip", ip, "path", r.URL.Path)
+			slog.Warn("rate limit exceeded", "ip", ip, "path", loggedPath(r))
 			metrics.RateLimitRejections.Global.Inc()
 			w.Header().Set("Retry-After", rl.retryAfterSeconds())
 			writeError(w, "rate limit exceeded", http.StatusTooManyRequests)
@@ -321,7 +321,7 @@ func authTokenMiddleware(bech32Prefix string, limiter *TenantRateLimiter) func(h
 			if limiter != nil && !limiter.Allow(token.Tenant) {
 				slog.Warn("tenant rate limit exceeded",
 					"tenant", token.Tenant,
-					"path", r.URL.Path,
+					"path", loggedPath(r),
 				)
 				metrics.RateLimitRejections.Tenant.Inc()
 				w.Header().Set("Retry-After", limiter.retryAfterSeconds())
@@ -366,7 +366,7 @@ func (tl *TenantRateLimiter) PayloadAuthMiddleware() func(http.Handler) http.Han
 			if !tl.Allow(token.Tenant) {
 				slog.Warn("tenant rate limit exceeded",
 					"tenant", token.Tenant,
-					"path", r.URL.Path,
+					"path", loggedPath(r),
 				)
 				metrics.RateLimitRejections.Tenant.Inc()
 				w.Header().Set("Retry-After", tl.retryAfterSeconds())

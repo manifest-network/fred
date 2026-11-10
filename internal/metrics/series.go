@@ -1,7 +1,11 @@
 package metrics
 
 import (
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -29,8 +33,10 @@ import (
 //     the component that writes it is constructed. A recording path only looks
 //     series up: ForBackend never creates one;
 //   - a label set that is open by nature (an HTTP status code) is written
-//     through a Count function and documented as created on first event. Those
-//     families are not alerted with increase() or rate().
+//     through a recording function (ObserveAPIRequest) and documented as
+//     created on first event. Those families are not alerted with increase()
+//     or rate(). Such a function derives its other labels itself, from a
+//     fixed vocabulary, so no caller supplies a label string.
 //
 // internal/testutil's counter series guard keeps child-series creation inside
 // the files that declare a vocabulary.
@@ -685,12 +691,81 @@ func bindBackend(name string) BackendSeries {
 	}
 }
 
-// CountAPIRequest counts one tenant API request. Its status label is an HTTP
-// status code, an open set, so each method, path and status series is
-// created by its first request; nothing alerts on this counter with
-// increase() or rate().
-func CountAPIRequest(method, path, status string) {
-	apiRequestsTotal.WithLabelValues(method, path, status).Inc()
+// ObserveAPIRequest records one API request in fred_api_requests_total and
+// fred_api_request_duration_seconds. It takes the request rather than label
+// strings, and both families are unexported, so every label is derived here
+// and nothing a client sends can become a label value of its own (ENG-2150):
+//
+//   - method is one of apiMethodLabel's fixed values;
+//   - path is the route the request matched, or "unmatched" (apiPathLabel);
+//   - status is the HTTP status code the handler wrote. Fred chooses it, but
+//     the set is open, so each method, path and status series is created by
+//     its first request, and nothing alerts on these families with
+//     increase() or rate().
+func ObserveAPIRequest(r *http.Request, status int, elapsed time.Duration) {
+	method, path, code := apiMethodLabel(r.Method), apiPathLabel(r), strconv.Itoa(status)
+	apiRequestDuration.WithLabelValues(method, path, code).Observe(elapsed.Seconds())
+	apiRequestsTotal.WithLabelValues(method, path, code).Inc()
+}
+
+// apiMethodOther is the method label of a request whose method net/http does
+// not name.
+const apiMethodOther = "other"
+
+// apiMethodLabel maps a request method to the method label: the nine methods
+// net/http names, or apiMethodOther. Go's server accepts any token as a
+// method and ServeMux answers an unknown one 405, so labeling the raw method
+// let an unauthenticated client create a series per invented method, which is
+// never evicted. client_golang's own handler instrumentation fixed the same
+// flaw by mapping methods onto a fixed set (CVE-2022-21698).
+//
+// Methods are case-sensitive (RFC 9110, section 9.1), as ServeMux's matching
+// is, so "get" is apiMethodOther. Each case returns the constant rather than
+// its argument: the HTTP/1 server slices the method out of the request line,
+// so keeping the argument as a label would keep that whole line in memory.
+func apiMethodLabel(method string) string {
+	switch method {
+	case http.MethodGet:
+		return http.MethodGet
+	case http.MethodHead:
+		return http.MethodHead
+	case http.MethodPost:
+		return http.MethodPost
+	case http.MethodPut:
+		return http.MethodPut
+	case http.MethodPatch:
+		return http.MethodPatch
+	case http.MethodDelete:
+		return http.MethodDelete
+	case http.MethodConnect:
+		return http.MethodConnect
+	case http.MethodOptions:
+		return http.MethodOptions
+	case http.MethodTrace:
+		return http.MethodTrace
+	default:
+		return apiMethodOther
+	}
+}
+
+// apiPathUnmatched is the path label of a request that matched no route.
+const apiPathUnmatched = "unmatched"
+
+// apiPathLabel maps a request to the path label: the ServeMux pattern it
+// matched, without the pattern's method and host (for example
+// "/v1/leases/{lease_uuid}/status"), or apiPathUnmatched. ServeMux sets
+// r.Pattern to one of the patterns registered at startup, so the label takes
+// at most one value per route plus one. Labeling r.URL.Path instead let an
+// unauthenticated path scan create a series per path (ENG-448, F28).
+func apiPathLabel(r *http.Request) string {
+	if r.Pattern == "" {
+		return apiPathUnmatched
+	}
+	// A pattern is "[METHOD ][HOST]/path"; the path starts at the first '/'.
+	if i := strings.IndexByte(r.Pattern, '/'); i >= 0 {
+		return r.Pattern[i:]
+	}
+	return r.Pattern
 }
 
 // BackendRequestCounters is fred_backend_requests_total for one backend and

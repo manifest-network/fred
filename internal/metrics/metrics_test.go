@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -170,7 +171,7 @@ func allCollectors() []prometheus.Collector {
 		BackendHealthProbePanicsTotal,
 		// Rate limit / API / health
 		rateLimitRejectionsTotal,
-		APIRequestDuration,
+		apiRequestDuration,
 		apiRequestsTotal,
 		HealthCheckHealthy,
 		ChainHealthProbePanicsTotal,
@@ -334,7 +335,7 @@ func TestVecLabels(t *testing.T) {
 		BackendAllocatedCPURatio.WithLabelValues("docker")
 	})
 	assert.NotPanics(t, func() {
-		APIRequestDuration.WithLabelValues("GET", "/health", "200")
+		ObserveAPIRequest(&http.Request{Method: http.MethodGet, Pattern: "GET /health"}, http.StatusOK, 0)
 	})
 	assert.NotPanics(t, func() {
 		for _, check := range []string{

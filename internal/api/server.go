@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -45,6 +43,16 @@ const (
 	// Set independently of ReadTimeout to prevent Slowloris attacks even if
 	// ReadTimeout is tuned to 0 for streaming endpoints.
 	readHeaderTimeout = 5 * time.Second
+
+	// maxHeaderBytes limits the request line and headers the server reads, for
+	// HTTP/1 and HTTP/2 alike, with a small margin Go adds (4 KiB on HTTP/1).
+	// Go refuses a request over it without calling the server's handler:
+	// normally with 431, though HTTP/2 closes the connection when a header
+	// block is far over. Go's default is 1 MiB, enough for an unauthenticated
+	// client to send a method or path of nearly that size on every request.
+	// Fred's credentials are under 1 KiB (a bearer token or a callback
+	// signature), and 64 KiB leaves room for cookies a browser may attach.
+	maxHeaderBytes = 64 << 10
 )
 
 // CallbackPublisher applies authenticated backend callbacks through the
@@ -355,6 +363,7 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: readHeaderTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 		ReadTimeout:       cfg.ReadTimeout,
 		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       cfg.IdleTimeout,
@@ -589,41 +598,20 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
-		statusStr := strconv.Itoa(wrapped.statusCode)
 
-		// Use the matched route template (bounded cardinality) for the metric
-		// path label; the raw URL path still goes to the structured log below.
-		path := metricPath(r)
-
-		// Record metrics
-		metrics.APIRequestDuration.WithLabelValues(r.Method, path, statusStr).Observe(duration.Seconds())
-		metrics.CountAPIRequest(r.Method, path, statusStr)
+		// The metrics package derives every label from the request itself:
+		// the matched route template rather than the raw path, and a fixed
+		// method vocabulary rather than the raw method.
+		metrics.ObserveAPIRequest(r, wrapped.statusCode, duration)
 
 		slog.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
+			"method", loggedMethod(r),
+			"path", loggedPath(r),
 			"status", wrapped.statusCode,
 			"duration", duration,
 			"remote_addr", r.RemoteAddr,
 		)
 	})
-}
-
-// metricPath returns a bounded-cardinality label for the request: the matched
-// ServeMux route template with its leading method/host stripped (e.g.
-// "/v1/leases/{lease_uuid}/status"), or "unmatched" for a request that matched
-// no route (e.g. an unauthenticated 404 path scan). Labeling metrics with the
-// template rather than r.URL.Path bounds the {path} label to the finite set of
-// registered routes + 1, closing an unauthenticated cardinality-DoS vector. (F28)
-func metricPath(r *http.Request) string {
-	if r.Pattern == "" {
-		return "unmatched"
-	}
-	// Pattern is "[METHOD ][HOST]/path"; the path starts at the first '/'.
-	if i := strings.IndexByte(r.Pattern, '/'); i >= 0 {
-		return r.Pattern[i:]
-	}
-	return r.Pattern
 }
 
 // responseWriter wraps http.ResponseWriter to capture the status code.
