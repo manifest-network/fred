@@ -2156,10 +2156,21 @@ func (s *Store) installUnprojectedPositivesLocked(
 }
 
 func (s *Store) unprojectedPositiveErrorLocked(leaseUUID string) error {
-	if !s.inventoryRecoveryRequired && len(s.unprojectedPositives[leaseUUID]) == 0 {
+	boundaries := s.unprojectedPositives[leaseUUID]
+	if !s.inventoryRecoveryRequired && len(boundaries) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%w: lease %q", ErrUnprojectedInventoryPositive, leaseUUID)
+	if s.inventoryRecoveryRequired || s.pendingInventorySweepID == 0 {
+		return fmt.Errorf("%w: lease %q", ErrUnprojectedInventoryPositive, leaseUUID)
+	}
+	for sweepID := range boundaries {
+		if sweepID != s.pendingInventorySweepID {
+			// An earlier projection left this lease unresolved. Its barrier
+			// outlives the open sweep, so the refusal is not retryable.
+			return fmt.Errorf("%w: lease %q", ErrUnprojectedInventoryPositive, leaseUUID)
+		}
+	}
+	return inventorySweepRefusal{leaseUUID: leaseUUID, sweepID: s.pendingInventorySweepID}
 }
 
 func (s *Store) leaseSideEffectError(leaseUUID string) error {

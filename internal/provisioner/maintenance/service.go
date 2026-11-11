@@ -49,6 +49,11 @@ const (
 	OutcomeInternalFailure
 	OutcomeBackendLost
 	OutcomeExpired
+	// OutcomeInventoryReconciling: placement refused to admit the command only
+	// until the inventory sweep still collecting projects the lease. Nothing
+	// was recorded, so the same request is expected to succeed shortly
+	// (ENG-2161).
+	OutcomeInventoryReconciling
 )
 
 type Result struct {
@@ -70,7 +75,7 @@ func NewResult(outcome Outcome, cause error) Result {
 	case OutcomeAccepted, OutcomeNotFound, OutcomeNoLongerActive, OutcomeForbidden,
 		OutcomeAlreadyInProgress, OutcomeCommandConflict, OutcomeBackendInvalidState,
 		OutcomeBackendValidation, OutcomeCapacityReserved, OutcomeServiceUnavailable, OutcomeInternalFailure,
-		OutcomeBackendLost, OutcomeExpired:
+		OutcomeBackendLost, OutcomeExpired, OutcomeInventoryReconciling:
 		return Result{outcome: outcome, cause: cause}
 	default:
 		return Result{outcome: OutcomeInternalFailure, cause: errors.New("invalid maintenance result")}
@@ -143,6 +148,8 @@ func resultFromApplication(result placement.MaintenanceApplicationResult) Result
 		outcome = OutcomeBackendLost
 	case placement.MaintenanceApplicationExpired:
 		outcome = OutcomeExpired
+	case placement.MaintenanceApplicationInventoryReconciling:
+		outcome = OutcomeInventoryReconciling
 	case placement.MaintenanceApplicationAlreadyInProgress:
 		outcome = OutcomeAlreadyInProgress
 	case placement.MaintenanceApplicationCommandConflict:
