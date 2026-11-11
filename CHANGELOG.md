@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.14.2] - 2026-11-11
+
+### Added
+
 - A reproducible Quint simulation suite tracks the lifecycle, acknowledgment, retention, routing, and billing models from the November formal-modeling review, including historical counterexamples and clearly labeled proposed fixes. Run it with `make test-models` after installing the pinned tool in `models/quint`.
 
 ### Changed
@@ -24,9 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - providerd now permits restores from retained `REJECTED` leases and recovers interrupted restores from `EXPIRED` or `REJECTED` sources. Admission and recovery share the same exact-observation terminal-state policy, so provision or restore work that commits after timeout rejection or tenant cancellation no longer strands retained data under the rejected lease. Tenant/provider ownership, source placement, and backend retention checks still apply (ENG-2130).
-
 - providerd retries the remaining eligible leases together when an acknowledgment batch fails because a member left PENDING. Exact lease/provider observations resolve ACTIVE or ineligible members before retrying; every retry shrinks the batch and shares the original flush deadline, preserving duplicate-caller results and fee/gas failure handling (ENG-2127).
-
 - providerd no longer rejects a provision or restore on callback timeout after authenticating its Success callback when chain acknowledgment fails. Success remains attached to the exact tracked operation after callback claims are released, including when an inline callback precedes an ambiguous or refused synchronous return. Completion preserves callback ownership and the durable attempt, so recovery cannot reinstall that operation without its evidence. Even a timeout candidate collected before the callback cannot reject it; callback replay can retry acknowledgment (ENG-2129).
 - docker-backend's periodic recovery pass no longer stops partway when a tenant closes a lease just as the pass reports that the lease's containers diverged from its release. A close admitted in that window takes the lease's actor before the report, and the actor answered the report with an error. The pass then stopped with `ERROR reconciliation failed … apply durable cohort divergence for lease …`, counted as `fred_docker_backend_reconciliation_total{outcome="error"}`. It skipped the rest of that pass for every lease, including re-detected container deaths, cold-start failure diagnostics and the recovery of interrupted operations and restores, until the next pass (`reconcile_interval`, 5 minutes by default). The actor now answers that the report was superseded, which the pass skips (ENG-2155).
 - docker-backend's periodic recovery pass no longer logs `ERROR durable close recovery remains pending` with `lease actor terminated` for a close that just completed. The pass resumes every pending close, including one a live request is still tearing down, and queues its own close behind it. When the live close finished, its actor retired without running the queued one, and the pass reported that as a failed close. It now checks the close again under the lease's command fence and routes it again only if it is still pending, so the line appears only for a close that failed (ENG-2154).
