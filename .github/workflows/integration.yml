@@ -94,6 +94,37 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Prefer Ubuntu mirrors outside ubuntu.com
+        # The runner image points every Ubuntu suite at the mirror list
+        # /etc/apt/apt-mirrors.txt, and every mirror on it is a *.ubuntu.com
+        # host. On 2026-11-11 the runners could not resolve any ubuntu.com name
+        # for hours while other hosts resolved, so apt-get failed before a test
+        # ran. Two official mirrors outside that domain go first; the image's
+        # own follow as fallbacks, since apt tries the lowest priority first
+        # and moves on only when a mirror fails. apt verifies each archive's
+        # signature, so a mirror changes where packages come from, not what
+        # they are.
+        run: |
+          mirrors=/etc/apt/apt-mirrors.txt
+          if ! grep -rqs "mirror+file:$mirrors" /etc/apt/sources.list /etc/apt/sources.list.d; then
+            echo "::error::the runner's apt sources no longer use $mirrors; update this step"
+            exit 1
+          fi
+          {
+            printf '%s\tpriority:1\n' 'http://mirrors.edge.kernel.org/ubuntu/'
+            printf '%s\tpriority:2\n' 'https://mirror.math.princeton.edu/pub/ubuntu/'
+            # Keep the image's mirrors and their order, after the two above.
+            awk '{
+              if (match($0, /priority:[0-9]+/)) {
+                rank = substr($0, RSTART + 9, RLENGTH - 9) + 10
+                $0 = substr($0, 1, RSTART - 1) "priority:" rank substr($0, RSTART + RLENGTH)
+              }
+              print
+            }' "$mirrors"
+          } | sudo tee "$mirrors.new" >/dev/null
+          sudo mv "$mirrors.new" "$mirrors"
+          cat "$mirrors"
+
       - name: Install supported Docker Engine
         # The stock runner can ship Docker 28.0/API 1.48. Admission needs API
         # 1.49+, and the leg's image store must be selected explicitly.
