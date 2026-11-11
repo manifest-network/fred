@@ -979,7 +979,11 @@ durable typed journal fact.
   half-installed actor.
 - `errActorTerminated` is returned when a command was accepted before final
   retirement but can no longer run; the caller preserves or rolls back its
-  durable authority as appropriate and a retry resolves a fresh actor.
+  durable authority as appropriate and a retry resolves a fresh actor. A close
+  command is answered instead with a `leasesm.CloseAnswer` saying it was not
+  handled, which no error value can express. docker-backend's `routeClose`, the
+  only place a close command is minted, then admits the close again under a
+  fresh command fence before routing it to the replacement actor (ENG-2154).
 
 **Inbox delivery and backpressure:**
 

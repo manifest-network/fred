@@ -30,24 +30,18 @@ import (
 // close's durable head commits, so no other command can act between that
 // check and the head, however soon this call stops waiting.
 func (b *Backend) Deprovision(ctx context.Context, leaseUUID string) error {
-	for {
+	return b.routeClose(ctx, func(ctx context.Context) (shared.CommandFenceHold, bool, error) {
 		fence, err := b.prepareClose(ctx, leaseUUID)
 		if err != nil {
 			if ctx.Err() != nil {
 				// The caller's budget ran out before the close could be
 				// admitted. Nothing was decided; a retry admits it.
-				return closePending{leaseUUID: leaseUUID}
+				return shared.CommandFenceHold{}, false, closePending{leaseUUID: leaseUUID}
 			}
-			return err
+			return shared.CommandFenceHold{}, false, err
 		}
-		err = b.closeThroughActor(ctx, fence)
-		if !leasesm.IsRejectedByRetiringActor(err) {
-			return err
-		}
-		// The previous actor retired without running this close and gave the
-		// fence back. Prepare again under a new fence, then route the close to
-		// the actor that replaces it.
-	}
+		return fence, true, nil
+	})
 }
 
 // prepareClose does, under the caller's ctx, what must precede handing a
@@ -69,34 +63,59 @@ func (b *Backend) prepareClose(ctx context.Context, leaseUUID string) (shared.Co
 	return fence, nil
 }
 
-// closeThroughActor hands one close, with the lease's command fence, to the
-// lease's actor and waits for its answer. The close command takes ownership of
-// fence and keeps it until its durable head commits or its attempt ends; if
-// no actor accepts the command, abandoning it gives the fence back. When ctx
-// ends before the answer, the close keeps running on the actor's lifetime and
-// the result is closePending.
-func (b *Backend) closeThroughActor(ctx context.Context, fence shared.CommandFenceHold) error {
-	leaseUUID := fence.LeaseUUID()
-	command, reply, err := leasesm.NewDeprovisionCommand(fence)
-	if err != nil {
-		fence.Release()
-		return err
-	}
-	if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
-		command.Abandon()
-		if ctx.Err() != nil {
-			return closePending{leaseUUID: leaseUUID}
+// closeAdmission admits one close: it takes the lease's command fence and,
+// under it, checks what must hold before the close is handed to the lease's
+// actor. It returns the fence still held when the close may go ahead. With
+// proceed false there is nothing to hand over, and any fence it took has been
+// given back.
+type closeAdmission func(ctx context.Context) (fence shared.CommandFenceHold, proceed bool, err error)
+
+// routeClose is the only way a close reaches a lease actor (ENG-2154). It
+// admits the close, hands it to the lease's actor with the fence admission
+// took, and waits for the answer. The close command owns the fence until its
+// durable head commits or its attempt ends; a command no actor accepts gives
+// it back when abandoned.
+//
+// An actor that was retiring answers that it did not handle the close, and
+// gives the fence back. routeClose then admits the close again under a fresh
+// fence before routing it to the actor that replaces the retiring one. The
+// second admission re-checks whatever the first one checked, so a close that
+// settled in the meantime is not routed again, and nothing can be admitted
+// between that check and the route. A close that was not handled is never
+// reported as an outcome.
+//
+// When ctx ends before the answer, the close keeps running on the actor's
+// lifetime and the result is closePending.
+func (b *Backend) routeClose(ctx context.Context, admit closeAdmission) error {
+	for {
+		fence, proceed, err := admit(ctx)
+		if err != nil || !proceed {
+			return err
 		}
-		return err
-	}
-	wait, err := b.awaitCloseReply(ctx, reply)
-	switch wait {
-	case closeWaitAnswered:
-		return err
-	case closeWaitAbandoned:
-		return closePending{leaseUUID: leaseUUID}
-	default:
-		return errors.New("backend shutting down")
+		leaseUUID := fence.LeaseUUID()
+		command, reply, err := leasesm.NewDeprovisionCommand(fence)
+		if err != nil {
+			fence.Release()
+			return err
+		}
+		if err := b.routeToLeaseBlocking(ctx, leaseUUID, command); err != nil {
+			command.Abandon()
+			if ctx.Err() != nil {
+				return closePending{leaseUUID: leaseUUID}
+			}
+			return err
+		}
+		answer, wait := b.awaitCloseAnswer(ctx, reply)
+		switch wait {
+		case closeWaitAnswered:
+		case closeWaitAbandoned:
+			return closePending{leaseUUID: leaseUUID}
+		default:
+			return errors.New("backend shutting down")
+		}
+		if handled, err := answer.Outcome(); handled {
+			return err
+		}
 	}
 }
 
@@ -105,7 +124,7 @@ func (b *Backend) closeThroughActor(ctx context.Context, fence shared.CommandFen
 type closeWait uint8
 
 const (
-	// closeWaitAnswered: the actor answered; the error is its answer.
+	// closeWaitAnswered: the actor answered.
 	closeWaitAnswered closeWait = iota + 1
 	// closeWaitAbandoned: the caller's context ended first.
 	closeWaitAbandoned
@@ -113,34 +132,34 @@ const (
 	closeWaitStopping
 )
 
-// awaitCloseReply waits for the actor's answer until ctx or the backend ends.
+// awaitCloseAnswer waits for the actor's answer until ctx or the backend ends.
 // An answer that is already there wins over either ending.
-func (b *Backend) awaitCloseReply(ctx context.Context, reply leasesm.ActorReply) (closeWait, error) {
+func (b *Backend) awaitCloseAnswer(ctx context.Context, reply leasesm.CloseReply) (leasesm.CloseAnswer, closeWait) {
 	select {
-	case err := <-reply.Result():
-		return closeWaitAnswered, err
+	case answer := <-reply.Answer():
+		return answer, closeWaitAnswered
 	case <-ctx.Done():
 	case <-b.stopCtx.Done():
 	}
 	// A select picks at random among ready cases, so look for the answer on
 	// its own before reading which ending came.
 	select {
-	case err := <-reply.Result():
-		return closeWaitAnswered, err
+	case answer := <-reply.Answer():
+		return answer, closeWaitAnswered
 	default:
 	}
 	select {
 	case <-ctx.Done():
-		return closeWaitAbandoned, nil
+		return leasesm.CloseAnswer{}, closeWaitAbandoned
 	default:
-		return closeWaitStopping, nil
+		return leasesm.CloseAnswer{}, closeWaitStopping
 	}
 }
 
 // closePending reports that a caller stopped waiting before a close settled:
 // identity verification or other lifecycle work held up its admission, or the
 // actor had not answered yet. A close the actor admitted keeps running on the actor's
-// lifetime. Only Deprovision and closeThroughActor mint it.
+// lifetime. Only Deprovision and routeClose mint it.
 type closePending struct{ leaseUUID string }
 
 func (pending closePending) Error() string {
