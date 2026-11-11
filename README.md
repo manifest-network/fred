@@ -964,6 +964,13 @@ key and exact command safely joins recovery and may continue returning `503`
 while progress is blocked. After the lease closes, a positive chain observation
 allows recovery to settle the pending command without starting a replacement.
 
+A `503` with `reason: inventory_reconciling` is different: Fred refused the
+command before recording it, because a reconciliation sweep is still collecting
+backend inventory that includes this lease. Retry the same key and exact command
+after `Retry-After: 1`. A sweep usually records its inventory within a second,
+but it waits for its slowest backend, so `Retry-After` is a minimum wait: back
+off with jitter if the answer repeats.
+
 Fred derives tenant, provider, backend/storage, and callback authority from its
 prepared placement store; the request supplies none of those routing facts.
 For an upgraded v0.13 owner, the first complete identity-bearing fleet inventory
@@ -1006,6 +1013,10 @@ Once established, an unrelated backend outage does not revoke it.
   authentication/routing authority is temporarily unavailable, or a bounded
   idempotency journal refused admission before side effects.
   An admitted command can remain pending for automatic recovery as described above
+- `503 Service Unavailable` with `reason: inventory_reconciling` - A
+  reconciliation sweep is still collecting backend inventory that includes this
+  lease. The command was not recorded; retry it with the same key
+  (`Retry-After: 1`)
 
 ### Update Lease
 
@@ -1085,6 +1096,10 @@ Because the on-chain `meta_hash` is set once at lease creation and cannot curren
   is fenced, routing/authority is temporarily unavailable, or the bounded
   provider/backend idempotency journal refused admission before side effects. An
   admitted command can remain pending for automatic recovery
+- `503 Service Unavailable` with `reason: inventory_reconciling` - A
+  reconciliation sweep is still collecting backend inventory that includes this
+  lease. The command was not recorded; retry it with the same key
+  (`Retry-After: 1`)
 
 ### Restore Lease
 
@@ -1202,6 +1217,9 @@ off to a complete durable close intent before teardown.
 - `500 Internal Server Error` - The restore returned an unexpected or ambiguous backend result, such as a transport error, timeout, generic 5xx, coded already-provisioned response, or unknown refusal code; the durable target attempt is retained until positive evidence confirms it or an operator safely repairs it
 - `502 Bad Gateway` - The backend rejected the restore with an unusable or off-contract error response
 - `503 Service Unavailable` - Insufficient resources, an open backend circuit, an unavailable source lease observation, unavailable placement routing/recording/tracking, or a source placement that is unusable, unresolved, or names a backend Fred no longer knows
+- `503 Service Unavailable` with `reason: inventory_reconciling` - A reconciliation sweep is still collecting backend inventory that includes the source or target. Nothing was recorded and no backend was contacted; keep the target lease and retry with a fresh bearer token after `Retry-After: 1`, backing off with jitter if the answer repeats
+
+Fred logs every restore `5xx` answer with its cause, so an operator can tell a sweep deferral from a placement or backend failure.
 
 Restore admission conflicts add an optional `reason` while preserving the public
 API's numeric HTTP-status `code` and human-readable `error`:

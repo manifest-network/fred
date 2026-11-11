@@ -10,6 +10,7 @@ package restore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"time"
@@ -48,6 +49,10 @@ const (
 	// OutcomeTargetHasPayload: the target already received a tenant payload
 	// and is provisioned from that manifest instead.
 	OutcomeTargetHasPayload
+	// OutcomeInventoryReconciling: placement refused admission only until the
+	// inventory sweep still collecting projects. Nothing was written, so the
+	// same request is expected to succeed shortly (ENG-2161).
+	OutcomeInventoryReconciling
 )
 
 // Result is the typed result contract returned by Service. Detail contains
@@ -149,32 +154,16 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 		return service.accepted(command, backendName)
 	}
 	result := Result{BackendName: backendName, cause: execution.Err()}
-	switch execution.Disposition() {
-	case placement.RestoreApplicationInvalid:
-		result.Outcome = OutcomeInvalid
-	case placement.RestoreApplicationTargetNotPending:
-		result.Outcome = OutcomeTargetNotPending
-	case placement.RestoreApplicationTargetBillingOnly:
-		result.Outcome = OutcomeTargetBillingOnly
-	case placement.RestoreApplicationTargetHasPayload:
-		result.Outcome = OutcomeTargetHasPayload
-	case placement.RestoreApplicationSourceNotFound:
-		result.Outcome = OutcomeSourceNotFound
-	case placement.RestoreApplicationSourceUnavailable:
-		result.Outcome = OutcomeSourceUnavailable
-	case placement.RestoreApplicationSourceLost:
-		result.Outcome = OutcomeSourceLost
-	case placement.RestoreApplicationSourceBusy:
-		result.Outcome = OutcomeSourceBusy
-	case placement.RestoreApplicationTargetBusy:
-		result.Outcome = OutcomeTargetBusy
-	case placement.RestoreApplicationNotRetained:
-		result.Outcome = OutcomeNotRetained
+	switch disposition := execution.Disposition(); disposition {
 	case placement.RestoreApplicationBackendRejected:
 		result = classifyBackendResult(execution)
 		result.BackendName = backendName
 	default:
-		result.Outcome = OutcomeServiceUnavailable
+		result.Outcome = outcomeForDisposition(disposition)
+		if result.Outcome == OutcomeInternalFailure {
+			result.cause = errors.Join(result.cause,
+				fmt.Errorf("restore application returned unmapped disposition %d", disposition))
+		}
 	}
 	if execution.DefinitivelyRefused() {
 		service.publishRefusalBestEffort(backendName,
@@ -185,6 +174,42 @@ func (service *Service) Execute(ctx context.Context, command Command) Result {
 			})
 	}
 	return result
+}
+
+// outcomeForDisposition is the total projection of every non-backend restore
+// disposition. Each one is named, and an unnamed value fails closed as an
+// internal failure, which the transport logs, rather than reaching a tenant as
+// an unexplained retryable answer (ENG-2161). Accepted and BackendRejected are
+// projected by Execute itself.
+func outcomeForDisposition(disposition placement.RestoreApplicationDisposition) Outcome {
+	switch disposition {
+	case placement.RestoreApplicationInvalid:
+		return OutcomeInvalid
+	case placement.RestoreApplicationTargetNotPending:
+		return OutcomeTargetNotPending
+	case placement.RestoreApplicationTargetBillingOnly:
+		return OutcomeTargetBillingOnly
+	case placement.RestoreApplicationTargetHasPayload:
+		return OutcomeTargetHasPayload
+	case placement.RestoreApplicationSourceNotFound:
+		return OutcomeSourceNotFound
+	case placement.RestoreApplicationSourceUnavailable:
+		return OutcomeSourceUnavailable
+	case placement.RestoreApplicationSourceLost:
+		return OutcomeSourceLost
+	case placement.RestoreApplicationSourceBusy:
+		return OutcomeSourceBusy
+	case placement.RestoreApplicationTargetBusy:
+		return OutcomeTargetBusy
+	case placement.RestoreApplicationNotRetained:
+		return OutcomeNotRetained
+	case placement.RestoreApplicationServiceUnavailable:
+		return OutcomeServiceUnavailable
+	case placement.RestoreApplicationInventoryReconciling:
+		return OutcomeInventoryReconciling
+	default:
+		return OutcomeInternalFailure
+	}
 }
 
 func (service *Service) accepted(command Command, backendName string) Result {

@@ -1226,73 +1226,142 @@ func (h *Handlers) RestoreLease(w http.ResponseWriter, r *http.Request) {
 		Tenant:          auth.Token.Tenant,
 		SourceLeaseUUID: body.FromLeaseUUID,
 	})
-	h.writeRestoreResult(w, leaseUUID, body.FromLeaseUUID, result)
+	writeRestoreResult(r.Context(), w, leaseUUID, body.FromLeaseUUID, result)
 }
 
-func (h *Handlers) writeRestoreResult(
-	w http.ResponseWriter,
-	leaseUUID, sourceLeaseUUID string,
-	result restoreapp.Result,
-) {
+// restoreResponse is the complete HTTP answer to one restore outcome. It is
+// data, so writeRestoreResult is the only place a restore answer is written
+// and the only place it is logged.
+type restoreResponse struct {
+	status     int
+	body       any
+	retryAfter string
+	// logMessage names the operator event. Every 5xx answer carries one, so a
+	// server-side refusal is never invisible (ENG-2161).
+	logMessage string
+	logLevel   slog.Level
+}
+
+// restoreResponseFor is the total projection of a restore result onto HTTP.
+// It reads only the outcome and the curated backend detail, never the cause,
+// which is operator-only.
+func restoreResponseFor(result restoreapp.Result) restoreResponse {
+	answer := func(status int, body ErrorResponse) restoreResponse {
+		return restoreResponse{status: status, body: body}
+	}
+	plain := func(status int, message string) restoreResponse {
+		return answer(status, ErrorResponse{Error: message, Code: status})
+	}
+	logged := func(response restoreResponse, level slog.Level, message string) restoreResponse {
+		response.logLevel, response.logMessage = level, message
+		return response
+	}
 	switch result.Outcome {
 	case restoreapp.OutcomeAccepted:
 		// Tenant-facing restore remains "provisioning" even though the backend
 		// actor and event stream use the internal Restarting state.
-		writeJSON(w, map[string]string{"status": "provisioning"}, http.StatusAccepted)
+		return restoreResponse{status: http.StatusAccepted, body: map[string]string{"status": "provisioning"}}
 	case restoreapp.OutcomeTargetNotPending:
-		writeRestoreConflict(w, "lease is not pending; only a fresh lease can be restored into", "target_not_pending")
+		return answer(http.StatusConflict, restoreConflictBody(
+			"lease is not pending; only a fresh lease can be restored into", "target_not_pending"))
 	case restoreapp.OutcomeTargetBillingOnly:
-		writeBillingOnly(w, "lease is billing-only and cannot be restored into")
+		return answer(http.StatusBadRequest, billingOnlyBody("lease is billing-only and cannot be restored into"))
 	case restoreapp.OutcomeTargetHasPayload:
-		writeRestoreConflict(w, "lease already received a payload and is provisioned from it; restore into a fresh lease that receives no upload", "target_has_payload")
+		return answer(http.StatusConflict, restoreConflictBody(
+			"lease already received a payload and is provisioned from it; restore into a fresh lease that receives no upload",
+			"target_has_payload"))
 	case restoreapp.OutcomeSourceNotFound, restoreapp.OutcomeNotRetained:
-		writeError(w, "no retained data found for that lease", http.StatusNotFound)
-	case restoreapp.OutcomeSourceUnavailable:
-		slog.Warn("restore source authority unavailable",
-			"lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID,
-			"cause", fmt.Sprintf("%.1024s", fmt.Sprint(result.Cause())))
-		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return plain(http.StatusNotFound, "no retained data found for that lease")
 	case restoreapp.OutcomeSourceLost:
-		writeBackendStorageLost(w)
+		return answer(http.StatusGone, backendStorageLostBody())
 	case restoreapp.OutcomeSourceBusy:
-		writeRestoreConflict(w, "lease is already being provisioned or restored", "source_busy")
+		return answer(http.StatusConflict, restoreConflictBody("lease is already being provisioned or restored", "source_busy"))
 	case restoreapp.OutcomeTargetBusy:
-		writeRestoreConflict(w, "lease is already being provisioned or restored", "target_busy")
-	case restoreapp.OutcomeServiceUnavailable:
-		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+		return answer(http.StatusConflict, restoreConflictBody("lease is already being provisioned or restored", "target_busy"))
 	case restoreapp.OutcomeBackendInvalidState:
-		writeError(w, "lease not in a restorable state", http.StatusConflict)
-	case restoreapp.OutcomeInsufficientResources:
-		writeError(w, "insufficient resources to restore", http.StatusServiceUnavailable)
-	case restoreapp.OutcomeBackendUnavailable:
-		writeError(w, "restore backend is temporarily unavailable", http.StatusServiceUnavailable)
+		return plain(http.StatusConflict, "lease not in a restorable state")
 	case restoreapp.OutcomeTierTooSmall:
-		writeError(w, tenantDetailText(result.Detail(), "retained data exceeds the requested smaller tier"),
-			http.StatusUnprocessableEntity)
+		return plain(http.StatusUnprocessableEntity,
+			tenantDetailText(result.Detail(), "retained data exceeds the requested smaller tier"))
 	case restoreapp.OutcomeInvalidRequest:
-		writeError(w, tenantDetailText(result.Detail(), "the restore request was rejected as invalid"),
-			http.StatusBadRequest)
+		return plain(http.StatusBadRequest,
+			tenantDetailText(result.Detail(), "the restore request was rejected as invalid"))
+	case restoreapp.OutcomeInventoryReconciling:
+		response := logged(answer(http.StatusServiceUnavailable, inventoryReconcilingBody()),
+			slog.LevelWarn, "restore deferred until the open inventory sweep projects")
+		response.retryAfter = inventoryReconcilingRetryAfter
+		return response
+	case restoreapp.OutcomeSourceUnavailable:
+		return logged(plain(http.StatusServiceUnavailable, errMsgServiceUnavailable),
+			slog.LevelWarn, "restore source authority unavailable")
+	case restoreapp.OutcomeServiceUnavailable:
+		return logged(plain(http.StatusServiceUnavailable, errMsgServiceUnavailable),
+			slog.LevelWarn, "restore admission unavailable")
+	case restoreapp.OutcomeInsufficientResources:
+		return logged(plain(http.StatusServiceUnavailable, "insufficient resources to restore"),
+			slog.LevelWarn, "restore refused for insufficient backend resources")
+	case restoreapp.OutcomeBackendUnavailable:
+		return logged(plain(http.StatusServiceUnavailable, "restore backend is temporarily unavailable"),
+			slog.LevelWarn, "restore backend unavailable")
 	case restoreapp.OutcomeBackendMalformedResponse:
-		slog.Warn("restore rejected with an unusable backend error body",
-			"error", result.Cause(), "lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID)
-		writeError(w, errMsgBackendUnusableError, http.StatusBadGateway)
+		return logged(plain(http.StatusBadGateway, errMsgBackendUnusableError),
+			slog.LevelWarn, "restore rejected with an unusable backend error body")
 	case restoreapp.OutcomeInvalid, restoreapp.OutcomeInternalFailure:
-		slog.Error("failed to restore lease",
-			"error", result.Cause(), "lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return logged(plain(http.StatusInternalServerError, errMsgInternalServerError),
+			slog.LevelError, "failed to restore lease")
 	default:
-		slog.Error("restore service returned an unknown outcome",
-			"outcome", result.Outcome, "lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID)
-		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
+		return logged(plain(http.StatusInternalServerError, errMsgInternalServerError),
+			slog.LevelError, "restore service returned an unknown outcome")
 	}
+}
+
+// writeRestoreResult writes the answer restoreResponseFor chose. A 5xx answer
+// is logged with its bounded cause even if a table entry omits its message.
+func writeRestoreResult(
+	ctx context.Context,
+	w http.ResponseWriter,
+	leaseUUID, sourceLeaseUUID string,
+	result restoreapp.Result,
+) {
+	response := restoreResponseFor(result)
+	if response.logMessage == "" && response.status >= http.StatusInternalServerError {
+		response.logLevel, response.logMessage = slog.LevelError, "restore answered with an unlogged server error"
+	}
+	if response.logMessage != "" {
+		slog.Log(ctx, response.logLevel, response.logMessage,
+			"lease_uuid", leaseUUID, "from_lease", sourceLeaseUUID,
+			"outcome", result.Outcome, "backend", result.BackendName,
+			"cause", fmt.Sprintf("%.1024s", fmt.Sprint(result.Cause())))
+	}
+	if response.retryAfter != "" {
+		w.Header().Set("Retry-After", response.retryAfter)
+	}
+	writeJSON(w, response.body, response.status)
 }
 
 // writeRestoreConflict adds a cause authored by the exact restore admission
 // branch while preserving the public error envelope's numeric HTTP status code.
 func writeRestoreConflict(w http.ResponseWriter, message, reason string) {
-	writeJSON(w, ErrorResponse{
-		Error: message, Code: http.StatusConflict, Reason: reason,
-	}, http.StatusConflict)
+	writeJSON(w, restoreConflictBody(message, reason), http.StatusConflict)
+}
+
+func restoreConflictBody(message, reason string) ErrorResponse {
+	return ErrorResponse{Error: message, Code: http.StatusConflict, Reason: reason}
+}
+
+// inventoryReconcilingRetryAfter is a hint, not a bound: a sweep's collection
+// usually projects within a second, but it waits for the slowest backend.
+const inventoryReconcilingRetryAfter = "1"
+
+// inventoryReconcilingBody answers a command placement refused only until the
+// inventory sweep still collecting projects (ENG-2161). Nothing was recorded,
+// so the same request is safe to repeat.
+func inventoryReconcilingBody() ErrorResponse {
+	return ErrorResponse{
+		Error:  "the provider is reconciling its inventory; retry shortly",
+		Code:   http.StatusServiceUnavailable,
+		Reason: "inventory_reconciling",
+	}
 }
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
@@ -1479,6 +1548,11 @@ func (h *Handlers) writeMaintenanceResult(
 	case maintenanceapp.OutcomeServiceUnavailable:
 		slog.Warn("maintenance command deferred", "error", result.Cause(), "lease_uuid", leaseUUID, "kind", operationName)
 		writeError(w, errMsgServiceUnavailable, http.StatusServiceUnavailable)
+	case maintenanceapp.OutcomeInventoryReconciling:
+		slog.Warn("maintenance command deferred until the open inventory sweep projects",
+			"error", result.Cause(), "lease_uuid", leaseUUID, "kind", operationName)
+		w.Header().Set("Retry-After", inventoryReconcilingRetryAfter)
+		writeJSON(w, inventoryReconcilingBody(), http.StatusServiceUnavailable)
 	case maintenanceapp.OutcomeInvalid, maintenanceapp.OutcomeInternalFailure:
 		slog.Error("maintenance command failed", "error", result.Cause(), "lease_uuid", leaseUUID, "kind", operationName)
 		writeError(w, errMsgInternalServerError, http.StatusInternalServerError)
@@ -2476,22 +2550,22 @@ const reasonBillingOnly = "billing_only"
 // writeBillingOnly refuses a request that would deploy into a billing-only
 // lease.
 func writeBillingOnly(w http.ResponseWriter, message string) {
-	writeJSON(w, ErrorResponse{
-		Error:  message,
-		Code:   http.StatusBadRequest,
-		Reason: reasonBillingOnly,
-	}, http.StatusBadRequest)
+	writeJSON(w, billingOnlyBody(message), http.StatusBadRequest)
+}
+
+func billingOnlyBody(message string) ErrorResponse {
+	return ErrorResponse{Error: message, Code: http.StatusBadRequest, Reason: reasonBillingOnly}
 }
 
 // writeBackendStorageLost is the one terminal answer for a lease whose
 // backend an operator retired as irrecoverably lost: the workload and its data
 // are gone, so no retry can succeed.
 func writeBackendStorageLost(w http.ResponseWriter) {
-	writeJSON(w, ErrorResponse{
-		Error:  backend.MsgBackendStorageLost,
-		Code:   http.StatusGone,
-		Reason: "backend_storage_lost",
-	}, http.StatusGone)
+	writeJSON(w, backendStorageLostBody(), http.StatusGone)
+}
+
+func backendStorageLostBody() ErrorResponse {
+	return ErrorResponse{Error: backend.MsgBackendStorageLost, Code: http.StatusGone, Reason: "backend_storage_lost"}
 }
 
 // placementLost reports whether the lease's durable placement was lost with a
