@@ -40,6 +40,10 @@ const (
 	MaintenanceApplicationInternalFailure
 	MaintenanceApplicationBackendLost
 	MaintenanceApplicationExpired
+	// MaintenanceApplicationInventoryReconciling: placement refused to admit a
+	// new command only because the inventory sweep still collecting has not
+	// yet projected the lease. No command was recorded (ENG-2161).
+	MaintenanceApplicationInventoryReconciling
 )
 
 // MaintenanceApplicationRequest is an opaque authenticated intent. The
@@ -331,6 +335,9 @@ func resultForPreparation(preparation MaintenancePreparation) MaintenanceApplica
 		if errors.Is(err, ErrPlacementLost) {
 			return maintenanceApplicationResult(MaintenanceApplicationBackendLost, nil)
 		}
+		if inventorySweepPending(err) {
+			return maintenanceApplicationResult(MaintenanceApplicationInventoryReconciling, err)
+		}
 		return maintenanceApplicationResult(MaintenanceApplicationServiceUnavailable, err)
 	}
 	switch preparation.Outcome() {
@@ -354,6 +361,9 @@ func resultForMaintenanceBeginError(err error) MaintenanceApplicationResult {
 	if refusal, reserved := err.(maintenanceReservationRefusal); reserved && //nolint:errorlint // Only an exact source refusal proves the complete authority boundary succeeded.
 		(refusal.reservation == maintenanceCountReserved || refusal.reservation == maintenanceBytesReserved) {
 		return maintenanceApplicationResult(MaintenanceApplicationCapacityReserved, err)
+	}
+	if inventorySweepPending(err) {
+		return maintenanceApplicationResult(MaintenanceApplicationInventoryReconciling, err)
 	}
 	switch {
 	case errors.Is(err, ErrMaintenanceCommandConflict):

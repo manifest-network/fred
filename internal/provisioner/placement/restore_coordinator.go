@@ -44,6 +44,11 @@ const (
 	// RestoreApplicationTargetHasPayload: the target already holds a tenant
 	// payload, so it is provisioned from that manifest instead (ENG-2117).
 	RestoreApplicationTargetHasPayload
+	// RestoreApplicationInventoryReconciling: placement refused admission only
+	// because the inventory sweep still collecting has not yet projected a
+	// lease this restore touches. Nothing was written, and that sweep's
+	// projection is the next event that can admit the restore (ENG-2161).
+	RestoreApplicationInventoryReconciling
 )
 
 // RestoreApplicationRequest carries only authenticated identities. It cannot
@@ -389,6 +394,9 @@ func restoreClaimApplicationFailure(outcome operation.LeaseClaimOutcome, isSourc
 }
 
 func restoreAdmissionApplicationFailure(err error) RestoreApplicationResult {
+	if inventorySweepPending(err) {
+		return RestoreApplicationResult{disposition: RestoreApplicationInventoryReconciling, err: err}
+	}
 	disposition := RestoreApplicationServiceUnavailable
 	switch {
 	case errors.Is(err, ErrRestoreSourceNotFound):
