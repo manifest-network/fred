@@ -51,6 +51,7 @@ its corresponding product change has shipped.
 | `restore_retention.qnt` | ENG-2130: terminal destination strands retained data | Shared terminal-source eligibility implemented alongside the recovery model |
 | `restore_source_recovery.qnt` | ENG-2130: admitted EXPIRED/REJECTED sources must remain recoverable after restart | Shared eligibility used by admission and recovery |
 | `close_recovery_routing.qnt` | ENG-2154: recovery resumes a close that a retiring actor never ran | Typed close answer and re-admitting `routeClose` implemented alongside the model |
+| `cohort_divergence_close.qnt` | ENG-2155: a close admitted before recovery's cohort-divergence report aborts the pass | Typed cohort-divergence answer implemented alongside the model |
 | `billing_ledger.qnt` | ENG-2131: fractional seconds lost at withdrawal | Proposed manifest-ledger change; requires a chain upgrade |
 | `custom_domain_handoff.qnt` | ENG-2132: overlapping and restored stale routes | Deferred architectural change; partial-fix mutants are included |
 | `billing_fairness.qnt` | ENG-858: reservation contract | Candidate contract, awaiting a product decision |
@@ -145,6 +146,26 @@ recovery's close still waits behind a live close's teardown. Go regressions in
 `internal/backend/docker/close_recovery_routing_test.go` run the real recovery
 pass and both recovery entry points; `internal/testutil/close_routing_guard_test.go`
 pins close-command minting to `routeClose`.
+
+## ENG-2155 correspondence and limits
+
+`cohort_divergence_close.qnt` models one Ready lease whose cohort diverged.
+Recovery publishes it and later routes the divergence report, while a close may
+be admitted, tear down, and succeed or fail. Routing delivers only while the
+projection reads Ready, which it still does while a close is admitted, so the
+report can queue behind the close. `current` reports the superseded answers as
+errors and must violate `noAbortOnSupersededReport`. `fixed` skips a superseded
+report and holds that invariant, `handledFailureAborts` and
+`noDivergenceUnderClose`. Two mutants check the other invariants: `skipAllErrors`
+hides a handled failure, and `applyDespiteClose` applies the report although a
+failed close still owns the lease.
+
+The model has one lease and one report, and abstracts the handler's failure as a
+nondeterministic outcome when no close owns the actor. It does not model a stale
+generation separately; routing and the actor treat it as superseded, like a
+projection that left Ready. The Go regression
+`TestRecoverState_CloseAdmittedBeforeCohortDivergenceDoesNotAbortThePass` holds
+a real close in admission while the real recovery pass routes the report.
 
 ## Provenance
 

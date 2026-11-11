@@ -250,5 +250,33 @@
     "invariant": "noDroppedPendingClose",
     "expect_violation": true,
     "step": "step"
+  },
+  {
+    "model": "cohort_divergence_close.qnt",
+    "variant": "current",
+    "invariant": "noAbortOnSupersededReport",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "cohort_divergence_close.qnt",
+    "variant": "fixed",
+    "invariant": "noAbortOnSupersededReport and handledFailureAborts and noDivergenceUnderClose",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "cohort_divergence_close.qnt",
+    "variant": "skipAllErrors",
+    "invariant": "handledFailureAborts",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "cohort_divergence_close.qnt",
+    "variant": "applyDespiteClose",
+    "invariant": "noDivergenceUnderClose",
+    "expect_violation": true,
+    "step": "step"
   }
 ]

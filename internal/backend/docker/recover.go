@@ -2225,8 +2225,15 @@ func (b *Backend) recoverState(ctx context.Context) error {
 	}
 
 	// Existing actors retain their own serialized SM state across periodic
-	// recovery. Drive a typed Ready→Failed transition and wait for its reply so
+	// recovery. Drive a typed Ready→Failed transition and wait for its answer so
 	// the in-memory map, state machine, and lifecycle callback cannot diverge.
+	//
+	// The snapshot was released above, so a close may have begun since: while
+	// it is admitted its actor owns the lease but the projection still reads
+	// Ready, so routing delivers the report and the actor answers it superseded,
+	// as it does when the close ends the lease first. A superseded report is
+	// skipped, not a failure: the close owns the lease, and the next pass
+	// observes it afresh (ENG-2155).
 	slices.SortFunc(cohortTransitionGenerations, func(left, right shared.RuntimeGenerationProof) int {
 		return cmp.Compare(left.LeaseUUID(), right.LeaseUUID())
 	})
@@ -2240,8 +2247,18 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				"lease_uuid", generation.LeaseUUID())
 			continue
 		}
-		if err := b.waitForReply(ctx, reply.Result()); err != nil {
-			return fmt.Errorf("apply durable cohort divergence for lease %q: %w", generation.LeaseUUID(), err)
+		answer, waitErr := awaitActorAnswer(b, ctx, reply.Answer())
+		if waitErr != nil {
+			return fmt.Errorf("apply durable cohort divergence for lease %q: %w", generation.LeaseUUID(), waitErr)
+		}
+		handled, applyErr := answer.Outcome()
+		if !handled {
+			b.logger.Debug("cohort divergence superseded before its actor applied it",
+				"lease_uuid", generation.LeaseUUID())
+			continue
+		}
+		if applyErr != nil {
+			return fmt.Errorf("apply durable cohort divergence for lease %q: %w", generation.LeaseUUID(), applyErr)
 		}
 	}
 

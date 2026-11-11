@@ -229,7 +229,7 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 	observation, reply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
 	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(observation) })
-	require.NoError(t, reply.Wait(context.Background()))
+	require.NoError(t, handledDivergenceOutcome(t, <-reply.Answer()))
 
 	got, exists := store.Get(leaseUUID)
 	require.True(t, exists)
@@ -246,12 +246,14 @@ func TestCohortDivergenceFailsReadyLeaseIdempotently(t *testing.T) {
 	assert.Equal(t, backend.CallbackStatusFailed, gotCallbackStatus)
 	assert.Equal(t, errMsgCohortDiverged, gotCallbackError)
 
-	// A repeated recovery observation after the lease is already Failed is an
-	// SM Ignore: no count inflation, duplicate callback, or gauge movement.
+	// A repeated recovery observation after the lease is already Failed no
+	// longer describes a Ready projection, so the actor answers it superseded
+	// before the state machine sees it: no count inflation, duplicate callback,
+	// or gauge movement.
 	second, secondReply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
 	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(second) })
-	require.NoError(t, secondReply.Wait(context.Background()))
+	requireDivergenceSuperseded(t, <-secondReply.Answer(), "the lease already left Ready")
 	got, exists = store.Get(leaseUUID)
 	require.True(t, exists)
 	assert.Equal(t, 5, got.FailCount)
@@ -308,7 +310,8 @@ func TestCohortObservationCapturedBeforeInventoryCannotFailReplacementGeneration
 	assert.False(t, observation.Current(store),
 		"routing must re-attest the pre-inventory proof after replacement")
 	actor.handle(observation.message())
-	require.NoError(t, reply.Wait(context.Background()))
+	requireDivergenceSuperseded(t, <-reply.Answer(),
+		"a replacement generation supersedes the pre-inventory report; it is not applied")
 
 	got, exists := store.Get(leaseUUID)
 	require.True(t, exists)

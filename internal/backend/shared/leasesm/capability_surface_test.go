@@ -257,7 +257,7 @@ func TestLifecycleObservationCarriesExactActiveOperationGeneration(t *testing.T)
 	message, reply, err := NewCohortDivergedObservation(context.Background(), runtime)
 	require.NoError(t, err)
 	requireAccepted(t, func() bool { return actor.TryEnqueueObservation(message) })
-	require.NoError(t, reply.Wait(context.Background()))
+	require.NoError(t, handledDivergenceOutcome(t, <-reply.Answer()))
 	select {
 	case got := <-observed:
 		assert.Equal(t, runtime.LeaseUUID(), got.LeaseUUID())
