@@ -300,7 +300,7 @@ func actorCloseFence(t testing.TB, actor *LeaseActor) shared.CommandFenceHold {
 
 // requireCloseAccepted takes actor's close fence once and retries the close's
 // enqueue until the actor accepts it.
-func requireCloseAccepted(t testing.TB, actor *LeaseActor, reply chan error) {
+func requireCloseAccepted(t testing.TB, actor *LeaseActor, reply chan CloseAnswer) {
 	t.Helper()
 	message := deprovisionMsg{Reply: reply, fence: actorCloseFence(t, actor)}
 	requireAccepted(t, func() bool { return actor.tryEnqueue(message) })
@@ -308,11 +308,29 @@ func requireCloseAccepted(t testing.TB, actor *LeaseActor, reply chan error) {
 
 // newTestDeprovisionCommand builds a close command for actor that owns its
 // lease's command fence.
-func newTestDeprovisionCommand(t *testing.T, actor *LeaseActor) (ActorCommand, ActorReply) {
+func newTestDeprovisionCommand(t *testing.T, actor *LeaseActor) (ActorCommand, CloseReply) {
 	t.Helper()
 	command, reply, err := NewDeprovisionCommand(actorCloseFence(t, actor))
 	require.NoError(t, err)
 	return command, reply
+}
+
+// handledCloseOutcome returns the outcome of a close the actor handled, and
+// fails the test when the actor did not handle it.
+func handledCloseOutcome(t testing.TB, answer CloseAnswer) error {
+	t.Helper()
+	handled, err := answer.Outcome()
+	require.True(t, handled, "the actor did not handle the close: %v", err)
+	return err
+}
+
+// requireCloseUnhandled asserts that the actor handled nothing: the answer
+// carries no outcome, so the close may be admitted and routed again.
+func requireCloseUnhandled(t testing.TB, answer CloseAnswer, msgAndArgs ...any) {
+	t.Helper()
+	handled, err := answer.Outcome()
+	require.False(t, handled, msgAndArgs...)
+	require.NoError(t, err, "a close that was not handled has no outcome")
 }
 
 // testActorCloseTimeout bounds a test actor's close attempts.

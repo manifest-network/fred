@@ -222,5 +222,33 @@
     "invariant": "onlyOwnedTerminalSourceDispatched",
     "expect_violation": true,
     "step": "step"
+  },
+  {
+    "model": "close_recovery_routing.qnt",
+    "variant": "current",
+    "invariant": "noSpuriousCloseError",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "close_recovery_routing.qnt",
+    "variant": "fixed",
+    "invariant": "noSpuriousCloseError and noStaleTeardown and noDroppedPendingClose",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "close_recovery_routing.qnt",
+    "variant": "rerouteUnread",
+    "invariant": "noStaleTeardown",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "close_recovery_routing.qnt",
+    "variant": "dropNotRun",
+    "invariant": "noDroppedPendingClose",
+    "expect_violation": true,
+    "step": "step"
   }
 ]

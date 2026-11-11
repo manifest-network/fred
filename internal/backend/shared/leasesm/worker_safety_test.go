@@ -46,10 +46,11 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	actor.workCancel = func() { cancelCalled.Store(true) }
 	actor.workers.Add()
 
-	reply := make(chan error, 1)
+	reply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, reply)
 	select {
-	case err := <-reply:
+	case answer := <-reply:
+		err := handledCloseOutcome(t, answer)
 		require.True(t, IsLifecyclePending(err), "the exact live worker must issue a pending observation: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("deprovision did not promptly report the draining worker")
@@ -66,11 +67,11 @@ func TestDeprovisionRefusesTeardownUntilMutationWorkerDrains(t *testing.T) {
 	// Once the real worker exits, a retry may transition and tear down. The
 	// immediate observation cannot strand the actor in Deprovisioning.
 	actor.workers.Done()
-	retryReply := make(chan error, 1)
+	retryReply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, retryReply)
 	select {
-	case err := <-retryReply:
-		require.NoError(t, err)
+	case answer := <-retryReply:
+		require.NoError(t, handledCloseOutcome(t, answer))
 	case <-time.After(2 * time.Second):
 		t.Fatal("deprovision retry did not complete after the worker drained")
 	}
@@ -126,9 +127,9 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			// leaves. The failed OnExit preserves Failing, which normally permits
 			// restart/update; close ownership must independently fence admission.
 			actor.beginWorkerActivity()
-			command, reply := newTestDeprovisionCommand(t, actor)
-			actor.handle(command.envelope.message)
-			require.ErrorIs(t, <-reply.Result(), ErrWorkerDrainTimeout)
+			closeCommand, closeReply := newTestDeprovisionCommand(t, actor)
+			actor.handle(closeCommand.envelope.message)
+			require.ErrorIs(t, handledCloseOutcome(t, <-closeReply.Answer()), ErrWorkerDrainTimeout)
 			require.Equal(t, backend.ProvisionStatusFailing, actor.State())
 			actor.endWorkerActivity()
 			require.Nil(t, actor.TryClaimQuiescence(), "a drained worker does not let recovery retire the requested close owner")
@@ -144,9 +145,9 @@ func TestDeprovisionFailedTransitionKeepsActorClosedToNewMutation(t *testing.T) 
 			actor.cfg.WG.Wait()
 			require.Zero(t, workers.Load(), "close-owned actor cannot acknowledge a mutation whose terminal result it would suppress")
 			require.Zero(t, teardown.Load())
-			command, reply = newTestDeprovisionCommand(t, actor)
-			actor.handle(command.envelope.message)
-			require.NoError(t, <-reply.Result())
+			closeCommand, closeReply = newTestDeprovisionCommand(t, actor)
+			actor.handle(closeCommand.envelope.message)
+			require.NoError(t, handledCloseOutcome(t, <-closeReply.Answer()))
 			require.EqualValues(t, 1, teardown.Load(), "the close continuation remains admissible")
 		})
 	}
@@ -168,11 +169,11 @@ func TestDeprovisionAbsentProjectionStillRunsSubstrateFinalizer(t *testing.T) {
 		},
 	})
 
-	reply := make(chan error, 1)
+	reply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, reply)
 	select {
-	case err := <-reply:
-		require.NoError(t, err)
+	case answer := <-reply:
+		require.NoError(t, handledCloseOutcome(t, answer))
 	case <-time.After(2 * time.Second):
 		t.Fatal("absent-projection finalizer did not acknowledge completion")
 	}

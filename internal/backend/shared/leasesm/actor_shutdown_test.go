@@ -120,7 +120,7 @@ func TestCloseKeepsItsCommandFenceWithoutDurableAdmission(t *testing.T) {
 	_, free := actor.cfg.CommandFence.TryLock(testActorLeaseUUID)
 	require.False(t, free, "a close without a durable head keeps the fence")
 	close(finishTeardown)
-	require.Error(t, <-reply.Result())
+	require.Error(t, handledCloseOutcome(t, <-reply.Answer()))
 	require.ErrorContains(t, admissionErr, "durable close head")
 	hold, free := actor.cfg.CommandFence.TryLock(testActorLeaseUUID)
 	require.True(t, free, "the attempt's end gives the fence back")
@@ -162,7 +162,7 @@ func TestCloseCommandTakesOwnershipOfItsLeasesFence(t *testing.T) {
 	require.Error(t, err, "the caller's copy cannot hand the fence over twice")
 	command.Abandon()
 	require.True(t, fenceFree(), "an abandoned command gives the fence back")
-	require.ErrorIs(t, <-reply.Result(), errCommandAbandoned)
+	requireCloseUnhandled(t, <-reply.Answer(), "an abandoned close was not handled")
 	require.False(t, actor.TryEnqueueCommand(command), "an abandoned command is spent")
 
 	var foreign shared.CommandFence
@@ -173,7 +173,7 @@ func TestCloseCommandTakesOwnershipOfItsLeasesFence(t *testing.T) {
 		command, reply, err := NewDeprovisionCommand(hold)
 		require.NoError(t, err, name)
 		actor.handle(command.envelope.message)
-		require.ErrorContains(t, <-reply.Result(), "does not own this lease's command fence", name)
+		require.ErrorContains(t, handledCloseOutcome(t, <-reply.Answer()), "does not own this lease's command fence", name)
 	}
 	require.Zero(t, teardown.Load())
 	retaken, free := foreign.TryLock(testActorLeaseUUID)
@@ -200,11 +200,11 @@ func TestAbandonDuringEnqueueIsNeverLost(t *testing.T) {
 			command.envelope.finishEnqueue(accepted)
 			if accepted {
 				require.False(t, fenceFree(), "an accepted close owns its fence")
-				require.Empty(t, reply.Result(), "an accepted close is not abandoned")
+				require.Empty(t, reply.Answer(), "an accepted close is not abandoned")
 				return
 			}
 			require.True(t, fenceFree(), "the refused enqueue settles the abandonment")
-			require.ErrorIs(t, <-reply.Result(), errCommandAbandoned)
+			requireCloseUnhandled(t, <-reply.Answer(), "an abandoned close was not handled")
 			require.False(t, actor.TryEnqueueCommand(command), "an abandoned close is spent")
 		})
 	}
@@ -226,8 +226,8 @@ func TestAbandonRacingRefusedEnqueuesSettlesOnce(t *testing.T) {
 		hold, free := actor.cfg.CommandFence.TryLock(testActorLeaseUUID)
 		require.True(t, free, "the abandoned close gave its fence back")
 		hold.Release()
-		require.ErrorIs(t, <-reply.Result(), errCommandAbandoned)
-		require.Empty(t, reply.Result(), "abandonment settles once")
+		requireCloseUnhandled(t, <-reply.Answer(), "an abandoned close was not handled")
+		require.Empty(t, reply.Answer(), "abandonment settles once")
 	}
 }
 
@@ -274,8 +274,8 @@ func TestCloseRunsOnTheActorLifetime(t *testing.T) {
 
 	stopBackend()
 	select {
-	case err := <-reply.Result():
-		require.ErrorIs(t, err, context.Canceled, "the close ends with the backend's lifetime")
+	case answer := <-reply.Answer():
+		require.ErrorIs(t, handledCloseOutcome(t, answer), context.Canceled, "the close ends with the backend's lifetime")
 	case <-time.After(5 * time.Second):
 		t.Fatal("close did not end with the backend's lifetime")
 	}
@@ -377,7 +377,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	var finalizerCalls atomic.Int32
 
 	queuedProvisionAck := make(chan error, 1)
-	queuedDeprovisionReply := make(chan error, 1)
+	queuedDeprovisionReply := make(chan CloseAnswer, 1)
 	// The first close still holds the actor's fence, so the queued close
 	// carries a separate one to show that rejection gives it back.
 	var queuedCloseFence shared.CommandFence
@@ -412,7 +412,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 		},
 	})
 
-	firstReply := make(chan error, 1)
+	firstReply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, firstReply)
 	select {
 	case <-finalizerEntered:
@@ -435,7 +435,7 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	})
 
 	releaseFinalizerOnce.Do(func() { close(releaseFinalizer) })
-	require.NoError(t, <-firstReply)
+	require.NoError(t, handledCloseOutcome(t, <-firstReply))
 	select {
 	case <-unregisterEntered:
 	case <-time.After(2 * time.Second):
@@ -455,11 +455,8 @@ func TestLeaseActor_RetirementRejectsQueuedCommandsBeforeUnregister(t *testing.T
 	}
 
 	require.ErrorIs(t, <-queuedProvisionAck, errActorTerminated)
-	rejectedClose := <-queuedDeprovisionReply
-	require.True(t, IsRejectedByRetiringActor(rejectedClose),
-		"a close the retiring actor never handled can be routed to its replacement")
-	require.False(t, IsRejectedByRetiringActor(fmt.Errorf("wrapped: %w", rejectedClose)),
-		"only the reply itself proves the close never ran")
+	requireCloseUnhandled(t, <-queuedDeprovisionReply,
+		"a close the retiring actor never handled can be admitted and routed to its replacement")
 	fence, free := queuedCloseFence.TryLock(actor.leaseUUID)
 	require.True(t, free, "a rejected close gives its command fence back")
 	fence.Release()

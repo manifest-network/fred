@@ -99,10 +99,11 @@ func actorLifecyclePendingError(t *testing.T) error {
 		require.True(t, actor.TryEnqueueCommand(command))
 		require.NoError(t, <-reply.Result())
 		<-started
-		command, reply, err = leasesm.NewDeprovisionCommand(fence.Lock(handlerTestLeaseUUID))
+		closeCommand, closeReply, err := leasesm.NewDeprovisionCommand(fence.Lock(handlerTestLeaseUUID))
 		require.NoError(t, err)
-		require.True(t, actor.TryEnqueueCommand(command))
-		pending := <-reply.Result()
+		require.True(t, actor.TryEnqueueCommand(closeCommand))
+		handled, pending := (<-closeReply.Answer()).Outcome()
+		require.True(t, handled, "the actor handled the close and answered pending")
 		require.True(t, leasesm.IsLifecyclePending(pending), pending)
 		return pending
 	})

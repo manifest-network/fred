@@ -50,6 +50,7 @@ its corresponding product change has shipped.
 | [`inline_callback_completion.qnt`](../../internal/provisioner/operation/testdata/inline_callback_completion.qnt) | ENG-2129: synchronous completion after an inline callback | Fixed in PR #296; remains beside operation regression tests, included by this runner |
 | `restore_retention.qnt` | ENG-2130: terminal destination strands retained data | Shared terminal-source eligibility implemented alongside the recovery model |
 | `restore_source_recovery.qnt` | ENG-2130: admitted EXPIRED/REJECTED sources must remain recoverable after restart | Shared eligibility used by admission and recovery |
+| `close_recovery_routing.qnt` | ENG-2154: recovery resumes a close that a retiring actor never ran | Typed close answer and re-admitting `routeClose` implemented alongside the model |
 | `billing_ledger.qnt` | ENG-2131: fractional seconds lost at withdrawal | Proposed manifest-ledger change; requires a chain upgrade |
 | `custom_domain_handoff.qnt` | ENG-2132: overlapping and restored stale routes | Deferred architectural change; partial-fix mutants are included |
 | `billing_fairness.qnt` | ENG-858: reservation contract | Candidate contract, awaiting a product decision |
@@ -122,6 +123,28 @@ represents the committed-destination retention outcome and does not execute Dock
 volume operations. Docker's
 `TestDeprovision_ReadyRestoreDestinationFinalizesSourceBeforeClose` separately checks
 the source-finalizer handoff and destination retained-volume rename.
+
+## ENG-2154 correspondence and limits
+
+`close_recovery_routing.qnt` models one lease whose close intent docker-backend's
+periodic recovery pass resumes. Either a live close is still tearing down (the
+reported race), or an earlier close failed and waits for recovery. The lease
+actor answers a close it handled with that close's outcome, or says it handled
+nothing because it was retiring. `current` reports the second answer as a failed
+close and must violate `noSpuriousCloseError`. `fixed` admits the close again
+under the command fence, re-reading the intent, and routes it only while it is
+still pending. Two mutants show that the re-admission is what makes it safe:
+`rerouteUnread` routes again without re-reading and tears down a later admission
+of the same lease (`noStaleTeardown`), and `dropNotRun` treats the answer as done
+while the intent is still pending (`noDroppedPendingClose`).
+
+The model has one live close and one recovery worker. It abstracts a later
+admission of the lease as a single environment action allowed only once the close
+has settled and the fence is free. It does not model the blocking wait itself:
+recovery's close still waits behind a live close's teardown. Go regressions in
+`internal/backend/docker/close_recovery_routing_test.go` run the real recovery
+pass and both recovery entry points; `internal/testutil/close_routing_guard_test.go`
+pins close-command minting to `routeClose`.
 
 ## Provenance
 

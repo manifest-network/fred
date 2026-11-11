@@ -1762,7 +1762,10 @@ current close head in this backend's own journal releases it early; otherwise
 the close attempt's end does.
 Teardown runs without the fence, since the head refuses every other mutation. A retry that reaches the lease's actor just
 as the running close retires it is handed to the next actor, which answers it
-from the durable close journal.
+from the durable close journal. Recovery's resumed closes take the same route
+(`routeClose`): a close the retiring actor did not handle is admitted again
+under a fresh fence, which re-reads the close intent, so it is routed again only
+while that intent is still pending.
 
 **Request:**
 

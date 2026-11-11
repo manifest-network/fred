@@ -458,7 +458,7 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	// Route the Deprovision message through the actor's inbox. The
 	// actor cancels the worker and answers pending. Only a later request may
 	// transition and run DoDeprovisionFn once the worker actually exits.
-	reply := make(chan error, 1)
+	reply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
@@ -472,14 +472,14 @@ func TestLeaseActor_RestartDeprovisionDefersUntilInFlightWorkerDrains(t *testing
 	}
 
 	// Release the worker, then retry with the now-drained actor.
-	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
+	require.True(t, IsLifecyclePending(handledCloseOutcome(t, <-reply)), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
 	requireCloseAccepted(t, actor, reply)
 
 	select {
-	case err := <-reply:
-		require.NoError(t, err, "Deprovision must succeed after worker completes")
+	case answer := <-reply:
+		require.NoError(t, handledCloseOutcome(t, answer), "Deprovision must succeed after worker completes")
 	case <-time.After(3 * time.Second):
 		t.Fatal("Deprovision did not complete after worker finished")
 	}
@@ -538,7 +538,7 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	})
 	require.NoError(t, <-restoreAck)
 
-	deprovisionReply := make(chan error, 1)
+	deprovisionReply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, deprovisionReply)
 	close(restoreWorkMayReturn)
 	select {
@@ -552,13 +552,13 @@ func TestLeaseActor_RestoreDeprovisionDefersUntilTerminalDeferDrains(t *testing.
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	require.True(t, IsLifecyclePending(<-deprovisionReply))
+	require.True(t, IsLifecyclePending(handledCloseOutcome(t, <-deprovisionReply)))
 	close(allowTerminalDefer)
 	<-actor.workers.Zero()
 	requireCloseAccepted(t, actor, deprovisionReply)
 	select {
-	case err := <-deprovisionReply:
-		require.NoError(t, err)
+	case answer := <-deprovisionReply:
+		require.NoError(t, handledCloseOutcome(t, answer))
 	case <-time.After(time.Second):
 		t.Fatal("deprovision did not resume after restore terminal settlement")
 	}
@@ -760,7 +760,7 @@ func TestSpawnProvisionWorker_PanicRecovery(t *testing.T) {
 	// Actor is still alive and responsive — a caller command is acknowledged.
 	command, reply := newTestDeprovisionCommand(t, actor)
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
-	require.NoError(t, reply.Wait(context.Background()))
+	require.NoError(t, handledCloseOutcome(t, <-reply.Answer()))
 }
 
 // TestSpawnReplaceWorker_PanicRecovery: same invariant for the
@@ -803,7 +803,7 @@ func TestSpawnReplaceWorker_PanicRecovery(t *testing.T) {
 
 	command, reply := newTestDeprovisionCommand(t, actor)
 	requireAccepted(t, func() bool { return actor.TryEnqueueCommand(command) })
-	require.NoError(t, reply.Wait(context.Background()))
+	require.NoError(t, handledCloseOutcome(t, <-reply.Answer()))
 }
 
 // TestGatherDiagAsync_PanicRecovery: the diag worker (spawned from
@@ -1168,7 +1168,7 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 
 	// Route Deprovision through the actor. Its pending response keeps teardown
 	// fenced until a retry independently observes the drained barrier.
-	reply := make(chan error, 1)
+	reply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, cancelCalled.Load, 1*time.Second, 5*time.Millisecond,
@@ -1182,14 +1182,14 @@ func TestProvision_DeprovisionDefersUntilInFlightWorkerDrains(t *testing.T) {
 	}
 
 	// A retry after workers.Done reads the pre-published ContainerIDs.
-	require.True(t, IsLifecyclePending(<-reply), "the caller must receive pending before the worker is released")
+	require.True(t, IsLifecyclePending(handledCloseOutcome(t, <-reply)), "the caller must receive pending before the worker is released")
 	close(workerRelease)
 	<-actor.workers.Zero()
 	requireCloseAccepted(t, actor, reply)
 
 	select {
-	case err := <-reply:
-		require.NoError(t, err, "Deprovision must succeed after worker completes")
+	case answer := <-reply:
+		require.NoError(t, handledCloseOutcome(t, answer), "Deprovision must succeed after worker completes")
 	case <-time.After(3 * time.Second):
 		t.Fatal("Deprovision did not complete after worker finished")
 	}
@@ -1450,7 +1450,7 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 
 	// Deprovision preempts the in-flight worker (whose workCancel must still
 	// be request #1's), returning pending while it drains.
-	reply := make(chan error, 1)
+	reply := make(chan CloseAnswer, 1)
 	requireCloseAccepted(t, actor, reply)
 
 	require.Eventually(t, firstCancelObserved.Load, 1*time.Second, 5*time.Millisecond,
@@ -1459,13 +1459,13 @@ func runConcurrentReplaceRejectedTest(t *testing.T, op string) {
 		"the rejected second %s must not run", op)
 
 	// Release worker #1, then independently retry the pending close.
-	require.True(t, IsLifecyclePending(<-reply))
+	require.True(t, IsLifecyclePending(handledCloseOutcome(t, <-reply)))
 	close(worker1Release)
 	<-actor.workers.Zero()
 	requireCloseAccepted(t, actor, reply)
 	select {
-	case err := <-reply:
-		require.NoError(t, err)
+	case answer := <-reply:
+		require.NoError(t, handledCloseOutcome(t, answer))
 	case <-time.After(3 * time.Second):
 		t.Fatal("deprovision did not complete after the worker was released")
 	}

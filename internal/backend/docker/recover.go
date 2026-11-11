@@ -335,42 +335,60 @@ func recoveredCallbackPairsExcept(
 // Routing the typed message lets an existing actor drain any mutation worker,
 // invokes the substrate finalizer even for an intentionally absent cleanup-only
 // projection, and retires the actor after doDeprovision completes.
+//
+// The snapshot claim may have settled after recovery published its map, and
+// the close it names may still be running for a live request. Every admission
+// therefore fences the lease, then re-reads durable authority before routing:
+// otherwise a new provision can win after that settlement and this stale worker
+// can tear down the replacement generation. A live close that completes while
+// this one waits behind it retires its actor, which does not handle this one;
+// routeClose then admits it again, finds the intent settled, and stops
+// (ENG-2154).
 func (b *Backend) resumeRecoveredClose(
 	ctx context.Context,
 	claim shared.CloseIntentClaim,
 ) error {
-	// The snapshot claim may have settled after recovery published its map. Fence
-	// the lease, then re-read durable authority before routing: otherwise a new
-	// provision can win after that settlement and this stale worker can tear down
-	// the replacement generation.
-	return b.resumeRecoveredCloseFenced(ctx, b.commandFence.Lock(claim.LeaseUUID()))
+	leaseUUID := claim.LeaseUUID()
+	return b.routeRecoveredClose(ctx, func(context.Context) (shared.CommandFenceHold, bool, error) {
+		return b.admitRecoveredClose(b.commandFence.Lock(leaseUUID))
+	})
 }
 
 // tryResumeRecoveredClose is resumeRecoveredClose for background work that
 // must not wait on a busy lease: it reports resumed=false when the command
-// fence is held, whose holder observes the same durable state.
+// fence is held, whose holder observes the same durable state. That holds for
+// an admission retried after a retiring actor did not handle the close, too.
 func (b *Backend) tryResumeRecoveredClose(ctx context.Context, leaseUUID string) (resumed bool, err error) {
-	fence, acquired := b.commandFence.TryLock(leaseUUID)
-	if !acquired {
-		return false, nil
-	}
-	return true, b.resumeRecoveredCloseFenced(ctx, fence)
+	resumed = true
+	err = b.routeRecoveredClose(ctx, func(context.Context) (shared.CommandFenceHold, bool, error) {
+		fence, acquired := b.commandFence.TryLock(leaseUUID)
+		if !acquired {
+			resumed = false
+			return shared.CommandFenceHold{}, false, nil
+		}
+		return b.admitRecoveredClose(fence)
+	})
+	return resumed, err
 }
 
-// resumeRecoveredCloseFenced re-reads the lease's durable close authority under
-// fence and, when a close is still pending, routes it through the lease actor.
-// It takes over fence: the routed close owns it from then on, and every other
-// path gives it back.
-func (b *Backend) resumeRecoveredCloseFenced(ctx context.Context, fence shared.CommandFenceHold) error {
-	pending, err := b.recoveredCloseStillPending(fence.LeaseUUID())
-	if err != nil || !pending {
-		fence.Release()
-		return err
-	}
-	if err := b.closeThroughActor(ctx, fence); err != nil {
+// routeRecoveredClose routes a recovered close admitted by admit.
+func (b *Backend) routeRecoveredClose(ctx context.Context, admit closeAdmission) error {
+	if err := b.routeClose(ctx, admit); err != nil {
 		return fmt.Errorf("apply recovered close through lease actor: %w", err)
 	}
 	return nil
+}
+
+// admitRecoveredClose re-reads the lease's durable close authority under fence.
+// It keeps the fence for the close only when a close is still pending, and
+// gives it back otherwise.
+func (b *Backend) admitRecoveredClose(fence shared.CommandFenceHold) (shared.CommandFenceHold, bool, error) {
+	pending, err := b.recoveredCloseStillPending(fence.LeaseUUID())
+	if err != nil || !pending {
+		fence.Release()
+		return shared.CommandFenceHold{}, false, err
+	}
+	return fence, true, nil
 }
 
 // recoveredCloseStillPending reports whether leaseUUID still has a close

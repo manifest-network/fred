@@ -25,7 +25,8 @@ import (
 // actor through actorForLocked. Without this check, such messages
 // would hit SM.Ignore in Deprovisioning state and Fire would return
 // nil — the handler would then ack success and spawn a worker under
-// a terminated actor, wedging the lease.
+// a terminated actor, wedging the lease. A close command is never answered
+// with it: its CloseAnswer reports that it was not handled.
 var errActorTerminated = errors.New("lease actor terminated; retry will create a fresh actor")
 
 // ErrWorkerDrainTimeout means a state transition could not prove that the
@@ -113,7 +114,7 @@ func (e *messageEnvelope) finishEnqueue(enqueued bool) {
 	case e.move(envelopeEnqueueing, envelopeIdle):
 	default:
 		e.admission.Store(uint32(envelopeAbandoned))
-		e.message.onPanic(errCommandAbandoned)
+		settleUnhandled(e.message, errCommandAbandoned)
 	}
 }
 
@@ -124,7 +125,7 @@ func (e *messageEnvelope) abandon() {
 		switch e.state() {
 		case envelopeIdle:
 			if e.move(envelopeIdle, envelopeAbandoned) {
-				e.message.onPanic(errCommandAbandoned)
+				settleUnhandled(e.message, errCommandAbandoned)
 				return
 			}
 		case envelopeEnqueueing:
@@ -209,6 +210,56 @@ func (r ActorReply) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// CloseReply is the receive-only half of a close command. Unlike ActorReply it
+// answers with a CloseAnswer, which tells a close the actor handled from one it
+// never handled.
+type CloseReply struct {
+	answer <-chan CloseAnswer
+}
+
+// Answer exposes the actor's one answer as a receive-only channel, for callers
+// which already own a cancellation policy.
+func (r CloseReply) Answer() <-chan CloseAnswer { return r.answer }
+
+// CloseAnswer is a lease actor's answer to one close command: either the
+// outcome of a close the actor handled, or the fact that it handled nothing. A
+// command is not handled when a retiring actor rejects it or when no actor
+// accepts it; either way it changed nothing and gave its command fence back.
+// Only the actor side of NewDeprovisionCommand authors an answer, and no error
+// value says "not handled", so wrapping an outcome can never turn it into the
+// other case (ENG-2154). The zero value is a close that was not handled.
+type CloseAnswer struct {
+	handled bool
+	err     error
+}
+
+// Outcome reports whether the actor handled the close and, if it did, the
+// close's result. A close that was not handled must be admitted again under a
+// fresh command fence before it is routed again: what its first admission
+// checked may have changed, and the next route reaches the actor that replaces
+// the retiring one.
+func (answer CloseAnswer) Outcome() (handled bool, err error) {
+	return answer.handled, answer.err
+}
+
+// unhandledMessage is a message whose caller must tell "never handled" from a
+// handled failure, so it is settled without an error when no handler runs it.
+type unhandledMessage interface {
+	leaseMessage
+	settleUnhandled()
+}
+
+// settleUnhandled settles a message that no handler ran: a command a retiring
+// actor rejected, or one no actor accepted. A message that can say so answers
+// that it was not handled; every other message hears err.
+func settleUnhandled(msg leaseMessage, err error) {
+	if unhandled, ok := msg.(unhandledMessage); ok {
+		unhandled.settleUnhandled()
+		return
+	}
+	msg.onPanic(err)
 }
 
 // ObservationGenerationState is the exhaustive relationship between a queued
@@ -387,27 +438,41 @@ func newContainerDiedObservation(
 // caller that stops waiting cannot cancel the close. It carries the lease's
 // command fence instead, which the close owns until its durable head commits.
 type deprovisionMsg struct {
-	Reply chan error
+	Reply chan CloseAnswer
 	fence shared.CommandFenceHold
 }
 
 func (deprovisionMsg) isleaseMessage()        {}
 func (deprovisionMsg) isactorCommandMessage() {}
+
+// onPanic answers a close whose handler panicked: it was handled, and the panic
+// is its outcome.
 func (m deprovisionMsg) onPanic(err error) {
+	m.settle(CloseAnswer{handled: true, err: err})
+}
+
+// settleUnhandled answers a close no handler ran, whether a retiring actor
+// rejected it or no actor accepted it.
+func (m deprovisionMsg) settleUnhandled() {
+	m.settle(CloseAnswer{})
+}
+
+func (m deprovisionMsg) settle(answer CloseAnswer) {
 	// A close rejected or interrupted here never commits its head, so the
 	// fence it owns goes back before its caller hears about it.
 	m.fence.Release()
 	// Non-blocking send: Reply is buffered-1, caller receives at most
 	// once. On recover, make sure the caller gets something.
 	select {
-	case m.Reply <- err:
+	case m.Reply <- answer:
 	default:
 	}
 }
 
 // NewDeprovisionCommand asks the actor to close its lease. The reply only
 // reports the outcome: the close runs on the actor's lifetime, bounded by
-// LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it.
+// LeaseActorConfig.CloseTimeout, whether or not anyone still waits for it. Its
+// CloseAnswer also says whether the actor handled the close at all.
 //
 // The command takes ownership of fence, the lease's command fence that its
 // caller acquired before checking that the close may begin: every copy the
@@ -415,21 +480,13 @@ func (m deprovisionMsg) onPanic(err error) {
 // commits (ActorCloseScope.CloseAdmitted) or its attempt ends, so no other
 // command can slip between that check and the head. A command that no actor
 // accepts gives the fence back through Abandon.
-func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, ActorReply, error) {
+func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, CloseReply, error) {
 	owned, err := fence.Transfer()
 	if err != nil {
-		return ActorCommand{}, ActorReply{}, fmt.Errorf("deprovision requires the lease's command fence: %w", err)
+		return ActorCommand{}, CloseReply{}, fmt.Errorf("deprovision requires the lease's command fence: %w", err)
 	}
-	reply, receiver := newActorReply()
-	return newActorCommand(deprovisionMsg{Reply: reply, fence: owned}), receiver, nil
-}
-
-// IsRejectedByRetiringActor reports that a command reached an actor that was
-// already retiring, which rejected it without handling it. Nothing ran, so
-// routing the same request again reaches the actor that replaces it. Only the
-// reply value itself carries this: a wrapped error does not.
-func IsRejectedByRetiringActor(err error) bool {
-	return err == errActorTerminated //nolint:errorlint // Only the direct reply proves the command was never handled.
+	answer := make(chan CloseAnswer, 1)
+	return newActorCommand(deprovisionMsg{Reply: answer, fence: owned}), CloseReply{answer: answer}, nil
 }
 
 // cohortDivergedMsg reports that recovery observed a running instance cohort
@@ -1350,7 +1407,7 @@ func (a *LeaseActor) endWorkerActivity() {
 }
 
 func (a *LeaseActor) rejectRetiringMessage(msg leaseMessage) {
-	msg.onPanic(errActorTerminated)
+	settleUnhandled(msg, errActorTerminated)
 }
 
 func (a *LeaseActor) handle(msg leaseMessage) {
@@ -1409,7 +1466,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case containerDiedMsg:
 		a.handleContainerDied(m.ContainerID, m.Runtime, m.provenance)
 	case deprovisionMsg:
-		m.Reply <- a.handleDeprovision(m.fence)
+		m.Reply <- CloseAnswer{handled: true, err: a.handleDeprovision(m.fence)}
 	case cohortDivergedMsg:
 		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
 	case maintenanceRecoveredMsg:
