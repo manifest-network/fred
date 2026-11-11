@@ -333,6 +333,24 @@ func requireCloseUnhandled(t testing.TB, answer CloseAnswer, msgAndArgs ...any) 
 	require.NoError(t, err, "a close that was not handled has no outcome")
 }
 
+// handledDivergenceOutcome returns the outcome of a cohort divergence the actor
+// handled, and fails the test when the report was superseded instead.
+func handledDivergenceOutcome(t testing.TB, answer CohortDivergenceAnswer) error {
+	t.Helper()
+	handled, err := answer.Outcome()
+	require.True(t, handled, "the cohort divergence was superseded: %v", err)
+	return err
+}
+
+// requireDivergenceSuperseded asserts that the actor did not apply the cohort
+// divergence: the answer carries no outcome.
+func requireDivergenceSuperseded(t testing.TB, answer CohortDivergenceAnswer, msgAndArgs ...any) {
+	t.Helper()
+	handled, err := answer.Outcome()
+	require.False(t, handled, msgAndArgs...)
+	require.NoError(t, err, "a superseded cohort divergence has no outcome")
+}
+
 // testActorCloseTimeout bounds a test actor's close attempts.
 const testActorCloseTimeout = 30 * time.Second
 

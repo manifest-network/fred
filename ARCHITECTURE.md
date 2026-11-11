@@ -838,13 +838,16 @@ observation, a recovery correction cannot create a new actor, a stale
 observation cannot gain actor-creation authority, and callers cannot assemble a
 partly valid message with a struct literal.
 
-Synchronous constructors return an `ActorReply` whose result channel is
-receive-only. The private message retains the only sending end, so a caller
-cannot acknowledge its own request or splice one command's reply channel into
-another. A container-death observation is fire-and-forget. A cohort-divergence
-observation (`NewCohortDivergedObservation`) returns a receive-only
-`ActorReply`, which recovery waits on; no observation exposes a
-caller-controlled completion channel. Tests synchronize through observable state
+Synchronous constructors return a receive-only reply: an `ActorReply`, or a
+typed `CloseReply` for a close. The private message retains the only sending
+end, so a caller cannot acknowledge its own request or splice one command's
+reply channel into another. A container-death observation is fire-and-forget.
+A cohort-divergence observation (`NewCohortDivergedObservation`) returns a
+receive-only `CohortDivergenceReply`, which recovery waits on. Its answer tells
+a report the actor handled (applied, or failed) from one that was superseded:
+the lease left Ready, a close owns or ended it, or the actor retired. Recovery
+skips a superseded report and aborts only on a handled failure (ENG-2155). No
+observation exposes a caller-controlled completion channel. Tests synchronize through observable state
 or the same
 typed quiescence capability used by recovery. Worker terminal/handoff messages
 and their success/failure projections

@@ -498,36 +498,76 @@ func NewDeprovisionCommand(fence shared.CommandFenceHold) (ActorCommand, CloseRe
 type cohortDivergedMsg struct {
 	Ctx     context.Context
 	Runtime shared.RuntimeGenerationProof
-	Reply   chan error
+	Reply   chan CohortDivergenceAnswer
 }
 
 func (cohortDivergedMsg) isleaseMessage()            {}
 func (cohortDivergedMsg) isactorObservationMessage() {}
-func (m cohortDivergedMsg) onStaleGeneration() {
+
+// onStaleGeneration answers an observation of a generation the lease no
+// longer runs: superseded, not applied.
+func (m cohortDivergedMsg) onStaleGeneration() { m.settle(CohortDivergenceAnswer{}) }
+
+// settleUnhandled answers an observation no handler ran: a close owned the
+// lease, the actor was retiring, or no actor accepted it.
+func (m cohortDivergedMsg) settleUnhandled() { m.settle(CohortDivergenceAnswer{}) }
+
+// onPanic answers an observation whose handler panicked: it was handled, and
+// the panic is its outcome.
+func (m cohortDivergedMsg) onPanic(err error) {
+	m.settle(CohortDivergenceAnswer{handled: true, err: err})
+}
+
+func (m cohortDivergedMsg) settle(answer CohortDivergenceAnswer) {
 	select {
-	case m.Reply <- nil:
+	case m.Reply <- answer:
 	default:
 	}
 }
-func (m cohortDivergedMsg) onPanic(err error) {
-	select {
-	case m.Reply <- err:
-	default:
-	}
+
+// CohortDivergenceReply is the receive-only half of a cohort-divergence
+// observation.
+type CohortDivergenceReply struct {
+	answer <-chan CohortDivergenceAnswer
+}
+
+// Answer exposes the actor's one answer as a receive-only channel, for callers
+// which already own a cancellation policy.
+func (r CohortDivergenceReply) Answer() <-chan CohortDivergenceAnswer { return r.answer }
+
+// CohortDivergenceAnswer is a lease actor's answer to one cohort-divergence
+// observation: either the outcome of the divergence it handled, or the fact
+// that the observation was superseded before the actor could apply it. It is
+// superseded when the lease no longer runs the observed generation, when a
+// close owns the lease or has ended it, or when the actor retired or never
+// accepted it. Only the actor side of NewCohortDivergedObservation authors an
+// answer, and no error value says "superseded", so a superseded report can
+// never be read as a failed one (ENG-2155). The zero value is superseded.
+type CohortDivergenceAnswer struct {
+	handled bool
+	err     error
+}
+
+// Outcome reports whether the actor handled the divergence and, if it did, the
+// result. A superseded divergence changed nothing; recovery is level-triggered,
+// so its next pass observes the lease afresh.
+func (answer CohortDivergenceAnswer) Outcome() (handled bool, err error) {
+	return answer.handled, answer.err
 }
 
 func NewCohortDivergedObservation(
 	ctx context.Context,
 	runtime shared.RuntimeGenerationProof,
-) (ActorObservation, ActorReply, error) {
+) (ActorObservation, CohortDivergenceReply, error) {
 	if ctx == nil {
-		return ActorObservation{}, ActorReply{}, errors.New("cohort divergence context is required")
+		return ActorObservation{}, CohortDivergenceReply{}, errors.New("cohort divergence context is required")
 	}
 	if !runtime.Valid() {
-		return ActorObservation{}, ActorReply{}, errors.New("cohort divergence observation requires an exact runtime generation")
+		return ActorObservation{}, CohortDivergenceReply{}, errors.New("cohort divergence observation requires an exact runtime generation")
 	}
-	reply, receiver := newActorReply()
-	return newActorObservation(cohortDivergedMsg{Ctx: ctx, Runtime: runtime, Reply: reply}), receiver, nil
+	answer := make(chan CohortDivergenceAnswer, 1)
+	message := cohortDivergedMsg{Ctx: ctx, Runtime: runtime, Reply: answer}
+	return newActorObservation(message), CohortDivergenceReply{answer: answer}, nil
 }
 
 // maintenanceRecoveryOutcome is deliberately private. Docker recovery can
@@ -1442,7 +1482,9 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 			// state: even if the FSM transition failed, no new mutation may enter
 			// an actor whose terminal settlement now belongs to close. Worker
 			// notifications have no caller, so their onPanic method is a no-op.
-			msg.onPanic(fmt.Errorf("%w: lease close owns lifecycle settlement", backend.ErrInvalidState))
+			// Nothing ran: a message that can say so answers that it was not
+			// handled, as a cohort-divergence report does (ENG-2155).
+			settleUnhandled(msg, fmt.Errorf("%w: lease close owns lifecycle settlement", backend.ErrInvalidState))
 			return
 		}
 	}
@@ -1468,7 +1510,7 @@ func (a *LeaseActor) handle(msg leaseMessage) {
 	case deprovisionMsg:
 		m.Reply <- CloseAnswer{handled: true, err: a.handleDeprovision(m.fence)}
 	case cohortDivergedMsg:
-		m.Reply <- a.handleCohortDiverged(m.Ctx, m.Runtime)
+		m.Reply <- CohortDivergenceAnswer{handled: true, err: a.handleCohortDiverged(m.Ctx, m.Runtime)}
 	case maintenanceRecoveredMsg:
 		m.reply <- a.handleMaintenanceRecovered(m)
 	case diagGatheredMsg:

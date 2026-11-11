@@ -623,36 +623,37 @@ func (b *Backend) awaitAsyncAcceptance(ctx context.Context, ack <-chan error) (a
 	return asyncAcceptanceUnknown, fmt.Errorf("backend shutting down")
 }
 
-// waitForReply waits for an actor's reply channel on a caller-facing
-// request whose semantics are "run the work, return the outcome"
-// (e.g., Deprovision). This is the ONLY supported way to block on a
-// lease actor's reply — the naive
-// `select { case err := <-reply: ... case <-ctx.Done(): return ctx.Err() }`
+// awaitActorAnswer waits for an actor's typed answer to a message whose
+// semantics are "run the work, return the outcome", such as a recovered cohort
+// divergence. The naive
+// `select { case a := <-reply: ... case <-ctx.Done(): return ctx.Err() }`
 // is unsafe because Go's select is pseudo-randomized when multiple
 // arms are ready, so a caller ctx cancel racing the actor's committed
 // outcome can return ctx.Err() for an operation that fully succeeded.
 // (The final non-blocking read is the same race treatment used by
-// awaitAsyncAcceptance for durable asynchronous commands.)
+// awaitAsyncAcceptance for durable asynchronous commands, and by
+// awaitCloseAnswer for closes.)
 //
-// Here the actor's reply IS the outcome of the work (it runs synchronously
-// inside the handler), so there is no "accepted vs err" distinction: callers
-// get the outcome or a cancellation error.
-func (b *Backend) waitForReply(ctx context.Context, reply <-chan error) error {
+// The answer IS the outcome of the work (it runs synchronously inside the
+// handler). The error reports only that the wait ended first: the caller's
+// context ended or the backend began stopping.
+func awaitActorAnswer[T any](b *Backend, ctx context.Context, reply <-chan T) (T, error) {
 	select {
-	case err := <-reply:
-		return err
+	case answer := <-reply:
+		return answer, nil
 	case <-ctx.Done():
 	case <-b.stopCtx.Done():
 	}
 	select {
-	case err := <-reply:
-		return err
+	case answer := <-reply:
+		return answer, nil
 	default:
 	}
+	var none T
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return none, ctx.Err()
 	}
-	return fmt.Errorf("backend shutting down")
+	return none, fmt.Errorf("backend shutting down")
 }
 
 // ActorSnapshot is a point-in-time view of one lease actor's state for
