@@ -53,10 +53,15 @@ func TestIntegration_Docker_TenantLinkedSourceIsNotAnotherLeasesVolumeWriter(t *
 			Cmd:    []string{"sleep", "3600"},
 			Labels: map[string]string{LabelManaged: "true", LabelLeaseUUID: lease},
 		},
-		&container.HostConfig{Binds: []string{
-			filepath.Join(volume, "data", "b") + ":/data/b",
-			source + ":/data/a/c",
-		}}, nil, nil, "")
+		&container.HostConfig{
+			// The workload needs no network, so it does not depend on the
+			// daemon's default bridge (attaching to it failed on both CI legs).
+			NetworkMode: "none",
+			Binds: []string{
+				filepath.Join(volume, "data", "b") + ":/data/b",
+				source + ":/data/a/c",
+			},
+		}, nil, nil, "")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
