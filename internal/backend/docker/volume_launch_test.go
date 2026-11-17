@@ -88,10 +88,10 @@ func TestProtectedVolumeUnrelatedRegularFileBindIsNotInterference(t *testing.T) 
 	other := filepath.Join(t.TempDir(), "config")
 	require.NoError(t, os.WriteFile(other, []byte("config"), 0o600))
 	q := &quiescedVolumes{volumes: map[string]protectedVolume{"volume": {root: root}}}
-	affected, err := q.affects(other)
+	affected, err := protectedVolumesAffectSource(q.volumes, other)
 	require.NoError(t, err)
 	require.False(t, affected)
-	affected, err = q.affects(filepath.Dir(root.Path()))
+	affected, err = protectedVolumesAffectSource(q.volumes, filepath.Dir(root.Path()))
 	require.NoError(t, err)
 	require.True(t, affected, "a writable parent can exchange the reserved directory")
 }

@@ -25,6 +25,14 @@ func (d *DockerClient) ListVolumeWriters(ctx context.Context) ([]ContainerInfo, 
 containers:
 	for _, current := range all {
 		info := ContainerInfo{ContainerID: current.ID, Status: current.State}
+		// A lease here means "fred launched this container", which is what lets
+		// volumeWriterMountEvidence stop at the managed volume root. Every fred
+		// launch writes both labels; a tenant can write neither, because the
+		// fred. namespace is refused in manifests and in image metadata, and
+		// Docker fixes labels at create. It grants no stop authority.
+		if current.Labels[LabelManaged] == "true" {
+			info.LeaseUUID = current.Labels[LabelLeaseUUID]
+		}
 		for _, mount := range current.Mounts {
 			if mount.Type == "volume" && mount.RW && mount.Source == "" {
 				// A plugin's missing cached path is not proof that it cannot alias

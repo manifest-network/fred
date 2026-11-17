@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- docker-backend no longer lets one tenant block every other lease's launch on a backend through a link inside its own volume. Before each launch that uses a managed volume, the backend lists every container on the daemon and resolves each writable bind source, to find containers that can still write the volumes it is about to prepare. Docker reports a bind source as the path the container was created with, and a workload could make that path pass through a link in its own volume, then re-point the link while running. A link loop made the path unresolvable, which failed provision, restart, update, restore, runtime refresh and update rollback for every other lease with a managed volume, with `classify volume writer ...: too many links`. A link to an ancestor of the volume directory reported the container as a writer of every volume and failed the same operations with `volume writer interference`. Running workloads were not affected, and no tenant gained access to another's data. For a container Fred launched, the backend now classifies the managed volume root the bind lives in and ignores the tenant-writable path below it; every launch already proves that its binds resolve inside the lease's own volumes. Containers Fred did not launch are classified as before (ENG-2181).
+
 ## [0.14.2] - 2026-11-11
 
 ### Added
