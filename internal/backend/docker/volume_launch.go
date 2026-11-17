@@ -13,6 +13,7 @@ import (
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/fsidentity"
 )
@@ -346,8 +347,69 @@ func pathContains(parent, child string) bool {
 	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
 }
 
-func (q *quiescedVolumes) affects(source string) (bool, error) {
-	return protectedVolumesAffectSource(q.volumes, source)
+// protectedVolumesAffectWriter reports whether a writable mount of one
+// inventoried container reaches a protected volume. Both callers classify
+// through it, so neither can resolve a tenant-writable path by omission.
+func protectedVolumesAffectWriter(volumes map[string]protectedVolume, writer ContainerInfo) (bool, error) {
+	for _, mount := range writer.Mounts {
+		if (mount.Type != "bind" && mount.Type != "volume") || mount.ReadOnly {
+			continue
+		}
+		affected, err := protectedVolumesAffectSource(volumes, volumeWriterMountEvidence(writer.LeaseUUID, mount.Source))
+		if err != nil || affected {
+			return affected, err
+		}
+	}
+	return false, nil
+}
+
+// volumeWriterMountEvidence returns the part of a mount source that says where
+// its container can write.
+//
+// Docker reports a bind source as the string the container was created with,
+// and classification resolves that string again at every later launch. For a
+// container fred launched, only the path down to its managed volume root is
+// fred's. Everything below is inside the tenant's volume, where the running
+// workload can add or re-point a link at any time, so a source that passes
+// through one resolves wherever the tenant last pointed it. A loop failed the
+// launch of every other lease on the backend; a link to an ancestor of the
+// volume tree reported the container as a writer of every volume (ENG-2181).
+//
+// Dropping the tail loses nothing. The kernel fixes a mount when the container
+// starts, so what the tail resolves to afterwards says where the tenant last
+// pointed a link, not where the container can write. That was settled at
+// launch: with the lease's writers stopped, the launch proves that every bind
+// resolves inside the lease's own reserved roots (validateProject). The root
+// is also an ancestor of the source, so an unlinked source classifies at
+// least as conservatively by its root.
+//
+// Any other source is returned whole. Nothing validated a container fred did
+// not launch, so where its source resolves is the only evidence there is; and
+// a first managed root that belongs to another lease, or to the retained
+// namespace, is not a shape fred emits.
+func volumeWriterMountEvidence(leaseUUID, source string) string {
+	if !backend.IsCanonicalLeaseUUID(leaseUUID) {
+		return source
+	}
+	cleaned := filepath.Clean(source)
+	if !filepath.IsAbs(cleaned) {
+		return source
+	}
+	separator := string(filepath.Separator)
+	components := strings.Split(strings.TrimPrefix(cleaned, separator), separator)
+	for index, component := range components {
+		// The outermost managed name is the volume root: no directory above it
+		// is tenant-writable, while a tenant can create one of the same shape
+		// below it.
+		if _, err := parseManagedVolumeName(component); err != nil {
+			continue
+		}
+		if !strings.HasPrefix(component, volumePrefix+leaseUUID+"-") {
+			return source
+		}
+		return separator + filepath.Join(components[:index+1]...)
+	}
+	return source
 }
 
 func protectedVolumesAffectSource(volumes map[string]protectedVolume, source string) (bool, error) {
@@ -435,19 +497,12 @@ func (q *quiescedVolumes) stopWriters(ctx context.Context) error {
 	}
 	var writers []string
 	for _, candidate := range all {
-		for _, mount := range candidate.Mounts {
-			if (mount.Type != "bind" && mount.Type != "volume") || mount.ReadOnly {
-				continue
-			}
-			affected, err := q.affects(mount.Source)
-			if err != nil {
-				return fmt.Errorf("classify volume writer %q: %w", candidate.ContainerID, err)
-			}
-			if !affected {
-				continue
-			}
+		affected, err := protectedVolumesAffectWriter(q.volumes, candidate)
+		if err != nil {
+			return fmt.Errorf("classify volume writer %q: %w", candidate.ContainerID, err)
+		}
+		if affected {
 			writers = append(writers, candidate.ContainerID)
-			break
 		}
 	}
 	slices.Sort(writers)

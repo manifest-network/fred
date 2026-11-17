@@ -41,7 +41,7 @@ func TestProtectedVolumeClassifiesNonDirectoryAndLinkedSources(t *testing.T) {
 	defer root.Close()
 	q := &quiescedVolumes{volumes: map[string]protectedVolume{"volume": {root: root}}}
 	for _, source := range unrelatedBindLeaves(t) {
-		affected, err := q.affects(source)
+		affected, err := protectedVolumesAffectSource(q.volumes, source)
 		require.NoError(t, err, source)
 		require.False(t, affected, source)
 	}
@@ -53,16 +53,16 @@ func TestProtectedVolumeClassifiesNonDirectoryAndLinkedSources(t *testing.T) {
 	} {
 		link := filepath.Join(links, label)
 		require.NoError(t, os.Symlink(destination, link))
-		affected, err := q.affects(link)
+		affected, err := protectedVolumesAffectSource(q.volumes, link)
 		require.NoError(t, err)
 		require.True(t, affected, "linked %s must remain protected", label)
 	}
-	affected, err := q.affects(filepath.Join(links, "root", "not-created-yet"))
+	affected, err := protectedVolumesAffectSource(q.volumes, filepath.Join(links, "root", "not-created-yet"))
 	require.NoError(t, err)
 	require.True(t, affected, "a missing child must not hide its linked protected parent")
 	loop := filepath.Join(links, "loop")
 	require.NoError(t, os.Symlink(loop, loop))
-	_, err = q.affects(loop)
+	_, err = protectedVolumesAffectSource(q.volumes, loop)
 	require.Error(t, err, "unresolved directory authority must remain conservative")
 }
 

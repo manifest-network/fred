@@ -234,6 +234,18 @@ validates the complete mount graph before Docker starts a replacement. Bind alia
 same reservation. A foreign writer or a layout where one container could replace
 another container's pending bind source refuses the launch.
 
+Writers are found by listing every container on the daemon and classifying each
+writable mount source. Docker reports a bind source as the path the container
+was created with. For a container Fred launched (it carries `fred.managed` and
+`fred.lease_uuid`, which no tenant can set), only the path down to its managed
+volume root is Fred's; the rest lies inside the tenant's volume, where the
+running workload can re-point a link at any time. Such a container is therefore
+classified by its managed volume root. This loses nothing: the launch that
+created it proved every bind resolves inside its lease's own volumes. A
+container Fred did not launch is classified by where its whole source resolves,
+and a source that fails to resolve for any reason other than a missing path
+refuses the launch.
+
 Before Docker receives a launch, `callbacks.db` records its exact attempt and
 physical volumes. Completion evidence from the adapter for all issued Docker
 calls and storage attestation can clear this record. A recognized terminal Docker error

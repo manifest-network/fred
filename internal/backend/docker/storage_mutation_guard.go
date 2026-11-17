@@ -1564,17 +1564,12 @@ func (b *Backend) recoverRestoreNamespacesLocked(
 				return fmt.Errorf("verify restore namespace writers: %w", err)
 			}
 			for _, writer := range writers {
-				for _, mount := range writer.Mounts {
-					if mount.ReadOnly || (mount.Type != "bind" && mount.Type != "volume") {
-						continue
-					}
-					affected, err := protectedVolumesAffectSource(roots, mount.Source)
-					if err != nil {
-						return fmt.Errorf("classify restore namespace writer %q: %w", writer.ContainerID, err)
-					}
-					if affected {
-						return fmt.Errorf("container %q still writes a restore recovery volume", writer.ContainerID)
-					}
+				affected, err := protectedVolumesAffectWriter(roots, writer)
+				if err != nil {
+					return fmt.Errorf("classify restore namespace writer %q: %w", writer.ContainerID, err)
+				}
+				if affected {
+					return fmt.Errorf("container %q still writes a restore recovery volume", writer.ContainerID)
 				}
 			}
 			if len(original) > 0 {
