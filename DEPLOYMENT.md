@@ -765,7 +765,7 @@ Ordinary file-copy backups must be taken with the owning daemon stopped (bbolt's
 file lock refuses a second bbolt open). Snapshot each backend's marker pair,
 complete authoritative-store set, and substrate as one unit so a restore cannot
 mix generations or times. For zero-downtime backups, use an atomic
-filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent.
+filesystem-level snapshot (LVM, btrfs) — bbolt files are crash-consistent.
 providerd can also snapshot `placements.db` and `payloads.db` itself while it
 runs; see [Online snapshots](#online-snapshots).
 Restoring a complete matching snapshot intentionally preserves the same lineage,
