@@ -65,67 +65,63 @@ func quotaRollbackProvision() map[string]*provision {
 	}
 }
 
-// All supported volume managers implement quota changes through the same
-// volumeManager contract. Pin the rollback ordering once per concrete kind so
-// a future kind-specific shortcut cannot bypass the immutable source cap.
-func TestRollbackRestoreAdoption_ReappliesImmutableSourceQuota_AllVolumeBackends(t *testing.T) {
-	for _, kind := range []string{"btrfs", "xfs"} {
-		t.Run(kind, func(t *testing.T) {
-			b := newBackendForProvisionTest(t, &mockDockerClient{}, quotaRollbackProvision())
-			rs := attachRetentionStore(t, b)
-			b.compose = &mockComposeExecutor{
-				DownFn: func(context.Context, string, time.Duration) error { return nil },
-			}
+// Quota changes go through the volumeManager contract. Pin the rollback
+// ordering so a kind-specific shortcut cannot bypass the immutable source cap.
+func TestRollbackRestoreAdoption_ReappliesImmutableSourceQuota(t *testing.T) {
 
-			var steps []string
-			retained := retainedName(canonicalVolumeName(quotaRollbackSourceLease, "app", 0))
-			b.volumes = &kindedMockVolumeManager{
-				kind: kind,
-				mockVolumeManager: &mockVolumeManager{
-					RenameVolumeFn: func(oldName, newName string) error {
-						steps = append(steps, fmt.Sprintf("rename:%s:%s", oldName, newName))
-						return nil
-					},
-					UsageFn: func(_ context.Context, name string) (int64, error) {
-						require.Equal(t, retained, name)
-						steps = append(steps, "usage:"+name)
-						return 50 * bytesPerMiB, nil
-					},
-					EnsureQuotaFn: func(_ context.Context, name string, diskMB int64) error {
-						require.Equal(t, retained, name)
-						require.Equal(t, int64(100), diskMB,
-							"rollback must use the durable source snapshot, not mutable config")
-						steps = append(steps, fmt.Sprintf("quota:%s:%d", name, diskMB))
-						return nil
-					},
-				},
-			}
-
-			rec := quotaRollbackEntry()
-			rec = *putRestoringRetention(t, rs, rec)
-			// If production accidentally falls back to mutable config, this value
-			// would leak into EnsureQuota instead of the immutable 100 MiB cap.
-			b.cfg.SKUProfiles["old-tier"] = SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 999}
-
-			ok := b.rollbackRestoreAdoption(
-				context.Background(), quotaRollbackDestinationLease, nil, &rec, true, slog.Default(),
-			)
-			require.True(t, ok)
-			assert.Equal(t, []string{
-				"rename:" + canonicalVolumeName(quotaRollbackDestinationLease, "app", 0) + ":" + retained,
-				"usage:" + retained,
-				"quota:" + retained + ":100",
-			}, steps, "re-quarantine, fit proof, then quota restore is the required order")
-
-			stored, err := rs.Get(quotaRollbackSourceLease)
-			require.NoError(t, err)
-			require.NotNil(t, stored)
-			assert.Equal(t, shared.RetentionStatusActive, stored.Status)
-			assert.Equal(t, rec.Generation+1, stored.Generation)
-			_, provisionExists := b.provisions[quotaRollbackDestinationLease]
-			assert.False(t, provisionExists)
-		})
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, quotaRollbackProvision())
+	rs := attachRetentionStore(t, b)
+	b.compose = &mockComposeExecutor{
+		DownFn: func(context.Context, string, time.Duration) error { return nil },
 	}
+
+	var steps []string
+	retained := retainedName(canonicalVolumeName(quotaRollbackSourceLease, "app", 0))
+	b.volumes = &kindedMockVolumeManager{
+		kind: "xfs",
+		mockVolumeManager: &mockVolumeManager{
+			RenameVolumeFn: func(oldName, newName string) error {
+				steps = append(steps, fmt.Sprintf("rename:%s:%s", oldName, newName))
+				return nil
+			},
+			UsageFn: func(_ context.Context, name string) (int64, error) {
+				require.Equal(t, retained, name)
+				steps = append(steps, "usage:"+name)
+				return 50 * bytesPerMiB, nil
+			},
+			EnsureQuotaFn: func(_ context.Context, name string, diskMB int64) error {
+				require.Equal(t, retained, name)
+				require.Equal(t, int64(100), diskMB,
+					"rollback must use the durable source snapshot, not mutable config")
+				steps = append(steps, fmt.Sprintf("quota:%s:%d", name, diskMB))
+				return nil
+			},
+		},
+	}
+
+	rec := quotaRollbackEntry()
+	rec = *putRestoringRetention(t, rs, rec)
+	// If production accidentally falls back to mutable config, this value
+	// would leak into EnsureQuota instead of the immutable 100 MiB cap.
+	b.cfg.SKUProfiles["old-tier"] = SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 999}
+
+	ok := b.rollbackRestoreAdoption(
+		context.Background(), quotaRollbackDestinationLease, nil, &rec, true, slog.Default(),
+	)
+	require.True(t, ok)
+	assert.Equal(t, []string{
+		"rename:" + canonicalVolumeName(quotaRollbackDestinationLease, "app", 0) + ":" + retained,
+		"usage:" + retained,
+		"quota:" + retained + ":100",
+	}, steps, "re-quarantine, fit proof, then quota restore is the required order")
+
+	stored, err := rs.Get(quotaRollbackSourceLease)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, shared.RetentionStatusActive, stored.Status)
+	assert.Equal(t, rec.Generation+1, stored.Generation)
+	_, provisionExists := b.provisions[quotaRollbackDestinationLease]
+	assert.False(t, provisionExists)
 }
 
 func TestRollbackRestoreAdoption_QuotaProofFailureFailsClosed(t *testing.T) {

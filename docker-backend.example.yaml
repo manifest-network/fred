@@ -184,7 +184,7 @@ sku_profiles:
     disk_mb: 4096
 
   # Stateful SKU profiles — containers with disk_mb > 0 get bind-mounted
-  # volumes with quota enforcement (btrfs subvolumes or xfs project quotas).
+  # volumes with quota enforcement (xfs project quotas).
   # Image VOLUME paths (e.g., /data for redis) are automatically
   # discovered and bind-mounted. Data persists across container restarts and
   # re-provisions but is destroyed on deprovision.
@@ -461,32 +461,24 @@ host_address: ""
 # omitted, that seeding is best-effort and skipped. Diskless image VOLUME paths
 # are always tmpfs overrides, never durable binds.
 #
-# The filesystem of the volume_data_path must be btrfs or xfs.
-# If volume_filesystem is not set, it is auto-detected.
+# The filesystem of the volume_data_path must be xfs, mounted with project
+# quotas (pquota). volume_filesystem may be left unset; "xfs" is the only
+# accepted value.
 #
-# Setting it explicitly SELECTS the backend but does not override the check: the daemon
-# probes volume_data_path at startup either way and refuses to start if the path is not
-# actually on the filesystem named. This is deliberate — the usual reason for a mismatch
+# Setting it does not override the check: the daemon probes volume_data_path at
+# startup either way and refuses to start if the path is not actually on XFS.
+# This is deliberate — the usual reason for a mismatch
 # is that the volume is not mounted, and an unmounted root looks exactly like a node with
 # no volumes, which is how retention records were once pruned and their data later
 # destroyed as unclaimed (ENG-687). If startup fails here, check the mount before the
 # config: `findmnt <volume_data_path>`.
 #
-# Supported configurations:
-#   - xfs:   project quotas (requires pquota mount option)
-#            *** the only backend validated and used in production ***
-#   - btrfs: subvolumes with qgroup quotas   (experimental, untested)
-#
-# Only xfs is exercised in production (all mainnet/Morpheus backends run XFS
-# with pquota, and per-volume disk + inode quotas are enforced only on XFS).
-# The btrfs backend is implemented but not tested in any deployment;
-# use xfs for production.
 volume_data_path: "/var/lib/fred/volumes"
 # Required whenever volume_data_path is set, including an all-diskless managed-
 # scratch host. This must be the actual mountpoint containing volume_data_path,
 # not merely another directory on the same root FS.
 volume_mount_path: "/var/lib/fred/volumes"
-# volume_filesystem: "xfs"  # optional, auto-detected (xfs is the only production-validated backend)
+# volume_filesystem: "xfs"  # optional; xfs is the only supported filesystem
 
 # Smallest average file size (bytes) a workload may have before the per-volume
 # XFS inode quota (ihard) binds instead of the block quota (bhard). ihard =

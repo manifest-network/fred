@@ -153,9 +153,9 @@ func TestCheckDemoteFit_DemoteExceedsByOneByte(t *testing.T) {
 }
 
 func TestCheckDemoteFit_UnmeasurableRefuses(t *testing.T) {
-	// A non-ErrUnsupported read failure (e.g. the qgroup command errored) →
+	// A non-ErrUnsupported read failure (e.g. the xfs_quota report errored) →
 	// reason label "unmeasurable_read_error".
-	b := gateBackend(0, errors.New("qgroup show failed"))
+	b := gateBackend(0, errors.New("xfs_quota report failed"))
 	rec := gRec(b, "orig1", []backend.LeaseItem{gItem("docker-large", "app", 1)}, []string{gRetVol("orig1", "app", 0)})
 	newItems := []backend.LeaseItem{gItem("docker-medium", "app", 1)}
 	var err error
@@ -167,7 +167,7 @@ func TestCheckDemoteFit_UnmeasurableRefuses(t *testing.T) {
 	}
 	// The tenant-facing error must NOT leak the underlying Usage error (which
 	// can carry host paths / command output); that detail is logged, not returned.
-	if strings.Contains(err.Error(), "qgroup show failed") {
+	if strings.Contains(err.Error(), "xfs_quota report failed") {
 		t.Fatalf("tenant-facing error must not leak the underlying Usage error: %v", err)
 	}
 }

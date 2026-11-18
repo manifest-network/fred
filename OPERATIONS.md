@@ -5,9 +5,7 @@ This document covers day-to-day operation of a Fred deployment: health checks, a
 For deployment and initial setup see [DEPLOYMENT.md](DEPLOYMENT.md). For metric definitions see [ARCHITECTURE.md](ARCHITECTURE.md#metrics-prometheus). Sample Grafana dashboards live in the `manifest-deploy` repository.
 
 The deployed and production-validated execution envelope is `docker-backend` on
-XFS. Docker's Btrfs implementation
-is experimental and not deployed. Its recovery notes remain here to document
-implemented behavior, not to grant production support.
+XFS, the only filesystem supported for managed volumes.
 
 ---
 
@@ -298,7 +296,6 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 
 **Common causes and remedies:**
 - **`docker stop` hanging**: a container is ignoring SIGTERM and the grace period is long. Lower `container_stop_timeout`.
-- **Volume cleanup hanging on btrfs**: a quota or subvolume operation is blocked in the kernel. Inspect the filesystem state directly.
 - **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock. Later messages for the lease queue behind it, or are refused once its 16-message inbox is full, so retries from the reconciler or providerd reach the same wedged actor: nothing moves for that lease until docker-backend restarts.
 
 A stalled or failing image pull is not a cause: image preparation runs in a worker goroutine, so it delays provisions without raising this gauge. docker-backend makes these registry requests itself, so dockerd logs and a manual `docker pull` show neither the requests nor their errors. Search the docker-backend log for `resolve immutable image:` (a Docker Hub quota refusal contains `TOOMANYREQUESTS` or `429`), check `fred_docker_backend_image_registry_requests_total{status=~"429|5xx|error"}`, and follow [Registry rate limits](#registry-rate-limits).
@@ -412,7 +409,7 @@ To confirm nothing is stranded after the fault clears, the counter should stop r
 
 ## docker-backend refuses to start: quota capability or reconciliation failure
 
-On an `xfs` or `btrfs` backend the docker-backend **fails fast at startup** if it
+With managed volumes configured (`volume_data_path` set) the docker-backend **fails fast at startup** if it
 cannot set volume quotas, exiting with (message from `internal/backend/docker/capability.go`):
 
 ```
@@ -431,7 +428,7 @@ ownership for launches, `CAP_DAC_OVERRIDE` to manage restrictive tenant-owned
 trees, `CAP_SYS_ADMIN` to set the block limit, and `CAP_FOWNER` so startup can
 repair the root inode of a pre-existing tenant-owned volume.
 A plain `setcap …+ep` on the binary is insufficient for CLI quota operations —
-`CAP_SYS_ADMIN` must reach the exec'd `xfs_quota`/`btrfs` children. XFS root repair
+`CAP_SYS_ADMIN` must reach the exec'd `xfs_quota` children. XFS root repair
 uses descriptor-bound kernel ioctls in the backend process and never walks tenant
 descendants. The warning `repaired xfs volume root project attributes; descendants
 require offline verification` distinguishes a repaired root from ordinary limit
@@ -932,10 +929,6 @@ typed forms before operation-intent recovery:
   [Held volume deletions](#held-volume-deletions). Only a contradiction of the
   stage's own authority, or an outcome that cannot be classified, still latches
   and stops the current backend instance.
-- **Btrfs:** there is no private stage. The create command publishes the
-  subvolume before setting its qgroup limit, so operation-intent recovery, the
-  fail-closed startup quota reconciliation, and orphan classification converge
-  an interrupted result.
 
 First fix the filesystem or quota-control-plane error and retry the same sealed
 backend. Do not rename or delete a create/delete stage, or synthesize a marker

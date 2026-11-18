@@ -8,8 +8,7 @@ import (
 // requireCapSysAdmin returns a fatal, actionable error when the daemon cannot set
 // quotas (not root and no ambient CAP_SYS_ADMIN). It is called from the
 // Validate() of backends whose quota operations REQUIRE that capability with no
-// delegation alternative — xfs (quotactl Q_XSETQLIM) and btrfs (subvolume/qgroup
-// ioctls). It is not called for the noop backend (no privileged ops). Failing
+// delegation alternative — xfs (quotactl Q_XSETQLIM). It is not called for the noop backend (no privileged ops). Failing
 // fast at startup beats failing every provision at runtime with an unenforced
 // disk cap.
 //

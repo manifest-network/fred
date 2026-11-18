@@ -274,46 +274,34 @@ func TestReconcileVolumeQuotas_InventoryAttestationFailureIsFatal(t *testing.T) 
 	require.ErrorContains(t, err, `attest managed volume "`+volumeName+`"`)
 }
 
-func TestReconcileVolumeQuotas_ConcreteManagerFailuresReachReadinessGate(t *testing.T) {
+func TestReconcileVolumeQuotas_ConcreteManagerFailureReachesReadinessGate(t *testing.T) {
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	volumeName := canonicalVolumeName(leaseUUID, "app", 0)
 
-	for _, kind := range []string{"btrfs", "xfs"} {
-		t.Run(kind, func(t *testing.T) {
-			b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
-			root := t.TempDir()
-			require.NoError(t, os.Mkdir(filepath.Join(root, volumeName), 0o700))
-			t.Setenv("PATH", "") // concrete CLI-backed managers fail without invoking host tools
+	b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
+	root := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(root, volumeName), 0o700))
+	t.Setenv("PATH", "") // the concrete CLI-backed manager fails without invoking host tools
 
-			var manager volumeManager
-			switch kind {
-			case "btrfs":
-				manager = &btrfsVolumeManager{dataPath: root, logger: b.logger}
-			case "xfs":
-				manager = &xfsVolumeManager{
-					dataPath: root, mountPoint: root, logger: b.logger,
-					activeIDs: make(map[uint32]string), volumeToID: make(map[string]uint32),
-				}
-			default:
-				t.Fatalf("unexpected manager kind %q", kind)
-			}
-
-			b.cfg.VolumeDataPath = root
-			b.cfg.SKUProfiles = map[string]SKUProfile{
-				"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 100},
-			}
-			b.provisions[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{
-				LeaseUUID: leaseUUID,
-				Items:     []backend.LeaseItem{{SKU: "stateful", Quantity: 1, ServiceName: "app"}},
-			}}
-			b.volumes = quotaInventoryOverride{volumeManager: manager, names: []string{volumeName}}
-
-			err := b.reconcileVolumeQuotas(context.Background())
-			require.Error(t, err)
-			require.ErrorContains(t, err, `managed volume "`+volumeName+`"`)
-			require.ErrorContains(t, err, kind)
-		})
+	manager := &xfsVolumeManager{
+		dataPath: root, mountPoint: root, logger: b.logger,
+		activeIDs: make(map[uint32]string), volumeToID: make(map[string]uint32),
 	}
+
+	b.cfg.VolumeDataPath = root
+	b.cfg.SKUProfiles = map[string]SKUProfile{
+		"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 100},
+	}
+	b.provisions[leaseUUID] = &provision{ProvisionState: leasesm.ProvisionState{
+		LeaseUUID: leaseUUID,
+		Items:     []backend.LeaseItem{{SKU: "stateful", Quantity: 1, ServiceName: "app"}},
+	}}
+	b.volumes = quotaInventoryOverride{volumeManager: manager, names: []string{volumeName}}
+
+	err := b.reconcileVolumeQuotas(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, `managed volume "`+volumeName+`"`)
+	require.ErrorContains(t, err, "xfs")
 }
 
 // A backend that cannot re-apply the quota attached to durable tenant bytes is

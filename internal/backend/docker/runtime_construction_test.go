@@ -78,7 +78,7 @@ func TestNewBackendRefusesUnsupportedDockerBeforeOpeningStorage(t *testing.T) {
 			cfg.DockerHost = server.URL
 			cfg.VolumeMountPath = filepath.Join(root, "mount")
 			cfg.VolumeDataPath = filepath.Join(cfg.VolumeMountPath, "volumes")
-			cfg.VolumeFilesystem = "btrfs"
+			cfg.VolumeFilesystem = "xfs"
 			cfg.CallbackDBPath = filepath.Join(root, "callbacks.db")
 			cfg.DiagnosticsDBPath = filepath.Join(root, "diagnostics.db")
 			cfg.ReleasesDBPath = filepath.Join(root, "releases.db")

@@ -52,7 +52,7 @@
 //     pass of the backend's own periodic reconcile loop
 //   - compose.go, compose_project.go: Compose-based stack provisioning
 //   - reconcile_custom_domain.go: Traefik label sync for tenant custom domains
-//   - volume.go (+ volume_btrfs.go, volume_xfs.go):
+//   - volume.go (+ volume_xfs.go):
 //     filesystem-specific quota enforcement for durable SKU volumes and
 //     optional diskless writable-path scratch
 //   - ingress.go: Traefik label generation for routable ports

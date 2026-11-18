@@ -198,7 +198,7 @@ func TestConfigValidation(t *testing.T) {
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
 		cfg.VolumeMountPath = "/var/lib/fred"
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		return cfg
 	}
 
@@ -328,7 +328,7 @@ func TestConfigValidation(t *testing.T) {
 		}
 		cfg.SKUMapping = nil
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		assert.NoError(t, cfg.Validate())
 	})
 
@@ -565,7 +565,7 @@ func TestConfigHardeningValidation(t *testing.T) {
 		cfg.HostAddress = "192.168.1.100"
 		cfg.VolumeDataPath = "/var/lib/fred/volumes"
 		cfg.VolumeMountPath = "/var/lib/fred"
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		return cfg
 	}
 

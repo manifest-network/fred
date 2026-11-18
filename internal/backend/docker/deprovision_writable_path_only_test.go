@@ -550,8 +550,7 @@ func TestBuildStatefulVolumeBinds_RejectsReservedWritablePathName(t *testing.T) 
 // root. The detector must whitelist the marker only as a regular FILE (the real
 // xfs quota marker) — a directory of that name is tenant data, so a volume holding
 // such a dir alongside a _wp scaffolding subtree must be RETAINED, not destroyed.
-// (On btrfs there is no real marker; on xfs such a VOLUME collides with the
-// marker file and fails at provision.)
+// (On xfs such a VOLUME collides with the marker file and fails at provision.)
 func TestDeprovision_MarkerNamedStatefulDirPlusWp_Retained(t *testing.T) {
 	server, callbackDone := retainCloseServer(t)
 

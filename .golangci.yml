@@ -299,7 +299,7 @@ linters:
         linters:
           - gosec
         text: "G110:"
-      # Volume drivers shell out to btrfs/xfs and read per-volume metadata
+      # The volume driver shells out to xfs_quota and reads per-volume metadata
       # files by design. Every exec uses a constant binary with discrete argv
       # (no shell -> no command injection), and every path is rooted at the
       # trusted provider-config dataPath; the only tenant-influenced segment

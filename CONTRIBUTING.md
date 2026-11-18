@@ -12,7 +12,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
-- **(Optional) root, `btrfs-progs`, `xfsprogs` and `capsh` (`libcap2-bin`)** — for the privileged integration tests, which exercise filesystem quotas. The full `make test-integration` needs all of them; `make test-integration-volume` and `make test-integration-restore` need only root, Docker and `xfsprogs`.
+- **(Optional) root, `xfsprogs` and `capsh` (`libcap2-bin`)** — for the privileged integration tests, which exercise filesystem quotas. The full `make test-integration` needs all of them; `make test-integration-volume` and `make test-integration-restore` do not need `capsh`.
 
 ---
 
@@ -126,7 +126,7 @@ go test ./internal/provisioner/ -run TestFleet_
 **It carries no build tag on purpose.** It needs no Docker, no root and no network
 beyond loopback, so it belongs in the ordinary `go test -short ./...` job, where the
 whole suite runs in well under a second on every PR. Behind the `integration` tag it
-would instead ride the privileged root+btrfs+Docker workflow — tens of minutes for a
+would instead ride the privileged root+XFS+Docker workflow — tens of minutes for a
 signal you want on every push, and gated on an environment none of these tests need.
 
 The scenarios in `fleet_characterization_test.go` are characterization tests: they
@@ -145,9 +145,9 @@ make test-integration-restart-update   # restart, update, release-history flows
 sudo -E env "PATH=$PATH" make test-integration-volume  # provision-path volume subset on an XFS loopback (root + xfsprogs)
 ```
 
-Volume tests need root because they create loopback filesystems and set filesystem quotas. The full suite covers btrfs and XFS project quotas, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the provision-path volume tests, which run on an XFS loopback with project quotas; the btrfs loopback now backs only the btrfs driver's own tests. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
+Volume tests need root because they create loopback filesystems and set filesystem quotas. The full suite covers XFS project quotas, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the provision-path volume tests, which run on an XFS loopback with project quotas. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the btrfs and XFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the XFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 

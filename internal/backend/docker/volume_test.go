@@ -399,16 +399,15 @@ func TestNewVolumeManager_UnsupportedFilesystem(t *testing.T) {
 // discard their exact accounting/finalizer authority. Refusing to start is the right
 // answer: a missing mount needs an operator, not a sweep.
 func TestNewVolumeManager_ConfiguredFilesystemMustMatchReality(t *testing.T) {
-	// The configured value is chosen to disagree with whatever the temp dir REALLY is, rather
-	// than assuming it is tmpfs: on a host whose /tmp is XFS, hardcoding "xfs" would describe
-	// the truth instead of the lie and the constructor would rightly succeed.
+	// XFS is the only supported filesystem, so the lie can only be staged on a temp dir that
+	// is NOT XFS. On a host whose temp dir is XFS, "xfs" describes the truth and the
+	// constructor rightly succeeds, so there is nothing to test.
 	dir := t.TempDir()
-	configured := "xfs"
-	if detected, derr := detectFilesystem(dir); derr == nil && detected == configured {
-		configured = "btrfs" // any supported type the temp dir is not
+	if _, derr := detectFilesystem(dir); derr == nil {
+		t.Skip("the temp dir is on XFS; a configured-filesystem mismatch cannot be staged here")
 	}
 
-	_, err := newVolumeManager(dir, configured, 1024, slog.Default())
+	_, err := newVolumeManager(dir, "xfs", 1024, slog.Default())
 	require.Error(t, err, "a configured filesystem that does not match the disk must fail startup")
 	assert.Contains(t, err.Error(), "is the volume mounted?",
 		"the error must name the likely cause; this fires on hosts where the mount unit failed")
@@ -705,9 +704,8 @@ func TestXFSLoadProjectIDsRejectsMalformedManagedEntry(t *testing.T) {
 //
 // These tests exercise the shared descriptor-relative renameAtStorageRoot helper and the
 // per-backend RenameVolume wrappers. They avoid filesystem-specific
-// tooling (xfs_quota, btrfs CLI) by operating on plain
-// directories under t.TempDir() — the rename semantics are identical
-// across xfs and btrfs (os.Rename on a managed root).
+// tooling (xfs_quota) by operating on plain
+// directories under t.TempDir() — the rename is an os.Rename on a managed root.
 
 func TestRenameAtStorageRoot_Idempotent(t *testing.T) {
 	root := t.TempDir()
@@ -799,75 +797,7 @@ func TestXFSVolumeManager_RenameVolume_UpdatesProjectIDMap(t *testing.T) {
 	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
 }
 
-func TestBtrfsVolumeManager_RenameVolume_Idempotent(t *testing.T) {
-	root := t.TempDir()
-	binDir := t.TempDir()
-	fakeBtrfs := filepath.Join(binDir, "btrfs")
-	require.NoError(t, os.WriteFile(fakeBtrfs, []byte(`#!/bin/sh
-if [ "$1 $2" = "subvolume show" ]; then
-  printf '%s\n' 'Subvolume ID: 256'
-  exit 0
-fi
-exit 97
-`), 0o700))
-	t.Setenv("PATH", binDir)
-	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
-
-	const oldName = "fred-550e8400-e29b-41d4-a716-446655440000-0"
-	const newName = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
-	require.NoError(t, os.MkdirAll(filepath.Join(root, oldName), 0o755))
-
-	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
-	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName)) // idempotent
-
-	_, err := os.Stat(filepath.Join(root, newName))
-	require.NoError(t, err)
-}
-
-func TestBtrfsVolumeManagerAttestsExactSubvolume(t *testing.T) {
-	root := t.TempDir()
-	binDir := t.TempDir()
-	logPath := filepath.Join(t.TempDir(), "btrfs.log")
-	fakeBtrfs := filepath.Join(binDir, "btrfs")
-	require.NoError(t, os.WriteFile(fakeBtrfs, []byte(`#!/bin/sh
-printf '%s\n' "$*" >> "$FRED_TEST_BTRFS_LOG"
-printf '%s\n' 'Subvolume ID: 512'
-`), 0o700))
-	t.Setenv("PATH", binDir)
-	t.Setenv("FRED_TEST_BTRFS_LOG", logPath)
-
-	name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
-	require.NoError(t, os.Mkdir(filepath.Join(root, name), 0o700))
-	managedName, err := parseManagedVolumeName(name)
-	require.NoError(t, err)
-	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
-
-	require.NoError(t, mgr.AttestManagedVolume(t.Context(), managedName))
-	commands, err := os.ReadFile(logPath)
-	require.NoError(t, err)
-	assert.Equal(t, "subvolume show "+filepath.Join(root, name)+"\n", string(commands))
-}
-
-func TestBtrfsVolumeManager_DestroyPlainDirectoryIsNotIdempotent(t *testing.T) {
-	root := t.TempDir()
-	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
-	path := filepath.Join(root, name)
-	require.NoError(t, os.Mkdir(path, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(path, "tenant-data"), []byte("keep"), 0o600))
-
-	binDir := t.TempDir()
-	fakeBtrfs := filepath.Join(binDir, "btrfs")
-	require.NoError(t, os.WriteFile(fakeBtrfs, []byte("#!/bin/sh\necho 'ERROR: not a btrfs subvolume' >&2\nexit 1\n"), 0o700))
-	t.Setenv("PATH", binDir)
-
-	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
-	err := mgr.Destroy(context.Background(), name)
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "not a btrfs subvolume")
-	assert.FileExists(t, filepath.Join(path, "tenant-data"), "failed deletion must retain the bytes and accounting evidence")
-}
-
-func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.T) {
+func TestXFSVolumeManager_RejectsTraversalAtEveryPathBoundary(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -896,24 +826,6 @@ func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.
 			_, err := (&xfsVolumeManager{dataPath: root}).Usage(context.Background(), invalid)
 			return err
 		}},
-		{"btrfs create", func() error {
-			_, _, err := (&btrfsVolumeManager{dataPath: root}).Create(context.Background(), invalid, 1)
-			return err
-		}},
-		{"btrfs quota", func() error {
-			return ensureQuotaErr((&btrfsVolumeManager{dataPath: root}).EnsureQuota(context.Background(), invalid, 1))
-		}},
-		{"btrfs destroy", func() error { return (&btrfsVolumeManager{dataPath: root}).Destroy(context.Background(), invalid) }},
-		{"btrfs rename old", func() error {
-			return (&btrfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), invalid, valid)
-		}},
-		{"btrfs rename new", func() error {
-			return (&btrfsVolumeManager{dataPath: root}).RenameVolume(context.Background(), valid, invalid)
-		}},
-		{"btrfs usage", func() error {
-			_, err := (&btrfsVolumeManager{dataPath: root}).Usage(context.Background(), invalid)
-			return err
-		}},
 	}
 	for _, test := range tests {
 		test := test
@@ -923,43 +835,27 @@ func TestFilesystemVolumeManagers_RejectTraversalAtEveryPathBoundary(t *testing.
 		})
 	}
 
-	for _, got := range []string{
-		(&xfsVolumeManager{dataPath: root}).HostPath(invalid),
-		(&btrfsVolumeManager{dataPath: root}).HostPath(invalid),
-	} {
-		relative, err := filepath.Rel(root, got)
-		require.NoError(t, err)
-		assert.True(t, filepath.IsLocal(relative))
-		assert.Contains(t, filepath.Base(got), ".fred-rejected-volume-")
-	}
+	got := (&xfsVolumeManager{dataPath: root}).HostPath(invalid)
+	relative, err := filepath.Rel(root, got)
+	require.NoError(t, err)
+	assert.True(t, filepath.IsLocal(relative))
+	assert.Contains(t, filepath.Base(got), ".fred-rejected-volume-")
 }
 
-func TestVolumeManagers_DestroyRejectsManagedNameSymlink(t *testing.T) {
+func TestXFSVolumeManager_DestroyRejectsManagedNameSymlink(t *testing.T) {
 	t.Parallel()
 
-	for _, filesystem := range []string{"xfs", "btrfs"} {
-		filesystem := filesystem
-		t.Run(filesystem, func(t *testing.T) {
-			t.Parallel()
-			root := t.TempDir()
-			outside := t.TempDir()
-			victim := filepath.Join(outside, "tenant-data")
-			require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
-			const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
-			require.NoError(t, os.Symlink(outside, filepath.Join(root, name)))
+	root := t.TempDir()
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "tenant-data")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	const name = "fred-550e8400-e29b-41d4-a716-446655440000-app-0"
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, name)))
 
-			var err error
-			switch filesystem {
-			case "xfs":
-				err = (&xfsVolumeManager{dataPath: root}).Destroy(context.Background(), name)
-			case "btrfs":
-				err = (&btrfsVolumeManager{dataPath: root}).Destroy(context.Background(), name)
-			}
-			require.Error(t, err)
-			assert.FileExists(t, victim)
-			assert.FileExists(t, filepath.Join(root, name), "the symlink itself must not be consumed as successful volume deletion")
-		})
-	}
+	err := (&xfsVolumeManager{dataPath: root}).Destroy(context.Background(), name)
+	require.Error(t, err)
+	assert.FileExists(t, victim)
+	assert.FileExists(t, filepath.Join(root, name), "the symlink itself must not be consumed as successful volume deletion")
 }
 
 // TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged covers
@@ -1009,11 +905,6 @@ func TestXFSVolumeManager_RenameVolume_FailureLeavesMapUnchanged(t *testing.T) {
 func TestVolumeManager_HostPath(t *testing.T) {
 	t.Run("xfs", func(t *testing.T) {
 		mgr := &xfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
-		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
-		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
-	})
-	t.Run("btrfs", func(t *testing.T) {
-		mgr := &btrfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
 		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
 		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
 	})

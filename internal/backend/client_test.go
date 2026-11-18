@@ -756,7 +756,7 @@ func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
 	// A host path plus raw command output, the exact shape ENG-508 removed from
 	// the async path. If any substring of this reaches the caller, the tenant
 	// sees it too — internal/api writes err.Error() into the 4xx body.
-	const hostPathSentinel = `btrfs qgroup show /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
+	const hostPathSentinel = `xfs_quota report /var/lib/fred/volumes/fred-abc-app-0: exit status 1`
 
 	bodies := map[string]string{
 		"text/plain body":    hostPathSentinel,
@@ -784,7 +784,7 @@ func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
 
 			assert.NotContains(t, err.Error(), hostPathSentinel,
 				"the raw backend body must never survive into the error a tenant can read")
-			assert.NotContains(t, err.Error(), "qgroup",
+			assert.NotContains(t, err.Error(), "xfs_quota",
 				"no fragment of the raw body may survive either")
 			assert.ErrorIs(t, err, ErrMalformedErrorBody)
 			assert.NotErrorIs(t, err, ErrValidation,

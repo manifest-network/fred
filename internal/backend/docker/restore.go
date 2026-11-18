@@ -1648,8 +1648,8 @@ func (b *Backend) checkDemoteFitWithResourceProfiles(
 					reason, refused = "unmeasurable_backend", b.restoreDemoteRefusals.unmeasurableBackend
 				}
 				refused.Inc()
-				// uerr can embed host paths and raw command output (e.g. btrfs
-				// qgroup show against b.dataPath); log it for operators but keep
+				// uerr can embed host paths and raw command output (e.g. xfs_quota
+				// report against the mount); log it for operators but keep
 				// it OUT of the returned error, which docker-backend/fred-api
 				// forward verbatim to the (untrusted) tenant in the 422 body.
 				logger.Warn("restore demote refused: cannot measure retained volume usage",
@@ -2306,7 +2306,7 @@ type retainedQuotaTarget struct {
 // retention record becomes Active again.
 //
 // A promote restore raises the physical quota through volumeManager.Create.
-// Merely renaming the volume back does not undo that change on btrfs or
+// Merely renaming the volume back does not undo that change on
 // XFS. RollbackRestoring would then publish the smaller immutable source footprint
 // while the filesystem still permits growth to the larger destination cap.
 // This helper closes that under-accounting window by requiring three proofs:

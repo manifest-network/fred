@@ -83,8 +83,7 @@ func TestResolveMountpoint_Root(t *testing.T) {
 // concurrent deprovision just removed). Runs unprivileged — the missing-path
 // branch returns before any exec.
 func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
-	// Built directly rather than through newVolumeManager, exactly as the btrfs sibling
-	// below already is: the constructor now verifies that volume_data_path really is on the
+	// Built directly rather than through newVolumeManager: the constructor now verifies that volume_data_path really is on the
 	// filesystem it claims (ENG-687), and a t.TempDir() is tmpfs. This test is about
 	// EnsureQuota's missing-path branch, not about construction.
 	mgr := &xfsVolumeManager{
@@ -97,16 +96,6 @@ func TestXfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
 	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
 	require.NoError(t, err, "EnsureQuota on a missing volume must be a no-op")
 	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing volume is never reported as applied")
-}
-
-// TestBtrfsEnsureQuota_MissingVolumeIsNoop is the btrfs analogue: EnsureQuota on
-// a subvolume that does not exist returns nil without running any btrfs command
-// (root-free — the missing-path branch returns before any exec).
-func TestBtrfsEnsureQuota_MissingVolumeIsNoop(t *testing.T) {
-	mgr := &btrfsVolumeManager{dataPath: t.TempDir(), logger: slog.Default()}
-	outcome, err := mgr.EnsureQuota(context.Background(), "fred-550e8400-e29b-41d4-a716-446655440000-app-0", 100)
-	require.NoError(t, err, "btrfs EnsureQuota on a missing subvolume must be a no-op")
-	assert.Equal(t, volumeQuotaAbsent, outcome, "a missing subvolume is never reported as applied")
 }
 
 // TestNewVolumeManager_XFS_ResolvesMountpoint verifies that constructing the
