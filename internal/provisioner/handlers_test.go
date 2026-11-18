@@ -168,12 +168,12 @@ func TestHandleLeaseCreated_ChainError(t *testing.T) {
 // RouteBySKU test, which asserted the removed SKU→backend deprovision guess.
 func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
-	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
+	batchBackend := &mockManagerBackend{name: "batch-backend"}
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: batchBackend, Match: backend.MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 
@@ -200,10 +200,10 @@ func TestHandleLeaseClosed_NoPlacement_SweepsAllBackends(t *testing.T) {
 	gpuBackend.mu.Unlock()
 	assert.Equal(t, 1, gpuCalls, "deprovision calls to GPU backend")
 
-	k8sBackend.mu.Lock()
-	k8sCalls := len(k8sBackend.deprovisionCalls)
-	k8sBackend.mu.Unlock()
-	assert.Equal(t, 1, k8sCalls, "deprovision calls to K8s backend")
+	batchBackend.mu.Lock()
+	batchCalls := len(batchBackend.deprovisionCalls)
+	batchBackend.mu.Unlock()
+	assert.Equal(t, 1, batchCalls, "deprovision calls to batch backend")
 }
 
 func TestHandleLeaseClosed_FallbackAllBackends(t *testing.T) {

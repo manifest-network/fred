@@ -35,7 +35,7 @@ linters:
         #
         # Scoped to the backend side of the fred<->backend boundary, which is
         # where the edge actually appeared: one import, for one panic counter,
-        # in internal/backend/docker and internal/backend/k3s. Tests are exempt
+        # in internal/backend/docker. Tests are exempt
         # — internal/backend/router_test.go legitimately asserts on the injected
         # collectors, and a test binary ships nowhere.
         backend-metrics-ownership:
@@ -43,7 +43,6 @@ linters:
             - "!$test"
             - "**/internal/backend/**"
             - "**/cmd/docker-backend/**"
-            - "**/cmd/k3s-backend/**"
             - "**/cmd/mock-backend/**"
           deny:
             # The $ anchor is load-bearing: pkg is a prefix/regex match, so

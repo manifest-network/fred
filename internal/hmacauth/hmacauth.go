@@ -73,7 +73,6 @@
 //   - Backend → Fred callbacks (internal/api/callback_auth.go)
 //   - Fred → backend HTTP requests (internal/backend/client.go)
 //   - docker-backend self-verification middleware (cmd/docker-backend/main.go)
-//   - k3s-backend self-verification middleware (cmd/k3s-backend/server.go)
 //   - mock-backend self-verification middleware (cmd/mock-backend/main.go)
 package hmacauth
 

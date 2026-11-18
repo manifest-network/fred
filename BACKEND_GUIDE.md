@@ -104,19 +104,15 @@ manifest, and a UUID that maps to no profile is refused as `unknown_sku`.
 |-----|-----|----------------------|
 | `a1b2c3d4-...-1234567890ab` | `docker-small` | Run each instance with 0.5 CPU, 512 MB memory and a 1 GB disk quota (Docker backend) |
 | `b2c3d4e5-...-2345678901bc` | `docker-large` | Run each instance with 2 CPU, 2 GB memory and a 4 GB disk quota (Docker backend) |
-| `d4e5f6a7-...-5678901234ef` | `k8s-small` | Create deployment with 1 CPU, 512MB (illustrative — see k3s note below) |
-| `e5f6a7b8-...-6789012345f0` | `k8s-large` | Create deployment with 4 CPU, 4GB (illustrative — see k3s note below) |
 | `c3d4e5f6-...-4567890123de` | `gpu-a100` | Allocate A100 GPU node |
 
 **Note:** The `mock-backend` included with Fred ignores the SKU entirely - it provisions the same fake resource regardless of SKU. This is intentional for testing purposes.
-
-**Note on `k8s-*` / k3s:** The `k8s-small`/`k8s-large` rows above are illustrative only. The bundled `k3s-backend` is an **experimental, non-functional scaffold (ENG-133)**: it serves the HTTP contract except `POST /restore`, for which it registers no route, so a restore request gets a `404` rather than the bare `422` that the `POST /restore` section requires of a backend without retention support (retention/restore is docker-only today). Its provisioner returns `status=failed, error="not implemented"`, and it returns `ErrNotProvisioned` for info/logs/restart/update/releases. It is **not for production use**; real Kubernetes provisioning lands in ENG-134+.
 
 ## Inbound Authentication
 
 **Your backend MUST verify Fred's signature on every inbound contract request.** Fred signs every request it sends to a backend with the same `X-Fred-Signature` HMAC scheme used for callbacks (see Callback Protocol → HMAC Signature). A backend that does not verify inbound signatures accepts unauthenticated provision/deprovision/update commands from anyone who can reach it.
 
-The bundled Docker, k3s, and mock HTTP servers wrap **all** contract routes in
+The bundled Docker and mock HTTP servers wrap **all** contract routes in
 HMAC verification middleware and respond `401 Unauthorized` to any request with
 a missing or invalid `X-Fred-Signature`.
 
@@ -134,15 +130,15 @@ one extra verify-only key while a rotation is in progress (docker-backend's
 Compute the MAC with both keys on every request and accept a match with either,
 so the time taken does not reveal which key matched; format and timestamp
 failures do not depend on the key. Backends inside this repository use
-`hmacauth.VerifyKeys` and `hmacauth.VerifyRequestKeys`. The bundled k3s and mock
-backends accept one key only.
+`hmacauth.VerifyKeys` and `hmacauth.VerifyRequestKeys`. The bundled mock
+backend accepts one key only.
 
 **Unauthenticated endpoints:** only the operational endpoints `GET /health`, `GET /stats`, and `GET /metrics` are exempt. Fred still signs its `/health` and `/stats` requests, but a backend need not verify those signatures (the bundled backends do not); both responses must carry the storage-identity header described below. Fred never calls `/metrics`. Every other (contract) endpoint below must be authenticated.
 
 ## Durable Backend Storage Identity
 
 A configured backend name is a routing label; it is not proof that the same
-disk, Docker daemon, or Kubernetes cluster is still behind that label. Every
+disk or Docker daemon is still behind that label. Every
 backend implementation must therefore seal one canonical lowercase UUIDv4 to
 its durable storage lineage and keep it stable across process restarts. A
 replacement storage substrate must receive a new backend name. Never generate
@@ -225,8 +221,8 @@ subsequent open refuses the journal. This is why the stopped-and-drained cutover
 is mandatory.
 
 The bundled Docker backend additionally binds the marker to its configured
-backend name, Docker daemon `SystemID`, and the existing configured data mount;
-the k3s scaffold binds it to the Kubernetes cluster UID. Verify the binding
+backend name, Docker daemon `SystemID`, and the existing configured data mount.
+Verify the binding
 before startup recovery, every inventory/side-effect boundary, asynchronous
 cleanup, and callback enqueue/delivery. A confirmed mismatch is permanent for
 that process: fail-stop rather than relearning the replacement. Restoring a
@@ -236,8 +232,7 @@ lineage; fence the old node/cluster before starting such a clone.
 Persistent authority must be part of that same seal. The bundled Docker backend
 binds its callback/intent, release, and retention databases to both the storage
 UUID and distinct store-kind tags; all three files are required even when
-retention policy is disabled. The k3s scaffold binds its callback/intent and
-release databases. A diagnostics database is intentionally excluded because it
+retention policy is disabled. A diagnostics database is intentionally excluded because it
 does not authorize a mutation, callback, restore, or release and can be
 recreated after loss. A third-party backend should make the same classification
 explicit: any file whose absence could change a lifecycle or destructive
@@ -1102,8 +1097,8 @@ configured backend set is unchanged, providerd's startup also probes `/health`
 on every unfenced backend: a missing header on a non-`5xx` response, or an
 empty, repeated, malformed or different one, stops startup, while an
 unreachable backend, another status, or a `5xx` without the header only leaves
-that backend degraded. The bundled Docker and k3s backends re-attest storage
-lineage on each probe and answer `503` without the header when that fails.
+that backend degraded. The bundled Docker backend re-attests storage
+lineage on each probe and answers `503` without the header when that fails.
 
 ### RefreshState (Backend interface method, optional for in-process backends)
 
@@ -1825,7 +1820,7 @@ not be used as a production backend. Key sections:
 
 ## Configuration
 
-The bundled Docker backend and experimental k3s scaffold are configured via a
+The bundled Docker backend is configured via a
 YAML file (the Docker backend reads `docker-backend.yaml`; see
 `internal/backend/docker/config.go`); the mock backend is the exception — it is
 configured via `MOCK_BACKEND_*` environment variables, not YAML.
@@ -1843,7 +1838,7 @@ name: "my-backend"               # For logging/metrics
 host_address: "192.168.1.100"    # For connection info
 ```
 
-The bundled Docker backend and experimental k3s scaffold configurations reject
+The bundled Docker backend configuration rejects
 a zero or negative `callback_max_age`. The setting bounds typed lifecycle
 observations; `24h` is the bundled default. Exact operation and
 maintenance completions never expire because discarding one can strand Fred's
@@ -1984,8 +1979,7 @@ Before deploying your backend:
 `reconcile_custom_domain` is called through its storage-bound mutation route on
 **every reconcile tick** for each active lease
 (`internal/provisioner/reconciler.go`), so it must be cheap and idempotent — a
-backend with no work should return success, not 404 (e.g. the k3s scaffold
-returns `nil` from `ReconcileCustomDomain`). `restart`, `update`, and
+backend with no work should return success, not 404. `restart`, `update`, and
 `/releases/{lease_uuid}` are invoked **on demand** when a tenant calls the
 corresponding API operation (`RestartLease`/`UpdateLease`/`GetLeaseReleases` in
 `internal/api/handlers.go`); the reconciler also reads `/releases/{lease_uuid}`

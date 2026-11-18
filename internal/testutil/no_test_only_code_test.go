@@ -45,7 +45,7 @@ package testutil
 //   - A field written in production but read only by tests, whose name and
 //     doc are both ordinary production prose. No phrase can reach that:
 //     there is nothing in the text to match. ENG-765 found three
-//     (docker.Backend.httpClient, k3s.Backend.httpClient,
+//     (docker.Backend.httpClient, a since-deleted backend's httpClient,
 //     provisioner.Manager.handlers) by enumerating every unexported
 //     production struct field and comparing prod reads against test reads.
 //     Catching it needs write-vs-read selector analysis, not a phrase.
@@ -102,7 +102,7 @@ var testOnlyDocPhrases = []string{
 	// the failure mode this list's third blind spot below exists to
 	// avoid. chain/client.go's clock seam already normalizes to
 	// "time.now in production". Measured across all production files
-	// under internal/ and cmd/: this phrase matched only the two k3s
+	// under internal/ and cmd/: this phrase matched only the two
 	// hooks ENG-765 removed.
 	"set in tests",
 }
@@ -368,7 +368,7 @@ type Backend struct {
 		{
 			// The same shape in the doc position, with the phrase
 			// straddling a line break — which is how gofmt left the real
-			// k3s hooks, and the reason an unnormalized Contains would
+			// hooks, and the reason an unnormalized Contains would
 			// have missed one of the two.
 			name: "nil-in-prod hook field, phrase wrapped across doc lines",
 			src: `package p

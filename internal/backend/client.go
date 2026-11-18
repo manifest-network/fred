@@ -30,7 +30,7 @@ import (
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
-// Any backend (Kubernetes, GPU, VM, etc.) must implement these operations.
+// Any backend (containers, GPU, VM, etc.) must implement these operations.
 type Backend interface {
 	// Provision starts async provisioning of a resource.
 	// The backend will call the callback URL when provisioning completes.
@@ -118,7 +118,7 @@ type Backend interface {
 	// ListRetentions returns the leases whose data this backend currently
 	// retains (soft-deleted, awaiting restore or grace-reap). Used by the
 	// reconciler to keep placement affinity for retained leases (ENG-333).
-	// Backends without retention (e.g. k3s) return an empty slice.
+	// Backends without retention return an empty slice.
 	ListRetentions(ctx context.Context) ([]RetainedLease, error)
 
 	// Name returns the backend's configured name.

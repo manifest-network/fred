@@ -1,29 +1,25 @@
 // Package manifest defines the tenant-facing container manifest schema
 // (StackManifest, holding a map of named per-service Manifest entries),
 // JSON parsing, and validation. It is consumed by every backend that
-// provisions tenant workloads (Docker, K3s, future substrates) so the
+// provisions tenant workloads (Docker today, future substrates) so the
 // on-the-wire schema and validation stay identical across substrates.
 //
 // # Substrate boundaries
 //
 // Some fields here carry Docker-flavored conventions because that is
-// the lingua franca of the schema. K8s/K3s translation is the job of
-// each backend, not of this package:
+// the lingua franca of the schema. Translating them for another substrate
+// is the job of that backend, not of this package:
 //
 //   - HealthCheckConfig.Test uses the Docker exec format
 //     (["CMD", cmd, args...], ["CMD-SHELL", "shell-string"], ["NONE"]).
-//     A K3s/K8s backend must translate this to exec / httpGet /
-//     tcpSocket probes substrate-side; that translation is out of
-//     scope for this package. Its timings are HealthDuration values
+//     Translating it to another probe shape is out of scope for this
+//     package. Its timings are HealthDuration values
 //     bounded by Docker's own container.MinimumDuration.
 //   - validateUserSpec accepts Docker's USER-directive format
 //     (uid, uid:gid, username, username:group). Generic enough to
-//     remain here as the wire format; backends translate to
-//     securityContext.runAsUser / runAsGroup as needed.
-//   - Tmpfs and StopGracePeriod are Docker-flavored field names but
-//     translate cleanly to K8s emptyDir.medium=Memory tmpfs mounts and
-//     terminationGracePeriodSeconds; backends do that translation
-//     substrate-side.
+//     remain here as the wire format.
+//   - Tmpfs and StopGracePeriod are Docker-flavored field names; a
+//     backend on another substrate translates them itself.
 package manifest
 
 import (
@@ -130,8 +126,7 @@ type flatManifest struct {
 	// directories (e.g., "/var/cache/nginx", "/var/log/nginx").
 	// Each mount uses the operator-configured tmpfs size limit.
 	//
-	// Field name follows Docker convention. K8s/K3s backends translate this
-	// substrate-side to emptyDir mounts with medium=Memory.
+	// Field name follows Docker convention.
 	Tmpfs []string `json:"tmpfs,omitempty"`
 
 	// User overrides the container's runtime user. Required for images like
@@ -150,8 +145,7 @@ type flatManifest struct {
 	// StopGracePeriod is the time to wait after SIGTERM before sending SIGKILL.
 	// Bounded to 1s–120s.
 	//
-	// Field name follows Docker convention. K8s/K3s backends translate this
-	// substrate-side to terminationGracePeriodSeconds.
+	// Field name follows Docker convention.
 	StopGracePeriod *Duration `json:"stop_grace_period,omitempty"`
 
 	// Init runs an init process (tini) as PID 1 inside the container for
@@ -190,8 +184,7 @@ type HealthCheckConfig struct {
 	//   - ["CMD-SHELL", "shell-string"]          — exec /bin/sh -c shell-string
 	//   - ["NONE"]                                — disable inherited health check
 	//
-	// K8s/K3s backends MUST translate this substrate-side to the appropriate
-	// probe shape (exec / httpGet / tcpSocket). Translation is out of scope
+	// Translating this to another substrate's probe shape is out of scope
 	// for this package; this is the wire format the chain stores.
 	Test []string `json:"test"`
 
@@ -468,10 +461,8 @@ func (m *flatManifest) validate(inStack bool) error {
 // Valid formats: "uid", "uid:gid", "username", "username:group".
 //
 // This format is generic enough to remain the wire format across
-// substrates. K8s/K3s backends translate uid/gid substrate-side
-// (securityContext.runAsUser / runAsGroup); username strings require
-// resolution against the container image's /etc/passwd, which is also
-// substrate-side.
+// substrates. Username strings require resolution against the container
+// image's /etc/passwd, which is substrate-side.
 func validateUserSpec(user string) error {
 	if strings.ContainsAny(user, " \t\n\r\f\v") {
 		return fmt.Errorf("user: must not contain whitespace: %q", user)

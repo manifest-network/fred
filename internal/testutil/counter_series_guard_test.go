@@ -67,7 +67,6 @@ var (
 		"internal/metrics/background/background.go",
 		"internal/backend/docker/series.go",
 		"internal/backend/docker/imagefetch/series.go",
-		"internal/backend/k3s/series.go",
 	}
 	// counterChildMethods create (or look up and create) a child series.
 	counterChildMethods = []string{

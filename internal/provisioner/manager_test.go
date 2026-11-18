@@ -1208,12 +1208,12 @@ func TestManager_CloseCancelsAndJoinsTimeoutChecker(t *testing.T) {
 func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 	// Test that leases are routed to the correct backend based on SKU
 	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
-	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
+	batchBackend := &mockManagerBackend{name: "batch-backend"}
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100-4x"}}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: batchBackend, Match: backend.MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 
@@ -1257,12 +1257,12 @@ func TestManager_HandleLeaseCreated_SKUBasedRouting(t *testing.T) {
 	assert.Equal(t, "gpu-lease-1", gpuCalls[0].LeaseUUID)
 	assert.Equal(t, "gpu-a100-4x", gpuCalls[0].RoutingSKU())
 
-	// Verify K8s backend did NOT receive any calls
-	k8sBackend.mu.Lock()
-	k8sCalls := k8sBackend.provisionCalls
-	k8sBackend.mu.Unlock()
+	// Verify batch backend did NOT receive any calls
+	batchBackend.mu.Lock()
+	batchCalls := batchBackend.provisionCalls
+	batchBackend.mu.Unlock()
 
-	assert.Empty(t, k8sCalls, "K8s backend should not have received any provision calls")
+	assert.Empty(t, batchCalls, "batch backend should not have received any provision calls")
 
 	// The durable write-ahead record, not a Manager Registry DTO, exposes the
 	// selected backend for observation.
@@ -1952,12 +1952,12 @@ func TestManager_HandlePayloadReceived_MissingPayloadInStore(t *testing.T) {
 
 func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	gpuBackend := &mockManagerBackend{name: "gpu-backend"}
-	k8sBackend := &mockManagerBackend{name: "k8s-backend"}
+	batchBackend := &mockManagerBackend{name: "batch-backend"}
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: batchBackend, Match: backend.MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 
@@ -2010,12 +2010,12 @@ func TestManager_HandlePayloadReceived_SKUBasedRouting(t *testing.T) {
 	require.Len(t, gpuCalls, 1)
 	assert.Equal(t, "gpu-a100", gpuCalls[0].RoutingSKU())
 
-	// Verify K8s backend did NOT receive any calls
-	k8sBackend.mu.Lock()
-	k8sCalls := k8sBackend.provisionCalls
-	k8sBackend.mu.Unlock()
+	// Verify batch backend did NOT receive any calls
+	batchBackend.mu.Lock()
+	batchCalls := batchBackend.provisionCalls
+	batchBackend.mu.Unlock()
 
-	assert.Empty(t, k8sCalls, "K8s backend should not have received any provision calls")
+	assert.Empty(t, batchCalls, "batch backend should not have received any provision calls")
 
 	// Verify the durable operation attempt has the correct backend.
 	record := managerTestPlacement(manager).Lookup(handlerTestLeaseOne)

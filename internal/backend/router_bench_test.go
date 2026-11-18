@@ -53,8 +53,8 @@ func (m *mockBenchBackend) ListRetentions(_ context.Context) ([]RetainedLease, e
 // BenchmarkRouter_Route benchmarks SKU-based routing decisions.
 func BenchmarkRouter_Route(b *testing.B) {
 	skus := []string{
-		"k8s-small",
-		"k8s-large",
+		"batch-small",
+		"batch-large",
 		"gpu-a100",
 		"gpu-h100",
 		"vm-basic",
@@ -65,7 +65,7 @@ func BenchmarkRouter_Route(b *testing.B) {
 
 	// Create router with multiple backends using exact SKU lists
 	backends := []BackendEntry{
-		{Backend: &mockBenchBackend{name: "kubernetes"}, Match: MatchCriteria{SKUs: []string{"k8s-small", "k8s-large"}}},
+		{Backend: &mockBenchBackend{name: "batch"}, Match: MatchCriteria{SKUs: []string{"batch-small", "batch-large"}}},
 		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUs: []string{"gpu-a100", "gpu-h100"}}},
 		{Backend: &mockBenchBackend{name: "vm"}, Match: MatchCriteria{SKUs: []string{"vm-basic", "vm-premium"}}},
 		{Backend: &mockBenchBackend{name: "storage"}, Match: MatchCriteria{SKUs: []string{"storage-ssd"}}},
@@ -92,11 +92,11 @@ func BenchmarkRouter_Route(b *testing.B) {
 
 // BenchmarkRouter_Route_Parallel benchmarks concurrent routing.
 func BenchmarkRouter_Route_Parallel(b *testing.B) {
-	skus := []string{"gpu-a100", "k8s-small", "unknown"}
+	skus := []string{"gpu-a100", "batch-small", "unknown"}
 
 	backends := []BackendEntry{
 		{Backend: &mockBenchBackend{name: "gpu"}, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-		{Backend: &mockBenchBackend{name: "k8s"}, Match: MatchCriteria{SKUs: []string{"k8s-small"}}},
+		{Backend: &mockBenchBackend{name: "batch"}, Match: MatchCriteria{SKUs: []string{"batch-small"}}},
 		{Backend: &mockBenchBackend{name: "default"}, IsDefault: true},
 	}
 
@@ -117,7 +117,7 @@ func BenchmarkRouter_Route_Parallel(b *testing.B) {
 
 // BenchmarkRouter_GetBackendByName benchmarks direct backend lookup.
 func BenchmarkRouter_GetBackendByName(b *testing.B) {
-	names := []string{"gpu", "k8s", "vm", "storage", "default"}
+	names := []string{"gpu", "batch", "vm", "storage", "default"}
 	backends := make([]BackendEntry, len(names))
 	for i, name := range names {
 		backends[i] = BackendEntry{

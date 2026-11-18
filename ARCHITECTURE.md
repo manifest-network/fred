@@ -805,7 +805,13 @@ operation, maintenance, close, release, and retention state remains in the
 corresponding journal; the actor consumes store-issued capabilities rather than
 becoming another authority database. The substrate-agnostic state-machine and
 actor code lives in `internal/backend/shared/leasesm`; only the Docker backend
-uses it (see [K3s backend](#k3s-backend-experimental)).
+uses it. The actor holds no backend pointer and receives narrow interfaces plus
+fixed operation handlers at construction (`LeaseProvisionStore`,
+`InstanceInspector`, `DiagnosticsGatherer`, and the journal-claim executors). A
+caller can submit only opaque commands minted by validating constructors; it
+cannot attach a different physical function at dispatch time. The same
+single-writer projection model therefore applies to any backend that supplies
+those seams.
 
 **Structure:**
 
@@ -1143,7 +1149,7 @@ a lease stateful or retainable; writable-path-only volumes are reclaimed at
 close. If conservative classification leaves an exact scratch-volume name in a
 retention row, its pinned allowance remains in physical pool accounting and
 quota backfill until that name is destroyed; this is fail-closed accounting, not
-retention entitlement. K3s legitimately persists zero scratch.
+retention entitlement.
 
 That resolved profile snapshot moves unchanged from operation intent to the
 live provision and successful release, then into any close/retention authority.
@@ -1521,9 +1527,7 @@ every pass that defers it increments
 `fred_docker_backend_operation_recovery_deferred_total` and logs the WARN
 `operation recovery retained unresolved lease authority`. A pre-existing terminal row is an immutable recovery decision;
 without a committed Release, its absence where a restore finalizer names that
-operation is invalid. The k3s scaffold
-creates no cluster objects, so its only valid operation-intent recovery is the
-deterministic `not implemented` failure.
+operation is invalid.
 
 For Docker, an already-active Release with durable runtime authority is itself
 exact recovery evidence even when containers are exited or entirely absent.
@@ -1698,8 +1702,7 @@ form one lineage seal. Docker always requires its callback, releases and
 retention stores (`callbacks.db`, `releases.db` and `retention.db` by default);
 the retention store exists and is bound even when `retain_on_close` is false,
 because absence must never be confused with an empty authoritative retention
-inventory. K3s requires its callback and releases stores (`k3s-callbacks.db`
-and `k3s-releases.db` by default). Each store carries the canonical backend
+inventory. Each store carries the canonical backend
 storage UUID and a
 distinct store-kind tag, so a database copied from another backend generation
 or substituted at a different configured role fails closed. The diagnostics
@@ -1873,15 +1876,8 @@ that combines individually matching files from different points in time.
 
 The production deployment envelope verified read-only for the ENG-632 cutover
 on 2026-09-02 is `docker-backend` on XFS. Btrfs and ZFS retain automated coverage
-but are not deployed or production-validated, and K3s is the non-functional
-scaffold described below. This point-in-time fact scopes the rollout proof; it
-does not replace the mandatory pre-cutover re-inventory in `DEPLOYMENT.md`.
-
-### K3s backend (experimental)
-
-`internal/backend/k3s` is an **experimental, non-functional scaffold (ENG-133)**. It boots, serves the full backend contract over HTTP, and wires up config/metrics/health, but its provisioner is a stub: every accepted provision flips to `failed` and posts a `status=failed, error="not implemented"` callback (`internal/backend/k3s/provision_stub.go:15`). Real Pod/Deployment provisioning lands in ENG-134+.
-
-The SM/actor machinery (`internal/backend/shared/leasesm`) is substrate-agnostic, but only the Docker backend uses it: the k3s scaffold keeps its own minimal provision record and deliberately does not embed `leasesm.ProvisionState`. The actor holds no backend pointer and receives narrow interfaces plus fixed operation handlers at construction (`LeaseProvisionStore`, `InstanceInspector`, `DiagnosticsGatherer`, and the journal-claim executors). A caller can submit only opaque commands minted by validating constructors; it cannot attach a different physical function at dispatch time. The same single-writer projection model therefore applies to any backend that supplies those seams.
+but are not deployed or production-validated. This point-in-time fact scopes the
+rollout proof; it does not replace the mandatory pre-cutover re-inventory in `DEPLOYMENT.md`.
 
 ## Data Flow
 
@@ -2222,10 +2218,8 @@ database acquisition and filesystem waits remain synchronous. See
 |---|---|---|
 | `fred_background_cleanup_panics_total` | providerd | `token` |
 | | docker-backend | `callback`, `diagnostics`, `releases`, `retention`, `docker_reconciliation`, `docker_network_reclamation`, `docker_projid_audit`, `docker_seccomp_census`, `docker_runtime_inventory`, `docker_volume_delete_hold`, `docker_runtime_refresh` |
-| | k3s-backend | `callback`, `diagnostics`, `releases` (no retention store — retention is docker-only, ENG-325) |
 | `fred_background_goroutine_panics_total` | providerd | `payload_writer`, `ack_batcher`, `withdraw_scheduler`, `timeout_checker_sweep`, `timeout_checker_candidate`, `maintenance_recovery` |
 | | docker-backend | `callback_replay`, `container_death_overflow_reporter` |
-| | k3s-backend | `callback_replay` |
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -2371,16 +2365,6 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_lease_failures_total` | counter | `attribution` | Every failure the consecutive-failure budget records (ENG-799), by who caused it: `tenant_workload` (the only one that counts toward closing a lease), `disruption` (an observed API signal, or a vanished/removing/dead container), `platform` (including a start the runtime refused, a startup crash in a launch Compose rejected, and a startup crash after a degraded launch), `maintenance` (restart/update/restore outcomes), `unknown` (a sweep-detected or partially observed death), `unhealthy` (a provision whose health check never passed, ENG-1125). Counts failures the lease actor records; a failed provision found at cold recovery and a maintenance outcome converged without an actor are not counted here. No lease label: use it for rates (sustained `platform`), never to page on `maintenance` or `tenant_workload`. See OPERATIONS.md for the alert set |
 | `fred_docker_backend_lease_pending_operation_unstamped_total` | counter | — | Provisions and restores that entered their in-flight state with a projection that could not await their exact operation (ENG-1125). Live recovery matches a failed operation to its projection only by that stamp, so such a lease can stay in flight until the backend restarts. The actor checks the claim before it fires either transition; any non-zero value is a bug |
 
-#### k3s backend (`/metrics` on the k3s-backend HTTP server)
-
-The k3s backend is an experimental, non-functional scaffold (ENG-133), but its binary still serves `GET /metrics` (default `:9002`) and increments three counters under `fred_k3s_backend_*`, mirroring the docker-backend names. Every series of its labeled counters exists at 0 from start.
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `fred_k3s_backend_provisions_total` | counter | `outcome` | Provision requests received by the k3s backend (`outcome` ∈ `accepted`/`rejected`) |
-| `fred_k3s_backend_callback_delivery_total` | counter | `outcome` | Callback delivery outcomes, one per overall delivery after retries (`outcome` ∈ `success`/`failure`) |
-| `fred_k3s_backend_callback_store_errors_total` | counter | — | Failures reading or writing durable callback evidence in the k3s backend, including interrupted-operation recovery |
-
 ### Logging (slog)
 
 Structured logging with consistent fields:
@@ -2402,7 +2386,6 @@ The full developer-facing test reference (commands, prerequisites, conventions) 
 | Integration (provisioner) | `_test.go` with no build tag | Full event flow with the in-memory mock backend. Watermill GoChannel transport. | `make test` |
 | Integration (Docker) | `_test.go` with `//go:build integration` | Real Docker daemon, real container lifecycle, the btrfs, XFS and ZFS quota tests, and `internal/fstree`'s mount-boundary tests. | `sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m` (root, Docker, the filesystem tools, `capsh` and `FRED_TEST_IMAGE_STORE`; see CONTRIBUTING.md) |
 | Integration (volumes) | Same, gated on root | A btrfs volume and quota subset; the XFS and ZFS quota tests run only in the full Docker suite. | `sudo -E env "PATH=$PATH" make test-integration-volume` |
-| Integration (k3s) | `cmd/k3s-backend/integration_test.go` (`//go:build integration`) | The real k3s-backend binary against a fake Kubernetes API; the test builds the binary itself, so no cluster is needed. | `make test-integration-k3s` |
 | Stress | `manager_stress_test.go` | 10K–1M event burst tests, sustained-load tests. | See [PERFORMANCE.md](PERFORMANCE.md#running-benchmarks); 500K/1M gated by `STRESS_TEST_LARGE=1` |
 | Bench | `*_bench_test.go` | Throughput and latency profiling. | `go test -bench=.` |
 | Fuzz | `func Fuzz…` targets (tar extraction, payload parsing, dirent parsing, ID round-trips, reconcile planning) | Parser robustness and planning invariants; each seed corpus also runs as an ordinary test. | `go test -run='^$' -fuzz=<FuzzName> <package>` |

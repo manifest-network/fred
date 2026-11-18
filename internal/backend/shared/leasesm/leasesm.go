@@ -28,7 +28,7 @@ import (
 // Phase is a substrate-agnostic container/instance lifecycle phase.
 //
 // PhaseUnknown is the iota zero value (deliberately first) because
-// Kubernetes pod status legitimately enters Unknown — defaulting to
+// a substrate can legitimately report an unknown status — defaulting to
 // any other phase would silently misclassify those cases as Running,
 // Exited, or Failed.
 //
@@ -36,8 +36,8 @@ import (
 // never decides whether a death counts against the terminal budget: that reads
 // InstanceState.Termination, which the substrate adapter mints itself, because
 // the mapping differs per substrate (Docker's PhaseFailed is a container being
-// removed or dead, while a Kubernetes container terminated with an exit code
-// reports PhaseFailed and is still the workload's own exit).
+// removed or dead, while another substrate may report PhaseFailed for what is
+// still the workload's own exit).
 type Phase int
 
 const (
@@ -46,21 +46,16 @@ const (
 	PhaseUnknown Phase = iota
 
 	// PhaseRunning means the instance is alive and operating. For
-	// Docker this maps to "running" or "paused" status; for K8s pods
-	// this maps to PodRunning with the relevant container in
-	// containerStatuses.state.running.
+	// Docker this maps to "running" or "paused" status.
 	PhaseRunning
 
 	// PhaseExited means the instance has terminated. ExitCode should
 	// be set when this phase is reported. Used for Docker "exited"
-	// status; K8s containerStatuses.state.terminated with reason
-	// "Completed" or similar non-failure terminations.
+	// status.
 	PhaseExited
 
 	// PhaseFailed means the instance was forcibly killed or otherwise
-	// terminated abnormally. Used for Docker "removing"/"dead";
-	// K8s containerStatuses.state.terminated with non-zero exit code
-	// or reasons like "OOMKilled", "Error", "ContainerCannotRun".
+	// terminated abnormally. Used for Docker "removing"/"dead".
 	PhaseFailed
 
 	// PhaseAbsent means the substrate positively observed that this exact
@@ -72,8 +67,7 @@ const (
 
 // InstanceState is a substrate-agnostic snapshot of a workload
 // instance. The Docker backend translates ContainerInfo into this
-// shape; the K3s backend will translate a Pod's containerStatuses
-// entry.
+// shape.
 //
 // OOMKilled is exposed as a separate field rather than encoded inside
 // Phase so callers can distinguish "exited cleanly" from "killed by
@@ -82,7 +76,7 @@ const (
 // ServiceName is the per-instance service name within a multi-service
 // (stack) deployment. It is a Fred-shared concept rather than a strict
 // substrate-level property — substrate adapters populate it from their
-// own conventions (Docker labels, K8s pod annotations, etc.) and leave
+// own conventions (Docker labels, for example) and leave
 // it empty for single-service leases where there is no meaningful
 // distinction. The SM uses it for log continuity at death events; no
 // behavior decisions branch on it.
@@ -103,8 +97,7 @@ type InstanceState struct {
 
 // InstanceInspector wraps the substrate-specific "inspect this
 // instance" operation. The Docker backend implements this around
-// DockerClient.InspectContainer; K3s will implement it around
-// pod-status inspection.
+// DockerClient.InspectContainer.
 type InstanceInspector interface {
 	InspectInstance(ctx context.Context, instanceID string) (*InstanceState, error)
 }
@@ -130,7 +123,7 @@ type DiagnosticsGatherer interface {
 // Manifest and StackManifest are substrate-shared schema (lifted to
 // internal/backend/shared/manifest in PR2) — they live here even
 // though substrates translate them to substrate-specific shapes
-// (Docker compose-spec, K8s pod spec) at provision time.
+// (Docker compose-spec) at provision time.
 type ProvisionState struct {
 	LeaseUUID    string
 	Tenant       string
@@ -318,8 +311,7 @@ type LeaseProvisionStore interface {
 // SMMetrics is the observability seam for substrate-specific metric
 // emission. Each substrate provides its own implementation, owning
 // the prometheus registry, naming, and labels — the Docker backend
-// keeps `fred_docker_backend_lease_*` names; K3s will choose its own
-// substrate-flavored namespacing. The SM/actor code calls these
+// keeps `fred_docker_backend_lease_*` names. The SM/actor code calls these
 // methods at fixed sites; the substrate adapter shapes the
 // counter/label semantics.
 //

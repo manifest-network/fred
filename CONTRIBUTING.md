@@ -22,7 +22,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 git clone https://github.com/manifest-network/fred.git
 cd fred
 go mod download
-make all              # builds the four daemons and both offline placement tools into ./build/
+make all              # builds the three daemons and both offline placement tools into ./build/
 make test             # all unit tests (runs the stress suite too; see Stress tests)
 ```
 
@@ -32,8 +32,6 @@ For an end-to-end local environment against a running chain, follow [Local Devel
 
 To exercise the provisioner without Docker, follow [Local Fred Development with the Mock Backend](README.md#local-fred-development-with-the-mock-backend). That recipe persists `MOCK_BACKEND_STORAGE_ID`, starts the mock, initializes fresh placement authority, and starts `providerd` with the matching configuration. Reuse the stored identity on mock restarts. The mock ignores SKUs and simulates provisioning.
 
-The experimental K3s backend can be built with `make build-k3s` and run with `make run-k3s`, which reads `config.k3s.yaml` (override via `K3S_BACKEND_CONFIG=...`). That file is not tracked: copy `config.k3s.yaml.example` and follow its quick start. Startup refuses an unsealed storage identity, so first seal it once against a reachable cluster with `./build/k3s-backend -config config.k3s.yaml -initialize-storage-identity new`. It is a non-functional scaffold (see *Project layout*) — the provisioner is a stub.
-
 ---
 
 ## Project layout
@@ -42,7 +40,6 @@ The experimental K3s backend can be built with `make build-k3s` and run with `ma
 cmd/
 ├── providerd/          Main daemon (chain ↔ backends, tenant API)
 ├── docker-backend/     Production Docker backend
-├── k3s-backend/        Experimental K3s backend (scaffold, non-functional)
 ├── mock-backend/       Test/dev backend
 ├── placement-preflight/ Offline inventory proof and placement initialization/upgrade
 ├── placement-repair/   Offline placement-authority repair
@@ -145,13 +142,12 @@ Integration tests require a running Docker Engine 28.1+ daemon and use the `inte
 sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker integration suite (also sweeps the slower retain/restore tests; ~15-25 min, so raise the 15m default ceiling)
 make test-integration-stack        # stack/compose-based provisions
 make test-integration-restart-update   # restart, update, release-history flows
-make test-integration-k3s          # k3s-backend integration tests (self-builds the binary)
 sudo -E env "PATH=$PATH" make test-integration-volume  # btrfs quota subset (root + btrfs-progs)
 ```
 
 Volume tests need root because they create loopback filesystems, set filesystem quotas, and manage ZFS pools. The full suite covers btrfs, XFS project quotas, and ZFS, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the btrfs subset. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the btrfs, XFS and ZFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). A separate unprivileged job runs `make test-integration-k3s`. The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the btrfs, XFS and ZFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 
@@ -242,7 +238,7 @@ Look at `internal/scheduler/doc.go` or `internal/backend/docker/doc.go` for the 
 1. Define the metric in the package owned by the binary that writes it. **Which package is not a filing decision — it decides which binaries export the metric.** Collectors are created with `promauto`, which registers on the default registerer at *package init*, so every binary linking that package exports the metric whether or not it has a call site. An unlabelled one then sits at a permanent 0 on processes that can never write it, and a 0 satisfies ordinary gauge comparisons — that is ENG-712, where `fred_signer_pool_lane_count < 3` matched every docker-backend and missed the only host with a signer pool.
 
    - only providerd writes it → `internal/metrics/metrics.go`;
-   - only one backend writes it → that backend's `metrics.go` (`internal/backend/docker/`, `internal/backend/k3s/`), with its series bound in the same package's `series.go`;
+   - only one backend writes it → that backend's `metrics.go` (`internal/backend/docker/`), with its series bound in the same package's `series.go`;
    - more than one binary writes it, **or** it belongs to the `fred_background_*` panic family → `internal/metrics/background`, where it **must** carry labels: a `*Vec` registers just as eagerly but exports no series until a package binds a component, which is what makes it free for a binary that never runs one. A component's counter is a package-level variable (`background.CleanupPanics("name")`) of the package that runs it. Label-bearing is the membership rule, not "written by everyone" — the goroutine-panic family has providerd-only components and lives there deliberately, keeping the family whole so the next backend that needs a panic counter does not re-import `internal/metrics`;
    - shared code that must reference no collector at all → take one by injection, as `backend.RouterConfig.RoutingFallback` and `backend.HTTPClientOptions.RequestCounters` do, and wire it in `cmd/providerd`.
 

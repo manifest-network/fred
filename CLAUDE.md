@@ -4,7 +4,7 @@
 
 Fred is the Manifest Network **provider daemon**: it watches the chain for lease events and drives provisioning through pluggable backends. `providerd` and a backend are **separate processes** over HTTP, HMAC-SHA256-authenticated in both directions (`X-Fred-Signature`; canonical string = timestamp + method + request URI + sha256(body)). Fred → backend is a request; backend → Fred a callback. Changing one side's wire shape means changing the other **and** `BACKEND_GUIDE.md`.
 
-`make all` builds six binaries; `providerd`, `docker-backend`, the offline `placement-preflight` inspector/preparer/initializer, and the offline `placement-repair` tool are released. `placement-preflight` is read-only by default; only explicit `-prepare` or `-initialize-fresh` modes write. `mock-backend` is for dev/E2E, and **`k3s-backend` is a non-functional scaffold (ENG-133)** — it serves the backend contract, but every provision returns `failed / "not implemented"` (`internal/backend/k3s/provision_stub.go`). `cmd/loadtest` and `cmd/lease-token` have no make target — `go run ./cmd/<name>`.
+`make all` builds five binaries; `providerd`, `docker-backend`, the offline `placement-preflight` inspector/preparer/initializer, and the offline `placement-repair` tool are released. `placement-preflight` is read-only by default; only explicit `-prepare` or `-initialize-fresh` modes write. `mock-backend` is for dev/E2E. `cmd/loadtest` and `cmd/lease-token` have no make target — `go run ./cmd/<name>`.
 
 ## Commands
 
@@ -22,7 +22,6 @@ make lint                    # go vet + golangci-lint
 ```bash
 sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker suite, slow
 sudo -E env "PATH=$PATH" make test-integration-volume   # btrfs-loopback subset, NOT the XFS/ZFS quota tests
-make test-integration-k3s                               # self-builds the binary, no cluster needed
 ```
 
 `sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + btrfs-progs + xfsprogs + zfsutils + capsh (libcap2-bin), and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one `TestIntegration_…`.

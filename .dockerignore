@@ -10,11 +10,11 @@ build/
 *.swo
 config.yaml
 config-*.yaml
+config.*.yaml
 config.docker.yaml
-config.k3s.yaml
 config.mock.yaml
 docker-backend.yaml
-k3s-backend.yaml
+*-backend.yaml
 *.pem
 *.key
 *.crt
@@ -31,7 +31,6 @@ docs/
 loadtest
 mock-backend
 docker-backend
-k3s-backend
 providerd
 scripts/
 *.md
