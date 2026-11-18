@@ -2452,7 +2452,7 @@ func TestIntegration_Docker_UpdateUnhealthyTargetRestoresFrozenSource(t *testing
 		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, "")
 	})
 	t.Run("stateful", func(t *testing.T) {
-		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, setupBtrfsLoopback(t))
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, setupXFSLoopback(t))
 	})
 }
 
@@ -2466,7 +2466,7 @@ func testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t *testing.T, moun
 		if mountPath != "" {
 			cfg.VolumeDataPath = mountPath
 			cfg.VolumeMountPath = mountPath
-			cfg.VolumeFilesystem = "btrfs"
+			cfg.VolumeFilesystem = "xfs"
 		}
 	})
 	ctx := t.Context()
@@ -2720,14 +2720,14 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 }
 
 func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 	})
 
 	ctx := context.Background()
@@ -2795,14 +2795,14 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 }
 
 func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 	})
 
 	ctx := context.Background()

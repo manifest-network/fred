@@ -21,9 +21,9 @@ import (
 )
 
 // TestIntegration_Docker_RetainRestoreLifecycle exercises the full soft-delete
-// + restore round-trip on real Docker + btrfs:
+// + restore round-trip on real Docker + XFS:
 //
-//  1. Provision a stateful redis:7 lease (VOLUME /data → btrfs subvolume).
+//  1. Provision a stateful redis:7 lease (VOLUME /data → XFS project directory).
 //  2. Write a sentinel into /data inside the container.
 //  3. Deprovision with RetainOnClose → the canonical volume is renamed into the
 //     retained namespace (fred-retained-...) and a retention record is written.
@@ -34,14 +34,14 @@ import (
 //     retention record is deleted, the new lease's canonical volume exists, and
 //     the retained volume is gone.
 func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		// Disable the background reaper so it doesn't race the test assertions.
 		cfg.RetentionMaxAge = 0 // 0 = reaping disabled
@@ -100,9 +100,9 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 	// Wait for Deprovisioned callback.
 	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
-	// ENG-329 ground truth: a real btrfs soft-delete must set Retained=true on the
+	// ENG-329 ground truth: a real XFS soft-delete must set Retained=true on the
 	// terminal deprovision callback (the best-effort push's observed outcome).
-	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag on the deprovision callback")
+	require.True(t, cb.Retained, "real XFS retain must set the ground-truth Retained flag on the deprovision callback")
 
 	// ── STEP 4a: Canonical volume is gone; retained volume exists ─────────
 	canonicalPath := filepath.Join(mountPath, canonicalVolumeID)
@@ -202,7 +202,7 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 // reaper hard-deletes a soft-deleted lease's record and retained volume once the
 // (tiny) grace window elapses.
 func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	// Grace window sized so the record is deterministically observable AFTER
@@ -217,7 +217,7 @@ func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionMaxAge = graceMaxAge
 		cfg.RetentionReapInterval = reapInterval

@@ -1279,7 +1279,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 }
 
 func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024
@@ -1323,7 +1323,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		cfg.RetentionMaxAge = 0 // reaper OFF: assert soft-delete persists
@@ -1411,7 +1411,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 // active release and re-provision the lease onto the same data, instead of
 // retrying "payload not available" forever.
 func TestIntegration_Reconciler_RestoredLeaseReprovisionsAfterContainerLoss(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	sourceLease := newIntegrationLeaseUUID()
 	restoredLease := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
@@ -1470,7 +1470,7 @@ func TestIntegration_Reconciler_RestoredLeaseReprovisionsAfterContainerLoss(t *t
 	env := testReconcilerSetup(t, mockChain, func(cfg *Config) {
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		cfg.RetentionMaxAge = 0
@@ -1607,7 +1607,7 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 }
 
 func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small"
@@ -1621,7 +1621,7 @@ func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	mgr, b, callbackCh, callbackURL := testManagerSetup(t, mockChain, func(cfg *Config) {
 		cfg.VolumeDataPath = mountPath // REQUIRED: empty would zero docker-small's DiskMB → stateless → nothing to retain
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		cfg.RetentionMaxAge = 0
@@ -1645,7 +1645,7 @@ func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
 	execInContainer(t, getContainerID(t, leaseUUID), []string{"sh", "-c", "echo mgr-event-sentinel > /data/sentinel.txt"})
 
 	// Drive the on-chain close as an event through the real Manager. LeaseExpired is
-	// intentionally not a second btrfs run — HandleLeaseExpired calls processLeaseClose
+	// intentionally not a second XFS run — HandleLeaseExpired calls processLeaseClose
 	// verbatim (handler_set.go:126-136), so this also covers the expiry route.
 	require.NoError(t, mgr.PublishLeaseEvent(chain.LeaseEvent{
 		Type: chain.LeaseClosed, LeaseUUID: leaseUUID, ProviderUUID: providerUUID, Tenant: tenant,

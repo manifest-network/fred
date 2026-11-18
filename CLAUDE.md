@@ -21,7 +21,7 @@ make lint                    # go vet + golangci-lint
 
 ```bash
 sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker suite, slow
-sudo -E env "PATH=$PATH" make test-integration-volume   # btrfs-loopback subset, NOT the XFS quota tests
+sudo -E env "PATH=$PATH" make test-integration-volume   # provision-path subset on an XFS loopback, NOT the XFS quota tests
 ```
 
 `sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + btrfs-progs + xfsprogs + capsh (libcap2-bin), and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one `TestIntegration_…`.

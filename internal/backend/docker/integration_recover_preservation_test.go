@@ -26,7 +26,7 @@ import (
 // reservation, no container" state against a REAL Docker daemon:
 //
 //  1. Provision a real stateful lease (docker-small, DiskMB=1024) on a real
-//     btrfs-quota'd volume — a real pool reservation is made and a real
+//     XFS project-quota'd volume — a real pool reservation is made and a real
 //     container is created.
 //  2. Kill the container out-of-band (SIGKILL) so Docker still reports it,
 //     exited, then run recoverState so the lease observes the death and
@@ -47,7 +47,7 @@ import (
 // allowlist with "preserve every lease still tracked in b.provisions", which
 // this test locks in against the real pool + real Docker daemon.
 func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024 (defaultTestSKUProfiles)
@@ -58,7 +58,7 @@ func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		// Manual recoverState control only — no background reconcile loop and
 		// no reconciler in this test, matching
