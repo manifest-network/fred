@@ -295,96 +295,63 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 	})
 }
 
-// TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems drives
-// the rollback quota helper through every production volumeManager. It models a
+// TestIntegration_RestoreRollback_ReappliesSourceQuota drives the rollback
+// quota helper through the production XFS volumeManager. It models a
 // failed promote after Create raised the adopted volume to 100 MiB: once the
 // volume is re-quarantined, rollback must restore the retained source's exact
 // 20 MiB cap before that source can become authoritative again.
-func TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems(t *testing.T) {
-	type setupResult struct {
-		mgr      volumeManager
-		xfsMount string
+func TestIntegration_RestoreRollback_ReappliesSourceQuota(t *testing.T) {
+	const oldCapMiB, promotedCapMiB = int64(20), int64(100)
+	ctx := context.Background()
+	mount := setupXFSLoopback(t)
+	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	orig := newIntegrationLeaseUUID()
+	destination := newIntegrationLeaseUUID()
+	canonical := canonicalVolumeName(orig, "app", 0)
+	retained := retainedName(canonical)
+	newCanonical := canonicalVolumeName(destination, "app", 0)
+
+	hostPath, _, err := mgr.Create(ctx, canonical, oldCapMiB)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(hostPath, "seed.bin"), make([]byte, 5*bytesPerMiB), 0o600,
+	))
+	require.NoError(t, mgr.RenameVolume(ctx, canonical, retained))
+	require.NoError(t, mgr.RenameVolume(ctx, retained, newCanonical))
+	_, _, err = mgr.Create(ctx, newCanonical, promotedCapMiB)
+	require.NoError(t, err, "promote must first raise the physical quota")
+	require.NoError(t, mgr.RenameVolume(ctx, newCanonical, retained))
+	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
+
+	b := newBackendForTest(&mockDockerClient{}, nil)
+	useVolumeManager(b, mgr)
+	rec := &shared.RetentionEntry{
+		OriginalLeaseUUID: orig,
+		NewLeaseUUID:      destination,
+		Items: []backend.LeaseItem{{
+			SKU: "old-tier", ServiceName: "app", Quantity: 1,
+		}},
+		ResourceProfiles: []shared.SKUResourceSnapshot{{
+			SKU: "old-tier", CPUCores: 1, MemoryMB: 512, DiskMB: oldCapMiB,
+		}},
+		RetainedVolumeNames: []string{retained},
+		Status:              shared.RetentionStatusRestoring,
+		Generation:          1,
 	}
-	cases := []struct {
-		name  string
-		setup func(*testing.T) setupResult
-	}{
-		{
-			name: "btrfs",
-			setup: func(t *testing.T) setupResult {
-				return setupResult{mgr: &btrfsVolumeManager{
-					dataPath: setupBtrfsLoopback(t), logger: slog.Default(),
-				}}
-			},
-		},
-		{
-			name: "xfs",
-			setup: func(t *testing.T) setupResult {
-				mount := setupXFSLoopback(t)
-				mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
-				require.NoError(t, err)
-				return setupResult{mgr: mgr, xfsMount: mount}
-			},
-		},
-	}
+	profiles, err := b.restoreRetainedVolumeQuotas(ctx, rec)
+	require.NoError(t, err)
+	require.Equal(t, rec.ResourceProfiles, profiles)
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			const oldCapMiB, promotedCapMiB = int64(20), int64(100)
-			ctx := context.Background()
-			setup := tc.setup(t)
-			mgr := setup.mgr
-			orig := newIntegrationLeaseUUID()
-			destination := newIntegrationLeaseUUID()
-			canonical := canonicalVolumeName(orig, "app", 0)
-			retained := retainedName(canonical)
-			newCanonical := canonicalVolumeName(destination, "app", 0)
-
-			hostPath, _, err := mgr.Create(ctx, canonical, oldCapMiB)
-			require.NoError(t, err)
-			require.NoError(t, os.WriteFile(
-				filepath.Join(hostPath, "seed.bin"), make([]byte, 5*bytesPerMiB), 0o600,
-			))
-			require.NoError(t, mgr.RenameVolume(ctx, canonical, retained))
-			require.NoError(t, mgr.RenameVolume(ctx, retained, newCanonical))
-			_, _, err = mgr.Create(ctx, newCanonical, promotedCapMiB)
-			require.NoError(t, err, "promote must first raise the physical quota")
-			require.NoError(t, mgr.RenameVolume(ctx, newCanonical, retained))
-			t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
-
-			b := newBackendForTest(&mockDockerClient{}, nil)
-			useVolumeManager(b, mgr)
-			rec := &shared.RetentionEntry{
-				OriginalLeaseUUID: orig,
-				NewLeaseUUID:      destination,
-				Items: []backend.LeaseItem{{
-					SKU: "old-tier", ServiceName: "app", Quantity: 1,
-				}},
-				ResourceProfiles: []shared.SKUResourceSnapshot{{
-					SKU: "old-tier", CPUCores: 1, MemoryMB: 512, DiskMB: oldCapMiB,
-				}},
-				RetainedVolumeNames: []string{retained},
-				Status:              shared.RetentionStatusRestoring,
-				Generation:          1,
-			}
-			profiles, err := b.restoreRetainedVolumeQuotas(ctx, rec)
-			require.NoError(t, err)
-			require.Equal(t, rec.ResourceProfiles, profiles)
-
-			if tc.name == "xfs" {
-				require.Equal(t, oldCapMiB*bytesPerMiB,
-					xfsBhardBytes(t, setup.xfsMount, mgr, retained),
-					"XFS hard quota must be restored exactly")
-			}
-			// Existing data is ~5 MiB; a fresh 25 MiB incompressible write must
-			// cross the restored 20 MiB cap. This enforcement probe is common to
-			// btrfs qgroup and XFS project quota.
-			out, writeErr := exec.Command(
-				"dd", "if=/dev/urandom", "of="+filepath.Join(mgr.HostPath(retained), "probe.bin"),
-				"bs=1M", "count=25",
-			).CombinedOutput()
-			require.Error(t, writeErr,
-				"%s must enforce the restored source cap; dd output: %s", tc.name, out)
-		})
-	}
+	require.Equal(t, oldCapMiB*bytesPerMiB,
+		xfsBhardBytes(t, mount, mgr, retained),
+		"XFS hard quota must be restored exactly")
+	// Existing data is ~5 MiB; a fresh 25 MiB incompressible write must
+	// cross the restored 20 MiB cap.
+	out, writeErr := exec.Command(
+		"dd", "if=/dev/urandom", "of="+filepath.Join(mgr.HostPath(retained), "probe.bin"),
+		"bs=1M", "count=25",
+	).CombinedOutput()
+	require.Error(t, writeErr,
+		"XFS must enforce the restored source cap; dd output: %s", out)
 }

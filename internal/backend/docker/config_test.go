@@ -534,20 +534,22 @@ func TestConfig_Validate_Volume(t *testing.T) {
 		assert.ErrorContains(t, err, "volume_data_path must not contain whitespace")
 	})
 
-	t.Run("valid volume_filesystem values", func(t *testing.T) {
-		for _, fs := range []string{"btrfs", "xfs"} {
-			cfg := validConfig()
-			cfg.VolumeFilesystem = fs
-			assert.NoError(t, cfg.Validate(), "filesystem %q should be valid", fs)
-		}
+	t.Run("xfs is the valid volume_filesystem", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.VolumeFilesystem = "xfs"
+		assert.NoError(t, cfg.Validate())
 	})
 
+	// btrfs and zfs were supported once; a config that still names either must
+	// be refused at validation rather than silently treated as XFS.
 	t.Run("invalid volume_filesystem", func(t *testing.T) {
-		cfg := validConfig()
-		cfg.VolumeFilesystem = "ext4"
-		err := cfg.Validate()
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "volume_filesystem must be btrfs or xfs")
+		for _, fs := range []string{"btrfs", "zfs", "ext4"} {
+			cfg := validConfig()
+			cfg.VolumeFilesystem = fs
+			err := cfg.Validate()
+			require.Error(t, err, "filesystem %q must be rejected", fs)
+			assert.ErrorContains(t, err, `volume_filesystem must be xfs (got "`+fs+`")`)
+		}
 	})
 
 	t.Run("empty volume_filesystem is valid", func(t *testing.T) {

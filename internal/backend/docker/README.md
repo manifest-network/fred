@@ -586,7 +586,7 @@ ingress:
 |---|---|---|---|---|
 | VolumeDataPath | `volume_data_path` | string | *(empty)* | Host directory for managed durable and writable-path scratch volumes. Required when any SKU has `disk_mb > 0`; optional on an all-diskless host |
 | VolumeMountPath | `volume_mount_path` | string | *(empty)* | Operator-declared active mount containing `volume_data_path`. Required and runtime-verified whenever `volume_data_path` is set, including an all-diskless managed-scratch deployment |
-| VolumeFilesystem | `volume_filesystem` | string | *(auto-detected)* | Filesystem type: `btrfs` or `xfs`. Auto-detected from `volume_data_path` if empty. **Only `xfs` is validated in production** — see [Supported Filesystems](#supported-filesystems) |
+| VolumeFilesystem | `volume_filesystem` | string | *(auto-detected)* | Filesystem type; `xfs` is the only accepted value. May be left empty. See [Supported Filesystems](#supported-filesystems) |
 | MinAvgFileBytes | `min_avg_file_bytes` | int64 | 1024 | Smallest avg file size before the per-volume inode ceiling binds. On XFS, derives the `ihard` quota (disk_mb × 1 MiB / min_avg_file_bytes, floored at 262144 inodes); the same value also caps tar-extraction entry count during writable-path image seeding on any backend. |
 
 When any SKU profile has `disk_mb > 0`, the backend manages quota-enforced host
@@ -602,11 +602,10 @@ is best-effort and skipped, while the conservative pool reservation remains.
 | Filesystem | Mechanism | Requirements | Production status |
 |---|---|---|---|
 | **xfs** | Project quotas | `pquota` mount option, `xfs_quota` binary; daemon `CAP_SYS_ADMIN` | **Validated — use this in production** |
-| **btrfs** | Subvolumes with qgroup quotas | `btrfs quota enable` on the filesystem; daemon `CAP_SYS_ADMIN` | Experimental — automated tests, not production-validated or deployed |
 
-> **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. The **`btrfs`** backend has automated coverage but is **not production-validated and not used in any deployment** — treat it as experimental. In particular, the inode-exhaustion backstops that XFS enforces via kernel project quotas have no equivalent production evidence on btrfs. Use `xfs` for any production deployment.
+> **Production support:** **`xfs` is the only filesystem validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. `volume_filesystem` accepts only `xfs`, and a `volume_data_path` on any other filesystem fails startup.
 
-> **Capability requirement (xfs/btrfs):** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` on an xfs or btrfs backend. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Giving each volume subdirectory to the container's user, root included, needs `CAP_CHOWN`, and managing the resulting tenant-owned trees needs `CAP_DAC_OVERRIDE`. Grant them ambiently — `AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota`/`btrfs` child processes. `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
+> **Capability requirement:** setting a volume's block-quota limit is a privileged operation, so the docker-backend must hold `CAP_SYS_ADMIN` whenever managed volumes are configured. The daemon **fails fast at startup** if it lacks it (`internal/backend/docker/capability.go`) rather than provisioning with silently-unenforced disk caps. Repairing a pre-existing tenant-owned volume root additionally needs `CAP_FOWNER`. Giving each volume subdirectory to the container's user, root included, needs `CAP_CHOWN`, and managing the resulting tenant-owned trees needs `CAP_DAC_OVERRIDE`. Grant them ambiently — `AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN CAP_FOWNER` on the systemd unit; a plain `setcap cap_sys_admin+ep` on the binary does **not** propagate to the exec'd `xfs_quota` child processes. `noop` is unaffected. See [DEPLOYMENT.md](../../../DEPLOYMENT.md#xfs-good-for-large-fleets) and its [systemd section](../../../DEPLOYMENT.md#process-management-systemd) for the full setup.
 
 XFS startup and reuse inspect only the descriptor-bound root project ID and
 inheritance flag, repair that already-open inode with XFS ioctls when necessary,
@@ -639,7 +638,7 @@ use the separate host scratch described above.
 ```yaml
 volume_data_path: "/var/lib/fred/volumes"
 volume_mount_path: "/var/lib/fred/volumes"
-# volume_filesystem: "xfs"  # optional, auto-detected (xfs is the only production-validated backend)
+# volume_filesystem: "xfs"  # optional; xfs is the only supported filesystem
 
 sku_profiles:
   docker-redis:

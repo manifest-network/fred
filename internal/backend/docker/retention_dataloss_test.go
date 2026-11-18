@@ -587,9 +587,12 @@ func TestOrphanReconcile_UnmountedRootDoesNotPruneLiveRecords(t *testing.T) {
 	vol := "fred-u1-app-0"
 	require.NoError(t, os.MkdirAll(filepath.Join(root, vol), 0o755))
 
-	// btrfs is used only because its List is the plain enumeration with no external tooling;
-	// the guard under test is shared by all three managers.
-	mgr := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
+	// Built directly: List is a plain enumeration that needs no XFS tooling, and the guard
+	// under test lives in the root watch.
+	mgr := &xfsVolumeManager{
+		dataPath: root, mountPoint: root, logger: slog.Default(),
+		activeIDs: make(map[uint32]string), volumeToID: make(map[string]uint32),
+	}
 
 	b := newBackendForTest(&mockDockerClient{}, nil)
 	b.cfg.VolumeDataPath = root // exists → the G2 gate passes, exactly as it would post-unmount

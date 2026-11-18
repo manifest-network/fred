@@ -15,10 +15,6 @@ func pinManagedNamespaceRoot(path string) (*fsidentity.Directory, error) {
 	return root, err
 }
 
-func (b *btrfsVolumeManager) PinNamespaceRoot(name managedVolumeName) (*fsidentity.Directory, error) {
-	return pinManagedNamespaceRoot(b.HostPath(name.value()))
-}
-
 func (x *xfsVolumeManager) PinNamespaceRoot(name managedVolumeName) (*fsidentity.Directory, error) {
 	return pinManagedNamespaceRoot(x.HostPath(name.value()))
 }

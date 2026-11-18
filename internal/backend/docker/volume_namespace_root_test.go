@@ -28,7 +28,6 @@ func TestVolumeAccessNamespaceRootProofDistinguishesAbsenceFromUnreadable(t *tes
 	name, _ := namespaceNames(t)
 	rootPath := t.TempDir()
 	managers := []volumeReader{
-		&btrfsVolumeManager{dataPath: rootPath},
 		&xfsVolumeManager{dataPath: rootPath},
 	}
 	path := filepath.Join(rootPath, name.value())

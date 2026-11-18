@@ -270,7 +270,10 @@ func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testi
 			name := canonicalVolumeName(leaseUUID, "app", 0)
 			artifact := filepath.Join(root, name)
 			test.plant(t, artifact)
-			manager := &btrfsVolumeManager{dataPath: root, logger: slog.Default()}
+			manager := &xfsVolumeManager{
+				dataPath: root, mountPoint: root, logger: slog.Default(),
+				activeIDs: make(map[uint32]string), volumeToID: make(map[string]uint32),
+			}
 
 			inventory, err := attestManagedVolumeInventory(t.Context(), manager)
 			require.NoError(t, err)

@@ -348,12 +348,11 @@ func TestVolumeOp_Partition_StoreError_Refuses(t *testing.T) {
 }
 
 // TestAssertVolumeDestroyer_AcceptsEveryRealManager guards the startup check against
-// becoming a tripwire on a healthy configuration: all three production managers must pass.
+// becoming a tripwire on a healthy configuration: both production managers must pass.
 func TestAssertVolumeDestroyer_AcceptsEveryRealManager(t *testing.T) {
 	for _, vm := range []volumeManager{
 		&noopVolumeManager{},
 		&xfsVolumeManager{},
-		&btrfsVolumeManager{},
 	} {
 		assert.NoError(t, assertVolumeDestroyer(vm), "%T is a production manager and must be destroy-capable", vm)
 	}

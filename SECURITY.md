@@ -357,7 +357,7 @@ runtime lineage drift deletes the header and returns `503`.
 
 Storage-lineage proof does not accept a canonical-looking directory name as
 substrate authority. Every managed name is parsed as one typed path component
-and then proved as an actual Btrfs subvolume or a real directory on the configured
+and then proved as a real directory on the configured
 XFS root with a regular no-follow nonzero project-ID marker. Container bind evidence
 must independently match its label-derived volume and exact target-derived
 subtree, with no symlink in any component. The XFS marker is durable project-ID
@@ -383,7 +383,7 @@ during a daemon/filesystem call; it cannot make an external daemon or CLI
 mutation atomic with the marker proof. Local recursive deletion and directory
 rename are descriptor-rooted after exact managed-volume-name validation, and
 XFS project-marker access uses attested, no-follow descriptor lookups. External
-Docker, btrfs, and xfs_quota operations still require a substrate-native
+Docker and xfs_quota operations still require a substrate-native
 generation/CAS primitive to close the residual same-root replacement window.
 Live XFS quota repair reads and changes only the pinned volume-root inode with
 `FS_IOC_FSGETXATTR` / `FS_IOC_FSSETXATTR`, preserving unrelated attributes and
@@ -487,7 +487,7 @@ Stateful-volume seed data is extracted from tenant-controlled container images v
 - **Permission stripping:** setuid/setgid bits are cleared on every entry; ownership uses `Root.Lchown` (never `Chown`) so a symlink is never followed during the ownership change.
 - **Symlinks:** links whose targets point outside the root are still created but are harmless — `os.Root` refuses to extract any *later* entry *through* them, and they only resolve inside the bind-mounted container.
 - **Byte budget (overflow-safe):** each regular file is checked against the *remaining* budget (`maxBytes - totalBytes`) rather than a running sum, so a tenant-controlled `hdr.Size` near `math.MaxInt64` cannot overflow past the gate; negative sizes are rejected outright. This bounds zip-bomb / oversized-image extraction.
-- **Entry-count cap (`maxEntries`, ENG-548):** the number of extracted entries (dirs/files/symlinks) is capped per writable path, so a crafted image can't flood the host with zero-byte files. It is applied per path rather than shared across paths — on a filesystem without an inode quota (btrfs) the effective bound across all of a container's writable paths is therefore `maxDetectedWritablePaths × maxEntries`, not `maxEntries` alone; on XFS, the volume-wide `ihard` project quota is the true cross-path gate.
+- **Entry-count cap (`maxEntries`, ENG-548):** the number of extracted entries (dirs/files/symlinks) is capped per writable path, so a crafted image can't flood the host with zero-byte files. It is applied per path rather than shared across paths, so on its own it bounds all of a container's writable paths at `maxDetectedWritablePaths × maxEntries`, not `maxEntries` alone; the volume-wide XFS `ihard` project quota is the true cross-path gate.
 
 ## Rate Limiting
 
@@ -682,7 +682,7 @@ Every container created by the Docker backend runs with these security measures:
 | Tmpfs for writable paths | `/tmp` and `/run` mounted as tmpfs | Size from `container_tmpfs_size_mb` (default 64MB) |
 | PID limit | `PidsLimit: 256` | Configurable via `container_pids_limit` |
 | No swap | `MemorySwap == Memory` | Prevents swap usage entirely |
-| Per-volume disk quota | `bhard` block limit (xfs project quota / btrfs qgroup) | Enforces the SKU `disk_mb` cap on stateful volumes; requires the daemon capability noted below |
+| Per-volume disk quota | `bhard` block limit (xfs project quota) | Enforces the SKU `disk_mb` cap on stateful volumes; requires the daemon capability noted below |
 | Per-volume inode quota | `ihard` limit (xfs project quota) | Bounds host inode exhaustion from zero-byte file floods; same `xfs_quota` call and `CAP_SYS_ADMIN` requirement as the disk quota above (ENG-548) |
 | Restart policy disabled | `RestartPolicyDisabled` | Failed containers stay dead for crash detection |
 | Network isolation | Per-lease bridge network; leases of the same tenant cannot reach each other | Configurable via `network_isolation` |
@@ -690,7 +690,7 @@ Every container created by the Docker backend runs with these security measures:
 Network isolation places each lease's containers in a dedicated Docker bridge network. Docker's `DOCKER-ISOLATION` iptables chains drop forwarded traffic between different bridge networks, so leases cannot reach each other, even leases of the same tenant. Containers created before v0.14 stay on their tenant network until they are recreated (see OPERATIONS.md, Runtime refresh).
 
 **Daemon capabilities vs. container privileges.** Tenant containers run with
-`CapDrop: ["ALL"]`. The docker-backend daemon needs `CAP_SYS_ADMIN` for XFS/btrfs
+`CapDrop: ["ALL"]`. The docker-backend daemon needs `CAP_SYS_ADMIN` for XFS
 quota limits, granted by systemd capabilities or by running as root; startup
 rejects a missing capability (`internal/backend/docker/capability.go`). The noop backend is exempt. Repairing an XFS
 root inode owned by another UID can additionally need `CAP_FOWNER`. Live repair

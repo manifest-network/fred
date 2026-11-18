@@ -229,7 +229,7 @@ func TestProjidAuditReportsATreeChangedMidWalk(t *testing.T) {
 // listedFirst returns a file and a directory name, both absent from dir,
 // such that a listing of dir holding just the two lists the file first.
 // Directory order is the filesystem's (os.ReadDir would sort it, so the
-// listing is read unsorted): hashed on ext4 and btrfs, newest first on
+// listing is read unsorted): hashed on ext4, newest first on
 // tmpfs. Candidates are tried in both creation orders until one fits.
 func listedFirst(t *testing.T, dir string) (file, sub string) {
 	t.Helper()
@@ -520,10 +520,8 @@ func TestProjidAuditSkipsUnsupportedManagers(t *testing.T) {
 	before := auditCounters()
 	auditor.passWithin(t.Context(), time.Minute)
 	requireAuditDeltas(t, before, nil)
-	for _, manager := range []volumeReader{&noopVolumeManager{}, &btrfsVolumeManager{}} {
-		_, err := manager.OpenProjectIDAudit(t.Context(), mustManagedVolumeName(t, auditVolumeName(20)))
-		require.ErrorIs(t, err, errProjectIDAuditUnsupported)
-	}
+	_, err := (&noopVolumeManager{}).OpenProjectIDAudit(t.Context(), mustManagedVolumeName(t, auditVolumeName(20)))
+	require.ErrorIs(t, err, errProjectIDAuditUnsupported)
 	var nilAuditor *projidAuditor
 	nilAuditor.pass(t.Context())
 }

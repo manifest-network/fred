@@ -15,7 +15,7 @@ package provisioner
 // and lets a test fault any single server mid-run. It deliberately carries no
 // build tag: it needs no Docker, no root and no network beyond loopback, so it
 // belongs in the ordinary `go test -short ./...` job on every PR. Behind the
-// `integration` tag it would instead ride the privileged root+btrfs+Docker
+// `integration` tag it would instead ride the privileged root+XFS+Docker
 // workflow — tens of minutes, and gated on an environment none of these tests need.
 
 import (

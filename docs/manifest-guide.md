@@ -644,7 +644,7 @@ Each field also has its own range: health check timings are `0` (use the default
 
 ### Redis (Stateful)
 
-Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision. Quota enforcement here requires the operator to run Fred on a quota-capable filesystem and, on xfs/btrfs, to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
+Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automatically discovered and bind-mounted to a quota-enforced host directory. Data persists across container restarts and re-provisions but is destroyed on deprovision. Quota enforcement here requires the operator to run Fred on XFS with project quotas and to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
 
 ```json
 {
@@ -664,7 +664,7 @@ Requires a stateful SKU with `disk_mb > 0`. The image's `VOLUME /data` is automa
 
 ### PostgreSQL (User Override + Stateful)
 
-Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume ownership for `postgres` images, but setting `user` explicitly is recommended for clarity and to ensure correct behavior across image versions. Quota enforcement of the data volume requires the operator to run Fred on a quota-capable filesystem and, on xfs/btrfs, to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
+Requires a stateful SKU with `disk_mb > 0`. The backend auto-detects the volume ownership for `postgres` images, but setting `user` explicitly is recommended for clarity and to ensure correct behavior across image versions. Quota enforcement of the data volume requires the operator to run Fred on XFS with project quotas and to grant the backend the required Linux capabilities; see `DEPLOYMENT.md`.
 
 ```json
 {

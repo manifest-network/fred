@@ -30,68 +30,6 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
-// setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
-// Returns the mount path. Cleanup is registered via t.Cleanup.
-// Skips the test if requirements (root, btrfs-progs) are not met.
-//
-// Only the tests of the btrfs driver itself use this fixture. Everything that
-// needs a real managed volume without caring which driver backs it stands on
-// setupXFSLoopback, the production filesystem.
-func setupBtrfsLoopback(t *testing.T) string {
-	t.Helper()
-
-	// Must be root to mount filesystems
-	if os.Getuid() != 0 {
-		t.Skip("btrfs loopback requires root")
-	}
-
-	// Check btrfs tools
-	if _, err := exec.LookPath("mkfs.btrfs"); err != nil {
-		t.Skip("mkfs.btrfs not found:", err)
-	}
-	if _, err := exec.LookPath("btrfs"); err != nil {
-		t.Skip("btrfs not found:", err)
-	}
-
-	tmpDir := t.TempDir()
-	imgFile := filepath.Join(tmpDir, "btrfs.img")
-	mountDir := filepath.Join(tmpDir, "mnt")
-	require.NoError(t, os.MkdirAll(mountDir, 0755))
-
-	// Create sparse file (256MB)
-	out, err := exec.Command("truncate", "-s", "256M", imgFile).CombinedOutput()
-	require.NoError(t, err, "truncate: %s", out)
-
-	// Format as btrfs
-	out, err = exec.Command("mkfs.btrfs", "-f", imgFile).CombinedOutput()
-	require.NoError(t, err, "mkfs.btrfs: %s", out)
-
-	// Mount with loop. Loop-device support is a prerequisite just like root and
-	// btrfs-progs above, but it can't be probed reliably ahead of time. Some
-	// environments (containers, restricted/hardened hosts, many CI runners) have
-	// no usable loop devices even as root, where `mount -o loop` fails with a
-	// "failed to set up loop device" error. Skip there rather than fail — only a
-	// genuine (non-loop) mount error should fail the test.
-	out, err = exec.Command("mount", "-o", "loop", imgFile, mountDir).CombinedOutput()
-	if err != nil {
-		if strings.Contains(string(out), "set up loop device") {
-			t.Skipf("btrfs loopback unavailable (loop device setup failed): %s", out)
-		}
-		require.NoError(t, err, "mount: %s", out)
-	}
-
-	// Enable quotas
-	out, err = exec.Command("btrfs", "quota", "enable", mountDir).CombinedOutput()
-	require.NoError(t, err, "btrfs quota enable: %s", out)
-
-	t.Cleanup(func() {
-		// Unmount — ignore errors on cleanup
-		_ = exec.Command("umount", "-l", mountDir).Run()
-	})
-
-	return mountDir
-}
-
 // requireXFSProjectVolume asserts that path is a managed XFS volume root: a
 // directory tagged with the project ID its marker records, with a live entry
 // in the mount's project-quota report. It returns that project ID.
@@ -789,62 +727,6 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 // container names the bytes. Interrupted-operation recovery is covered
 // separately; this test starts at the orphan collector's ownership boundary.
 
-func TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
-
-	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
-
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440109"
-	oldName := fmt.Sprintf("fred-%s-0", leaseUUID)
-	newName := canonicalVolumeName(leaseUUID, "app", 0)
-
-	// Create a real btrfs subvolume at the legacy path.
-	oldPath := filepath.Join(mountPath, oldName)
-	out, err := exec.Command("btrfs", "subvolume", "create", oldPath).CombinedOutput()
-	require.NoError(t, err, "btrfs subvolume create: %s", out)
-
-	// Record original subvol id (line `Subvolume ID: NNN` in btrfs show output).
-	originalID := extractSubvolID(t, oldPath)
-	require.NotEmpty(t, originalID, "must extract subvol id before rename")
-
-	// Rename via the manager.
-	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
-
-	// New path exists, old path is gone.
-	newPath := filepath.Join(mountPath, newName)
-	_, err = os.Stat(newPath)
-	require.NoError(t, err, "new path must exist after rename")
-	_, err = os.Stat(oldPath)
-	require.True(t, errors.Is(err, fs.ErrNotExist), "old path must be gone after rename")
-
-	// Subvol id must be unchanged at the new path.
-	renamedID := extractSubvolID(t, newPath)
-	require.NotEmpty(t, renamedID, "must extract subvol id after rename")
-	assert.Equal(t, originalID, renamedID,
-		"btrfs subvolume ID must be preserved across rename (rename is a metadata-only op; "+
-			"a re-id would indicate the rename was implemented as copy+delete, losing identity)")
-
-	// Cleanup: delete the renamed subvolume.
-	out, _ = exec.Command("btrfs", "subvolume", "delete", newPath).CombinedOutput()
-	t.Logf("cleanup btrfs subvolume delete: %s", out)
-}
-
-// extractSubvolID parses `btrfs subvolume show <path>` output for the
-// "Subvolume ID:" line and returns the numeric id as a string. The
-// raw string form (not parsed int) is fine for equality assertions.
-func extractSubvolID(t *testing.T, path string) string {
-	t.Helper()
-	out, err := exec.Command("btrfs", "subvolume", "show", path).CombinedOutput()
-	require.NoError(t, err, "btrfs subvolume show: %s", out)
-	for _, line := range strings.Split(string(out), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "Subvolume ID:") {
-			return strings.TrimSpace(strings.TrimPrefix(trimmed, "Subvolume ID:"))
-		}
-	}
-	return ""
-}
-
 // TestIntegration_Docker_VolumeQuotaEnforced verifies that XFS project quota
 // enforcement actually prevents writes beyond the configured disk limit.
 // A small write should succeed; a large write should fail with ENOSPC/EDQUOT.
@@ -953,8 +835,13 @@ func setupXFSLoopback(t *testing.T) string {
 	out, err = exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput()
 	require.NoError(t, err, "mkfs.xfs: %s", out)
 
-	// pquota enables project-quota enforcement. Loop-device support cannot be
-	// probed ahead of time, so skip when its setup fails (see setupBtrfsLoopback).
+	// pquota enables project-quota enforcement. Loop-device support is a
+	// prerequisite just like root and xfsprogs above, but it can't be probed
+	// reliably ahead of time. Some environments (containers, restricted/hardened
+	// hosts, many CI runners) have no usable loop devices even as root, where
+	// `mount -o loop` fails with a "failed to set up loop device" error. Skip
+	// there rather than fail — only a genuine (non-loop) mount error should
+	// fail the test.
 	out, err = exec.Command("mount", "-o", "loop,pquota", imgFile, mountDir).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "set up loop device") {
@@ -1005,36 +892,6 @@ func backendForReconcileTest(t *testing.T, mgr volumeManager, dataPath, lease, s
 	b.cfg.VolumeDataPath = dataPath
 	b.cfg.SKUProfiles[sku] = SKUProfile{CPUCores: 1, MemoryMB: 256, DiskMB: diskMB}
 	return b
-}
-
-// TestIntegration_Usage_Btrfs verifies that btrfsVolumeManager.Usage returns
-// the subvolume's referenced bytes within a generous metadata-overhead bound.
-func TestIntegration_Usage_Btrfs(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
-	ctx := context.Background()
-
-	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
-
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440100"
-	volName := canonicalVolumeName(leaseUUID, "app", 0)
-	const capMiB = int64(100)
-
-	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
-	require.NoError(t, err)
-	require.True(t, created)
-	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
-
-	const writeMiB = 10
-	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
-
-	got, err := mgr.Usage(ctx, volName)
-	require.NoError(t, err)
-
-	// rfer includes filesystem metadata; allow a 6 MiB overhead ceiling.
-	const wantMin = int64(writeMiB * 1024 * 1024)
-	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
-	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
-	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
 }
 
 // TestIntegration_Usage_XFS verifies that xfsVolumeManager.Usage returns the
@@ -1666,34 +1523,6 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 	}
 }
 
-// TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin is the btrfs analogue of
-// the ENG-454 regression: btrfs `qgroup limit` is a privileged ioctl requiring
-// CAP_SYS_ADMIN with no delegation alternative — so the daemon
-// must hold the capability. Proven by running it as root (succeeds) vs a
-// dropped-privilege subprocess (fails). Guards against the same "tests run as
-// root, prod runs unprivileged" fidelity gap on btrfs hosts.
-func TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
-	mount := setupBtrfsLoopback(t) // requires root; quota enabled
-	ctx := context.Background()
-
-	subvol := filepath.Join(mount, "fred-cap-probe-app-0")
-	out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", subvol).CombinedOutput()
-	require.NoError(t, err, "root subvolume create: %s", out)
-
-	// As root: setting the qgroup limit SUCCEEDS.
-	rootOut, rootErr := exec.CommandContext(ctx, "btrfs", "qgroup", "limit", "10M", subvol).CombinedOutput()
-	require.NoError(t, rootErr, "root should set the qgroup limit: %s", rootOut)
-
-	// With CAP_SYS_ADMIN dropped (euid 0, so the qgroup ioctl is reached): FAILS.
-	dropOut, dropErr := runWithoutCapSysAdmin(t, fmt.Sprintf("btrfs qgroup limit 5M %s", subvol))
-	require.Error(t, dropErr,
-		"setting a btrfs qgroup limit without CAP_SYS_ADMIN must fail: %s", dropOut)
-	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
-		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
-			"expected a permission error, got: %s", dropOut)
-	}
-}
-
 // TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites verifies that root-only
 // repair restores inheritance and enforcement for new files. Historical untagged
 // files remain outside the project; repairing them requires stopped-writer
@@ -1847,198 +1676,10 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 		"expected a quota/space error, got: %v", werr)
 }
 
-// TestIntegration_Btrfs_ReconcileBackfill_EndToEnd exercises the full startup
-// backfill wired to a real btrfs manager. btrfs has no "untagged" state (the
-// qgroup limit is applied at create), so this proves the reconcile RE-APPLIES
-// the current SKU cap: a volume created with a large cap is tightened by the
-// reconcile to the lease's smaller disk_mb, and a write past it is rejected.
-func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
-	mount := setupBtrfsLoopback(t) // requires root
-	dataPath := filepath.Join(mount, "volumes")
-	require.NoError(t, os.MkdirAll(dataPath, 0700))
-	ctx := context.Background()
-	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
-
-	const lease = "550e8400-e29b-41d4-a716-446655440107"
-	volName := canonicalVolumeName(lease, "app", 0)
-	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial cap
-	require.NoError(t, err)
-	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
-
-	b := backendForReconcileTest(t, mgr, dataPath, lease, "app", "btrfs-small", 20)
-	require.NoError(t, b.reconcileVolumeQuotas(ctx))
-
-	// The reconcile tightened the qgroup limit to 20 MiB → 30 MiB more is rejected.
-	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
-}
-
-// TestIntegration_Btrfs_SubdirDataPath_Measures guards that the btrfs backend
-// still measures correctly when volume_data_path is a subdirectory of the mount
-// (ENG-449 "validate other fs too"). btrfs tools operate on any path within the
-// filesystem, so — unlike XFS — a subdir needs no mountpoint resolution; this
-// pins that so the shared refactor did not regress it.
-func TestIntegration_Btrfs_SubdirDataPath_Measures(t *testing.T) {
-	mount := setupBtrfsLoopback(t)
-	dataPath := filepath.Join(mount, "volumes") // subdir of the btrfs mount
-	require.NoError(t, os.MkdirAll(dataPath, 0700))
-
-	ctx := context.Background()
-	mgr := &btrfsVolumeManager{dataPath: dataPath, logger: slog.Default()}
-
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440108"
-	volName := canonicalVolumeName(leaseUUID, "app", 0)
-	hostPath, created, err := mgr.Create(ctx, volName, 100)
-	require.NoError(t, err)
-	require.True(t, created)
-	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
-
-	const writeMiB = 10
-	require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, writeMiB*1024*1024), 0600))
-	got, err := mgr.Usage(ctx, volName)
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, got, int64(writeMiB*1024*1024), "Usage under-reports: %d", got)
-	assert.LessOrEqual(t, got, int64((writeMiB+6)*1024*1024), "Usage over-reports: %d", got)
-}
-
-// TestIntegration_DemotePromote_Btrfs is the end-to-end demote/promote quota
-// test on a real btrfs loopback. It verifies all three plan assertions:
-//
-//	(a) data fits medium → checkDemoteFit passes, Create at medium lowers the
-//	    enforced quota, and a write beyond medium fails with EDQUOT/ENOSPC.
-//	(b) data exceeds medium → checkDemoteFit returns ErrDemoteDataExceedsTier.
-//	(c) promote Create at large raises the cap so writes beyond medium succeed.
-//
-// Uses custom 100 MiB / 20 MiB "large"/"medium" tiers to stay within the
-// 256 MiB loopback image.
-func TestIntegration_DemotePromote_Btrfs(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
-	ctx := context.Background()
-
-	const largeMiB, mediumMiB = int64(100), int64(20)
-
-	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
-
-	// Wire a Backend with real btrfs volumes and the custom small-SKU profiles.
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	useVolumeManager(b, mgr)
-	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
-	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
-	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
-
-	// (a) 5 MiB data fits 20 MiB medium: gate passes, quota lowered, write beyond fails.
-	t.Run("fits_medium", func(t *testing.T) {
-		origLease := newIntegrationLeaseUUID()
-		canon := canonicalVolumeName(origLease, "app", 0)
-		retained := retainedName(canon)
-
-		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err)
-
-		// 5 MiB — fits 20 MiB medium
-		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
-
-		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
-
-		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID: origLease,
-			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
-			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
-				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
-			RetainedVolumeNames: []string{retained},
-		}
-		err = b.checkDemoteFit(ctx, rec,
-			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
-			mediumProfiles, b.logger)
-		require.NoError(t, err, "5 MiB data fits 20 MiB medium: checkDemoteFit must pass")
-
-		// Simulate adoptRetainedVolumes: rename to a new lease's canonical name.
-		newLease := newIntegrationLeaseUUID()
-		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
-
-		// Create at medium cap lowers the btrfs qgroup limit to 20 MiB.
-		newHostPath, _, err := mgr.Create(ctx, newCanon, mediumMiB)
-		require.NoError(t, err, "Create at medium cap must succeed")
-
-		// Writing 25 MiB beyond the 20 MiB quota must fail (total ~30 MiB > 20 MiB).
-		out, werr := exec.Command("dd", "if=/dev/zero",
-			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.Error(t, werr,
-			"writing 25 MiB to a 20 MiB-quota btrfs volume must fail (EDQUOT/ENOSPC); dd output: %s", out)
-	})
-
-	// (b) 25 MiB data exceeds 20 MiB medium: gate returns ErrDemoteDataExceedsTier.
-	t.Run("exceeds_medium", func(t *testing.T) {
-		origLease := newIntegrationLeaseUUID()
-		canon := canonicalVolumeName(origLease, "app", 0)
-		retained := retainedName(canon)
-
-		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
-
-		// 25 MiB — exceeds 20 MiB medium cap; write must succeed under 100 MiB large cap.
-		out, werr := exec.Command("dd", "if=/dev/zero",
-			"of="+filepath.Join(hostPath, "data.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.NoError(t, werr, "writing 25 MiB to 100 MiB-quota volume must succeed; dd output: %s", out)
-
-		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
-
-		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID: origLease,
-			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
-			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
-				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
-			RetainedVolumeNames: []string{retained},
-		}
-		err = b.checkDemoteFit(ctx, rec,
-			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
-			mediumProfiles, b.logger)
-		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
-			"25 MiB data exceeds 20 MiB medium: gate must refuse with ErrDemoteDataExceedsTier")
-	})
-
-	// (c) promote: Create at large from a medium-capped volume raises the cap so
-	//     writes beyond medium now succeed.
-	t.Run("promote_raises_cap", func(t *testing.T) {
-		origLease := newIntegrationLeaseUUID()
-		canon := canonicalVolumeName(origLease, "app", 0)
-
-		// Start at medium cap (20 MiB).
-		hostPath, _, err := mgr.Create(ctx, canon, mediumMiB)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
-
-		// Write 5 MiB so the subvolume has some data.
-		require.NoError(t, os.WriteFile(filepath.Join(hostPath, "data.bin"), make([]byte, 5*1024*1024), 0600))
-
-		// Confirm 25 MiB does NOT fit under medium cap (partial write fails).
-		out, werr := exec.Command("dd", "if=/dev/zero",
-			"of="+filepath.Join(hostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.Error(t, werr,
-			"25 MiB must not fit the 20 MiB cap before promote; dd output: %s", out)
-		// Remove any partial file so rfer drops back toward the initial 5 MiB.
-		_ = os.Remove(filepath.Join(hostPath, "big.bin"))
-
-		// Promote: Create (idempotent) at large cap raises qgroup limit to 100 MiB.
-		_, _, err = mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err, "Create at large cap must succeed (quota update)")
-
-		// Writing 25 MiB must now succeed (cap is 100 MiB; total at most ~30 MiB).
-		out, werr = exec.Command("dd", "if=/dev/zero",
-			"of="+filepath.Join(hostPath, "big2.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.NoError(t, werr,
-			"25 MiB must fit the promoted 100 MiB cap; dd output: %s", out)
-	})
-}
-
 // TestIntegration_DemotePromote_XFS exercises the demote/promote quota flow on
-// a real XFS loopback with project quotas (pquota). Covers the same gate
-// assertions as the btrfs variant: (a) gate passes + quota lowered, (b) gate
-// refuses when data exceeds the smaller tier.
+// a real XFS loopback with project quotas (pquota): (a) the gate passes and
+// the quota is lowered, (b) the gate refuses when data exceeds the smaller
+// tier, (c) a promote raises the cap.
 func TestIntegration_DemotePromote_XFS(t *testing.T) {
 	mountDir := setupXFSLoopback(t)
 	ctx := context.Background()

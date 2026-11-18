@@ -25,9 +25,9 @@ func TestCapGuardResult(t *testing.T) {
 	assert.Contains(t, err.Error(), "AmbientCapabilities")
 
 	// Can set quotas → nil.
-	require.NoError(t, capGuardResult("btrfs", true, nil, log))
+	require.NoError(t, capGuardResult("xfs", true, nil, log))
 
 	// Inconclusive probe (prctl error) → warn + proceed, never fatal.
-	require.NoError(t, capGuardResult("btrfs", false, errors.New("prctl boom"), log),
+	require.NoError(t, capGuardResult("xfs", false, errors.New("prctl boom"), log),
 		"an inconclusive probe must not brick startup")
 }

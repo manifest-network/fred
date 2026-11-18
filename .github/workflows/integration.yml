@@ -1,7 +1,7 @@
 name: Integration Tests
 
 # Runs the `-tags integration` suites that need a privileged environment
-# (root + XFS and btrfs loopbacks + a real Docker daemon) and therefore never ran in
+# (root + an XFS loopback + a real Docker daemon) and therefore never ran in
 # `ci.yml`. Without this, the volume/quota and retain/restore tests rot
 # silently — a volume-naming change went undetected for ~3 months (PR #115,
 # ENG-330). The whole point is *signal*: this workflow FAILS (it does not pass
@@ -56,10 +56,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  docker-btrfs:
-    # The job id stays `docker-btrfs` so `needs:` references keep working. The
-    # display name (and therefore the status-check name) carries the store.
-    name: docker + btrfs integration (root, ${{ matrix.image_store }})
+  docker-xfs:
+    # The display name (and therefore the status-check name) carries the store.
+    name: docker + xfs integration (root, ${{ matrix.image_store }})
     # MUST be the full ubuntu image (not ubuntu-slim): we need passwordless
     # sudo→root, loop devices, and low-level mount — ubuntu-slim's job container
     # is unprivileged and cannot do any of that.
@@ -175,21 +174,11 @@ jobs:
           docker --host unix:///var/run/docker.sock version
           test "$(docker --host unix:///var/run/docker.sock version --format '{{.Server.Version}}')" = "$DOCKER_ENGINE_VERSION"
 
-      - name: Install btrfs-progs
-        # mkfs.btrfs / btrfs are NOT preinstalled on ubuntu-latest; util-linux
-        # (losetup, mount) already is. The tests build their own btrfs loopback.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y btrfs-progs
-          sudo modprobe btrfs || true
-
       - name: Preflight — fail loudly if the privileged env is missing
-        # setupXFSLoopback and setupBtrfsLoopback (and the Docker-ping helpers)
-        # call t.Skip when root, the filesystem tools, loop devices, or Docker are
-        # absent — which would make this whole job pass green while testing
-        # NOTHING (the ENG-330 trap). Reproduce both exact loopback paths here so
-        # a broken runner fails fast and clearly. The suite stands on the XFS
-        # loopback; btrfs backs only the btrfs driver's own tests.
+        # setupXFSLoopback (and the Docker-ping helpers) call t.Skip when root,
+        # xfsprogs, loop devices, or Docker are absent — which would make this
+        # whole job pass green while testing NOTHING (the ENG-330 trap). Reproduce
+        # the exact loopback path here so a broken runner fails fast and clearly.
         run: |
           set -uo pipefail
           fail=0
@@ -227,27 +216,16 @@ jobs:
               echo "::error::unknown FRED_TEST_IMAGE_STORE '$FRED_TEST_IMAGE_STORE'"; fail=1
               ;;
           esac
-          command -v mkfs.btrfs >/dev/null 2>&1 || { echo "::error::mkfs.btrfs not installed"; fail=1; }
-          command -v btrfs >/dev/null 2>&1 || { echo "::error::btrfs CLI not installed"; fail=1; }
           work="$(mktemp -d)"
-          truncate -s 256M "$work/btrfs.img" || { echo "::error::truncate failed"; fail=1; }
-          sudo mkfs.btrfs -f "$work/btrfs.img" >/dev/null || { echo "::error::mkfs.btrfs failed"; fail=1; }
-          sync
-          mkdir -p "$work/mnt"
-          if sudo mount -o loop "$work/btrfs.img" "$work/mnt"; then
-            sudo btrfs quota enable "$work/mnt" || { echo "::error::btrfs quota enable failed"; fail=1; }
-            sudo umount -l "$work/mnt" || true
-          else
-            echo "::error::loopback btrfs mount failed — the btrfs driver tests would t.Skip (ENG-330 silent-rot gap). Failing."
-            fail=1
-          fi
-          # XFS: tooling is preinstalled. Build the same loopback the tests do:
-          # 512M (xfsprogs refuses <300MB), mounted with project quotas, and
-          # confirm project-quota enforcement is actually on.
+          # xfsprogs is preinstalled on ubuntu-24.04, as is util-linux (losetup,
+          # mount). Build the same loopback the tests do: 512M (xfsprogs refuses
+          # <300MB), mounted with project quotas, and confirm project-quota
+          # enforcement is actually on.
           command -v mkfs.xfs >/dev/null 2>&1 || { echo "::error::mkfs.xfs not installed"; fail=1; }
           command -v xfs_quota >/dev/null 2>&1 || { echo "::error::xfs_quota not installed"; fail=1; }
           truncate -s 512M "$work/xfs.img" || { echo "::error::truncate failed"; fail=1; }
           sudo mkfs.xfs -f "$work/xfs.img" >/dev/null || { echo "::error::mkfs.xfs failed"; fail=1; }
+          sync
           mkdir -p "$work/xfs"
           if sudo mount -o loop,pquota "$work/xfs.img" "$work/xfs"; then
             sudo xfs_quota -x -c 'state -p' "$work/xfs" | grep -q 'Enforcement: ON' \
@@ -258,7 +236,7 @@ jobs:
             fail=1
           fi
           rm -rf "$work" || true
-          [ "$fail" -eq 0 ] && echo "Preflight OK: docker ($FRED_TEST_IMAGE_STORE image store) + root + btrfs/xfs tooling + loopback + quota all available."
+          [ "$fail" -eq 0 ] && echo "Preflight OK: docker ($FRED_TEST_IMAGE_STORE image store) + root + xfs tooling + loopback + project quota all available."
           exit "$fail"
 
       - name: Docker Hub login (optional)
@@ -287,7 +265,7 @@ jobs:
             if [ "$ok" -ne 1 ]; then echo "::error::failed to pull $img after 3 attempts"; exit 1; fi
           done
 
-      - name: Run docker + btrfs integration suite (as root)
+      - name: Run docker + xfs integration suite (as root)
         # `-run Integration` covers the ENTIRE docker package: core lifecycle,
         # stack, restart/update, reconciler, idempotency, image admission and
         # immutable platform binding, volume/quota, and the
@@ -325,7 +303,7 @@ jobs:
             echo "::group::Skipped tests"
             grep -E '^[[:space:]]*--- SKIP:' integration.log || true
             echo "::endgroup::"
-            echo "::error::Integration tests were SKIPPED — the runner is missing root/xfs/btrfs/loop/docker. A green-but-skipped run is the ENG-330 silent-rot gap. Failing."
+            echo "::error::Integration tests were SKIPPED — the runner is missing root/xfs/loop/docker. A green-but-skipped run is the ENG-330 silent-rot gap. Failing."
             exit 1
           fi
           passed="$(grep -cE '^[[:space:]]*--- PASS:' integration.log || true)"

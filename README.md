@@ -187,9 +187,8 @@ All required fields are validated at startup. The daemon will fail to start with
 Backends are services that handle the actual resource provisioning. Backend and callback URLs must be absolute HTTP(S) URLs. Provider `production_mode: true` requires HTTPS in both directions and verifies backend peers using the configured private CA (or system roots); bundled backends must also enable production mode so callback peer verification cannot be disabled. HTTP is development-only because request HMAC does not authenticate backend responses and callback HMAC does not provide transport confidentiality.
 
 The currently deployed and production-validated execution envelope is
-`docker-backend` on XFS. Docker's Btrfs
-volume implementation has automated coverage but is experimental and
-not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
+`docker-backend` on XFS, the only filesystem supported for managed volumes.
+See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
 Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing. A SKU that no backend lists goes to the fallback backend: the one with `default: true` (at most one may set it), or the first configured backend when none does. A fenced fallback receives no new provisions. When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.
 

@@ -63,7 +63,7 @@ func newVolumeCleanupContext(parent context.Context) (context.Context, context.C
 // create, rename, requota, recover, or destroy storage.
 type volumeReader interface {
 	// ListForProof returns the complete managed-volume substrate inventory under
-	// a caller-owned deadline. For btrfs this is the same namespace as List. XFS
+	// a caller-owned deadline. Beyond List, XFS
 	// additionally lists every name whose deletion is held, so a volume cannot
 	// disappear from the proof merely because its directory is already gone.
 	ListForProof(context.Context) ([]string, error)
@@ -181,8 +181,8 @@ type volumeMutationSink interface {
 	DeferDeletesUntilExecutorRuns() volumeDeleteDeferral
 
 	// RenameVolume atomically renames a managed volume from oldName to
-	// newName, preserving data and per-volume metadata (xfs project ID,
-	// btrfs subvolume identity). Idempotent: if the new
+	// newName, preserving data and per-volume metadata (the xfs project
+	// ID). Idempotent: if the new
 	// name already exists and the old does not, returns nil; if both
 	// exist, returns an error so the operator can intervene; if neither
 	// exists, returns an error.
@@ -321,11 +321,8 @@ func (n *noopVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeNam
 	return nil, errProjectIDAuditUnsupported
 }
 
-// Filesystem magic numbers from statfs(2).
-const (
-	btrfsMagic = 0x9123683E
-	xfsMagic   = 0x58465342
-)
+// xfsMagic is the XFS filesystem magic number from statfs(2).
+const xfsMagic = 0x58465342
 
 // detectFilesystem returns the filesystem type of the given path
 // using statfs(2) magic numbers.
@@ -334,14 +331,10 @@ func detectFilesystem(path string) (string, error) {
 	if err := syscall.Statfs(path, &stat); err != nil {
 		return "", fmt.Errorf("statfs %s: %w", path, err)
 	}
-	switch stat.Type {
-	case btrfsMagic:
-		return "btrfs", nil
-	case xfsMagic:
-		return "xfs", nil
-	default:
-		return "", fmt.Errorf("unsupported filesystem (magic 0x%X) at %s; volume quotas require btrfs or xfs", stat.Type, path)
+	if stat.Type != xfsMagic {
+		return "", fmt.Errorf("unsupported filesystem (magic 0x%X) at %s; volume quotas require xfs", stat.Type, path)
 	}
+	return "xfs", nil
 }
 
 // newVolumeManager creates a volumeManager for the given data path and filesystem.
@@ -355,7 +348,7 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 	// Reject a nonsense volume_filesystem before touching the disk, so a typo reports itself
 	// as a typo rather than as whatever the probe below happens to find.
 	switch filesystem {
-	case "", "btrfs", "xfs":
+	case "", "xfs":
 	default:
 		return nil, fmt.Errorf("unsupported volume_filesystem: %s", filesystem)
 	}
@@ -372,29 +365,17 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 	if err != nil {
 		return nil, fmt.Errorf("probe filesystem at volume_data_path %q (is the volume mounted?): %w", dataPath, err)
 	}
-	switch {
-	case filesystem == "":
-		filesystem = detected
-		logger.Info("auto-detected volume filesystem", "path", dataPath, "filesystem", filesystem)
-	case filesystem != detected:
-		return nil, fmt.Errorf("volume_data_path %q is on %s, but volume_filesystem is configured as %s "+
-			"(is the volume mounted?)", dataPath, detected, filesystem)
+	if filesystem == "" {
+		logger.Info("auto-detected volume filesystem", "path", dataPath, "filesystem", detected)
 	}
 
-	switch filesystem {
-	case "btrfs":
-		return &btrfsVolumeManager{dataPath: dataPath, logger: logger}, nil
-	case "xfs":
-		// xfs_quota requires the XFS mount point as its filesystem argument;
-		// dataPath is typically a subdirectory of that mount (ENG-449).
-		mountPoint, err := resolveMountpoint(dataPath)
-		if err != nil {
-			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
-		}
-		return newXFSVolumeManager(dataPath, mountPoint, minAvgFileBytes, logger), nil
-	default:
-		return nil, fmt.Errorf("unsupported volume_filesystem %q; must be btrfs or xfs", filesystem)
+	// xfs_quota requires the XFS mount point as its filesystem argument;
+	// dataPath is typically a subdirectory of that mount (ENG-449).
+	mountPoint, err := resolveMountpoint(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 	}
+	return newXFSVolumeManager(dataPath, mountPoint, minAvgFileBytes, logger), nil
 }
 
 // volumePrefix is the naming prefix for all managed volume directories.

@@ -1735,8 +1735,7 @@ valid release/retention rows, and substrate evidence that agrees with the active
 releases.
 
 That substrate evidence is concrete rather than name-based. Every managed name
-first becomes one canonical typed component and must then be an actual Btrfs
-subvolume or a real directory on the configured XFS root with a regular no-follow
+first becomes one canonical typed component and must then be a real directory on the configured XFS root with a regular no-follow
 nonzero project-ID marker.
 Container evidence separately proves the label-derived volume and exact
 target-derived subtree, rejecting a symlink at any component. XFS startup quota
@@ -1829,9 +1828,7 @@ memory by Deprovision, and left out of the close-age gauge that pages.
 
 Any ambiguous recovery preserves evidence
 and prevents readiness. Read-only preflight and initialization reject both
-create and delete forms rather than mutate the lineage being proved. Btrfs has
-no private stage; its already-published subvolume is classified by operation
-recovery and the fatal quota gate. Unattributed Btrfs subvolumes are preserved;
+create and delete forms rather than mutate the lineage being proved. Unattributed managed volumes are preserved;
 only an exact durable operation, close, or retention finalizer can destroy them.
 
 Normal startup loads the committed marker pair as a typed verified-storage
@@ -1867,8 +1864,7 @@ copy and must roll the whole set back together; there is no supported recovery
 that combines individually matching files from different points in time.
 
 The production deployment envelope verified read-only for the ENG-632 cutover
-on 2026-09-02 is `docker-backend` on XFS. Btrfs retains automated coverage
-but is not deployed or production-validated. This point-in-time fact scopes the
+on 2026-09-02 is `docker-backend` on XFS. This point-in-time fact scopes the
 rollout proof; it does not replace the mandatory pre-cutover re-inventory in `DEPLOYMENT.md`.
 
 ## Data Flow
@@ -2265,7 +2261,7 @@ All docker-backend metrics live under `fred_docker_backend_*`, and that endpoint
 | `fred_docker_backend_image_registry_requests_total` | counter | `endpoint, method, status` | Every registry wire exchange docker-backend dispatches, including retries and redirect hops. `endpoint` ∈ `manifest`/`blob`/`ping`/`other`, `method` ∈ `GET`/`HEAD` (`other` otherwise), `status` ∈ `ok` (below 400), `4xx`, `429`, `5xx`, `error` (no response). Every endpoint, method and status series starts at zero. `endpoint="manifest",method="GET"` approximates the pulls Docker Hub meters; any `status="429"` increase is a registry quota refusal. Carries no host, repository or tenant label |
 | `fred_docker_backend_image_tag_resolutions_total` | counter | `source` | Tag resolutions past their manifest HEAD, by where the manifest came from: `cache` (the announced digest was already verified, no manifest GET), `registry` (one GET of the uncached announced digest), `fallback_unsupported` (HEAD answered 405/501) or `fallback_incomplete` (a 2xx without a usable digest, type or length); both fallbacks GET the tag on every preparation. A sustained high `registry` or fallback share predicts metered pulls |
 | `fred_docker_backend_image_unpinned_generations` | gauge | `kind` | Active (including required compensation ancestry) versus retained generations with incomplete image pins at the latest successful inventory |
-| `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFitWithResourceProfiles`) because the retained data does not fit the requested smaller SKU tier. `backend` is the volume manager kind (`xfs`, `btrfs`, `noop`), and only the configured kind's series exist; `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
+| `fred_docker_backend_restore_demote_refused_total` | counter | `backend, reason` | Restores refused by the demote fit-gate (`checkDemoteFitWithResourceProfiles`) because the retained data does not fit the requested smaller SKU tier. `backend` is the volume manager kind (`xfs`, `noop`), and only the configured kind's series exist; `reason` ∈ `measured_exceeds`, `unmeasurable_read_error`, `unmeasurable_backend`, `ephemeral_tier`. Synchronous-prelude refusals — NOT counted by `restore_total` (worker-scoped); surfaced to the tenant as HTTP 422 — the `demote_exceeds_tier` string discriminator rides only the backend→fred hop (ENG-438) |
 | `fred_docker_backend_volume_quota_backfill_total` | counter | `outcome` | Startup quota reconciliation (XFS root-attribute verification/repair plus limits), `outcome` ∈ `applied`/`failed`/`delete_pending`; `delete_pending` is a name whose deletion is pending, whose limits its delete authority keeps (ENG-1117); `applied` confirms root attributes and limits, not historical descendant tagging. Re-applies the immutable effective quota (`disk_mb` for stateful volumes or pinned scratch for a present diskless writable-path volume) without a re-provision or a recursive XFS tenant-tree walk. The complete inventory is attempted, then any failed application, inventory error, or durable-profile error fails startup/readiness before the normal metrics endpoint serves requests (ENG-454) |
 | `fred_docker_backend_volume_quota_clear_failed_total` | counter | — | Failed XFS quota-clear commands during interrupted-create compensation or typed deletion; preceding block/inode proof failures are not counted. Typed authority is retained either way: a deletion is held for that volume and retried by the hold executor, while a failed create compensation fail-stops the current backend instance for recovery by a fresh `Start`; only historical already-absent/no-authority leaks need classified one-time manual cleanup (ENG-459/ENG-632/ENG-1117) |
 | `fred_docker_backend_volume_projid_audit_total` | counter | `outcome` | Managed XFS volumes audited for project-ID drift, `outcome` ∈ `clean`, `drift`, `too_deep`, `incomplete`, `changed`, `error`, `skipped` (a volume with a registered delete stage). The audit only reads; its first pass runs 10 minutes after start, then one every 24 hours with a 30-minute pass budget |
@@ -2375,8 +2371,8 @@ The full developer-facing test reference (commands, prerequisites, conventions) 
 | Unit | `_test.go` next to each file | Single function / type behavior. Mock interfaces for chain, backends, etc. | `make test` |
 | Race | Same files, `-race -short` | Concurrency invariants — actor messages, operation registry, signer pool. Stress tests skip via `testing.Short()` because they OOM under `-race`. | `go test -race -short ./...` |
 | Integration (provisioner) | `_test.go` with no build tag | Full event flow with the in-memory mock backend. Watermill GoChannel transport. | `make test` |
-| Integration (Docker) | `_test.go` with `//go:build integration` | Real Docker daemon, real container lifecycle, the btrfs and XFS quota tests, and `internal/fstree`'s mount-boundary tests. | `sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m` (root, Docker, the filesystem tools, `capsh` and `FRED_TEST_IMAGE_STORE`; see CONTRIBUTING.md) |
-| Integration (volumes) | Same, gated on root | The provision-path volume subset, on an XFS loopback with project quotas; the driver-level XFS and btrfs quota tests run only in the full Docker suite. | `sudo -E env "PATH=$PATH" make test-integration-volume` |
+| Integration (Docker) | `_test.go` with `//go:build integration` | Real Docker daemon, real container lifecycle, the XFS quota tests, and `internal/fstree`'s mount-boundary tests. | `sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m` (root, Docker, the filesystem tools, `capsh` and `FRED_TEST_IMAGE_STORE`; see CONTRIBUTING.md) |
+| Integration (volumes) | Same, gated on root | The provision-path volume subset, on an XFS loopback with project quotas; the driver-level XFS quota tests run only in the full Docker suite. | `sudo -E env "PATH=$PATH" make test-integration-volume` |
 | Stress | `manager_stress_test.go` | 10K–1M event burst tests, sustained-load tests. | See [PERFORMANCE.md](PERFORMANCE.md#running-benchmarks); 500K/1M gated by `STRESS_TEST_LARGE=1` |
 | Bench | `*_bench_test.go` | Throughput and latency profiling. | `go test -bench=.` |
 | Fuzz | `func Fuzz…` targets (tar extraction, payload parsing, dirent parsing, ID round-trips, reconcile planning) | Parser robustness and planning invariants; each seed corpus also runs as an ordinary test. | `go test -run='^$' -fuzz=<FuzzName> <package>` |

@@ -118,7 +118,7 @@ actual containing mountpoint and `volume_data_path` to the managed directory
 beneath it; for example, `/data` and `/data/fred/volumes`. Preserve these paths
 and the matching storage identity across restarts and upgrades.
 
-The docker-backend places each container's data on a quota-enforced host directory. Two filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` backend has automated coverage but is **not production-validated and not used in any deployment** — treat it as experimental.
+The docker-backend places each container's data on a quota-enforced host directory. **`xfs` is the only supported filesystem.** All mainnet and Morpheus backends run XFS with `pquota`, which enforces the per-volume disk *and* inode (`ihard`) quotas. `volume_filesystem` accepts only `xfs`, and a `volume_data_path` on any other filesystem fails startup.
 
 #### xfs (good for large fleets)
 
@@ -189,31 +189,6 @@ Each container gets a directory with an xfs project quota.
 > recursive healing path is required. Inventory, authority and root-enforcement
 > errors still fail startup closed.
 
-#### Experimental backend (not production-validated or deployed)
-
-> **Not production-ready.** The `btrfs` backend is implemented but
-> has **no production coverage** — no mainnet/Morpheus backend runs it, and the
-> per-volume inode (`ihard`) exhaustion protection enforced on XFS has no
-> production-validated equivalent here. It is documented for completeness only; use `xfs` for any
-> production deployment.
-
-#### btrfs (experimental)
-
-```bash
-# Create a btrfs filesystem on a dedicated disk/partition
-mkfs.btrfs /dev/nvme1n1
-mkdir -p /var/lib/fred/volumes
-mount -t btrfs /dev/nvme1n1 /var/lib/fred/volumes
-
-# Enable quotas (one-time, per filesystem)
-btrfs quota enable /var/lib/fred/volumes
-
-# Persist in /etc/fstab
-echo "/dev/nvme1n1 /var/lib/fred/volumes btrfs defaults 0 0" >> /etc/fstab
-```
-
-Each container gets a btrfs subvolume with a qgroup quota.
-
 #### Set the config
 
 In `docker-backend.yaml`:
@@ -221,8 +196,8 @@ In `docker-backend.yaml`:
 ```yaml
 volume_data_path: "/var/lib/fred/volumes"
 volume_mount_path: "/var/lib/fred/volumes"
-# volume_filesystem auto-detects from the mount; set explicitly to override:
-# volume_filesystem: "xfs"   # xfs is the only production-validated backend
+# volume_filesystem is optional; "xfs" is the only accepted value:
+# volume_filesystem: "xfs"
 ```
 
 The docker-backend refuses to start if any SKU has `disk_mb > 0` and
@@ -765,7 +740,7 @@ Ordinary file-copy backups must be taken with the owning daemon stopped (bbolt's
 file lock refuses a second bbolt open). Snapshot each backend's marker pair,
 complete authoritative-store set, and substrate as one unit so a restore cannot
 mix generations or times. For zero-downtime backups, use an atomic
-filesystem-level snapshot (LVM, btrfs) — bbolt files are crash-consistent.
+filesystem-level snapshot (for example LVM) — bbolt files are crash-consistent.
 providerd can also snapshot `placements.db` and `payloads.db` itself while it
 runs; see [Online snapshots](#online-snapshots).
 Restoring a complete matching snapshot intentionally preserves the same lineage,
@@ -1502,8 +1477,7 @@ or bypass validation by adding ignored fields to Fred's config types.
 inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
 fleet on `docker-backend` with XFS, matching
 [Components and topology](#components-and-topology) and the current
-[stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus).
-Btrfs remains experimental. This
+[stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus). This
 is a point-in-time rollout fact, not a permanent support or compatibility
 promise: re-inventory the deployments immediately before executing the cutover
 and extend the proof plan if the fleet has changed. Local development
@@ -1646,7 +1620,7 @@ inventory check still refuses any unexplained managed volume.
 
 The managed-volume check proves more than a directory name. Every inventory
 entry must have the canonical live or retained lease/service/index grammar and
-must be backed by the configured quota substrate: an actual Btrfs subvolume or an
+must be backed by the quota substrate: an
 XFS directory with a regular no-follow nonzero project-ID marker. Container
 bind evidence must name the exact volume derived from its labels and the exact
 target-derived subtree (or `_wp` subtree), with no symlinked path component;
@@ -1848,9 +1822,7 @@ and triggers the backend-wide graceful exit above; the supervisor's fresh
 `Start` must recover it before serving. Startup never promotes recovered debris
 into a tenant volume.
 Stage recovery preserves its evidence
-and fails startup on an ambiguous or failed mutation. Btrfs has no private stage:
-an interrupted create is an already-published subvolume, which operation
-recovery classifies before fatal quota reconciliation. Unattributed managed
+and fails startup on an ambiguous or failed mutation. Unattributed managed
 volumes are preserved for explicit operator attribution; startup never derives
 destruction authority from their absence in current projections. See
 [Interrupted managed-volume mutation at startup](OPERATIONS.md#interrupted-managed-volume-mutation-at-startup)
@@ -2675,7 +2647,7 @@ The `docker-backend` stage is intentionally last in the `Dockerfile`, so a targe
 Both run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
 
 **`docker-backend` (stateless development only)** — the image contains no
-`xfs_quota` or `btrfs` executable. Its `/data` volume persists the
+`xfs_quota` executable. Its `/data` volume persists the
 backend's databases and storage identity; it does not supply managed tenant
 storage. Installing quota tools on the host does not make them available inside
 this image. Containerized stateful backend operation is unsupported.

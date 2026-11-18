@@ -49,8 +49,8 @@ func (b *Backend) isWritablePathOnly(name string) bool {
 			sawWritablePathDir = true
 		case e.Name() == projectIDFile && e.Type().IsRegular():
 			// xfs writes this quota marker as a regular FILE inside every volume
-			// root; it is fred housekeeping, not tenant data. btrfs writes nothing
-			// here. Whitelist ONLY a regular file — the real marker's exact type.
+			// root; it is fred housekeeping, not tenant data.
+			// Whitelist ONLY a regular file — the real marker's exact type.
 			// Any other entry of this name (a directory from a declared VOLUME like
 			// /.fred-project-id, or a symlink/special file) is not the marker and
 			// must NOT be whitelisted, or the volume could be misclassified and

@@ -92,7 +92,7 @@ sku_profiles:
     disk_mb: 4096
 volume_data_path: "/var/lib/fred/volumes"
 volume_mount_path: "/var/lib/fred/volumes"
-volume_filesystem: "btrfs"
+volume_filesystem: "xfs"
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "docker-backend.yaml")
