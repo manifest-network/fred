@@ -511,8 +511,6 @@ func run(cmd *cobra.Command, args []string) error {
 		TokenTrackerDBPath:          cfg.TokenTrackerDBPath,
 		CallbackBaseURL:             cfg.CallbackBaseURL,
 		BillingPolicy:               billingPolicy,
-
-		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	}, api.ServerDeps{
 		ChainClient:           chainClient,
 		BackendRouter:         backendRouter,

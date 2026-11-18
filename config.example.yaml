@@ -12,8 +12,8 @@
 #   therefore be overridden only when this file sets them: provider_uuid,
 #   provider_address, keyring_dir, key_name, tls_cert_file, tls_key_file,
 #   trusted_proxies, callback_base_url, callback_secret,
-#   callback_canonical_path_prefix, maintenance_legacy_idempotency_tenants,
-#   token_tracker_db_path, payload_store_db_path, placement_store_db_path.
+#   callback_canonical_path_prefix, token_tracker_db_path,
+#   payload_store_db_path, placement_store_db_path.
 #   backends[] entries have no environment form. List values are
 #   comma-separated: PROVIDER_CORS_ORIGINS=https://a.example,https://b.example
 #
@@ -474,12 +474,6 @@ callback_base_url: "http://localhost:8080"
 
 # How often to check sub-signer balances and top up if needed.
 # sub_signer_fund_check_interval: "1h"
-
-# Tenant addresses whose restart/update requests may omit Idempotency-Key.
-# Each keyless request is keyed by its single-use signed token, so a retry is
-# a new command. Only for clients that predate the header; empty (default)
-# keeps it mandatory. Entries must be canonical bech32 account addresses.
-# maintenance_legacy_idempotency_tenants: ["manifest1..."]
 
 # =============================================================================
 # WITHDRAWAL CONFIGURATION

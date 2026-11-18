@@ -310,7 +310,6 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 | `placement_snapshot_dir` | Directory for online snapshots of `placements.db` and `payloads.db`; empty disables them. Must be an absolute, clean path that is not the directory of either live database, and requires `payload_store_db_path`. See [Online snapshots](DEPLOYMENT.md#online-snapshots) | `""` |
 | `placement_snapshot_interval` | How often to snapshot; at least `5m`. Validated only when `placement_snapshot_dir` is set | `1h` |
 | `placement_snapshot_retain` | Number of complete snapshot sets to keep, `1`–`1000`. Validated only when `placement_snapshot_dir` is set | `24` |
-| `maintenance_legacy_idempotency_tenants` | Tenant addresses whose restart/update requests may omit `Idempotency-Key` (see [Restart Lease](#restart-lease)). Entries must be distinct canonical bech32 account addresses with `bech32_prefix` | `[]` |
 | `max_request_body_size` | Maximum request body size in bytes | `1048576` (1MB) |
 
 > **Note:** The Docker backend has additional configuration (`releases_db_path`, `releases_max_age`, `container_stop_timeout`, etc.) documented in `docker-backend.example.yaml`.
@@ -394,7 +393,7 @@ See [SECURITY.md](SECURITY.md#transport-security) for TLS configuration details 
 
 ### Environment Variables
 
-An environment variable named `PROVIDER_` plus the upper-cased key overrides that key, but only when the key has a built-in default or appears in the config file. These keys have no default and must therefore appear in the config file: `provider_uuid`, `provider_address`, `keyring_dir`, `key_name`, `tls_cert_file`, `tls_key_file`, `trusted_proxies`, `backends`, `callback_base_url`, `callback_secret`, `callback_canonical_path_prefix`, `maintenance_legacy_idempotency_tenants`, `token_tracker_db_path`, `payload_store_db_path`, and `placement_store_db_path`. providerd cannot start from environment variables alone.
+An environment variable named `PROVIDER_` plus the upper-cased key overrides that key, but only when the key has a built-in default or appears in the config file. These keys have no default and must therefore appear in the config file: `provider_uuid`, `provider_address`, `keyring_dir`, `key_name`, `tls_cert_file`, `tls_key_file`, `trusted_proxies`, `backends`, `callback_base_url`, `callback_secret`, `callback_canonical_path_prefix`, `token_tracker_db_path`, `payload_store_db_path`, and `placement_store_db_path`. providerd cannot start from environment variables alone.
 
 ```bash
 export PROVIDER_CHAIN_ID=manifest-1                            # has a default
@@ -924,17 +923,6 @@ never run again, restart work twice, or move the provider's desired payload
 backward. Such a command settles as `410 Gone` with
 `reason: maintenance_expired`; it did not run. Send a new command with a new
 key.
-
-For clients written before `Idempotency-Key` existed, an operator can list
-tenant addresses in `maintenance_legacy_idempotency_tenants`. A restart or update
-from a listed tenant may then omit the header: Fred authenticates the request
-first, which consumes its single-use signed token, and keys the command by that
-token. Each accepted token is one command, as before keys existed, and a
-replayed token is refused with `401`; a retry therefore needs a new token and is
-a new command. Every such request logs a WARN and increments
-`fred_api_maintenance_legacy_key_total`. A malformed or repeated header is still
-refused with `400`, after the token's signature is validated but before the
-token is consumed, and an unlisted tenant that omits the header receives `400`.
 
 The provider shares a separate budget of 1,024 pending commands and 64 MiB of
 journal content, including 512 bytes of phase-growth allowance per command.

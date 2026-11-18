@@ -214,8 +214,7 @@ row and treats absence as invalid authority. Restart/update/custom-domain replac
 separately typed maintenance intent before appending its exact target release or
 touching Docker. One canonical UUIDv4 `maintenance_id` identifies that intent,
 target release, and every target container. For a restart or update it is the
-ID Fred sends with the request (the tenant's `Idempotency-Key`, or one derived
-from the signed token for a tenant allowed legacy keys); a custom-domain
+ID Fred sends with the request (the tenant's `Idempotency-Key`); a custom-domain
 replacement mints its own. An ID that already names a release of the lease is
 refused with `send a new key`. The cancelable pre-append admission and
 append-started authority are distinct opaque capabilities; advancing to the

@@ -1590,9 +1590,7 @@ and requires an explicit checked conversion from an operation identity, and
 `maintenanceid.ID` identifies a caller-issued restart/update command. Their
 representations are private, their zero values are invalid, and construction
 either validates one canonical UUIDv4 spelling or returns cryptographic-random
-generation failure to the caller. The one exception is `maintenanceid.Derive`,
-which shapes a digest of single-use authenticated input into a UUIDv4 for a
-keyless restart or update from a tenant allowed legacy keys. Operation and lifecycle UUIDs are also causal
+generation failure to the caller. Operation and lifecycle UUIDs are also causal
 capabilities: their typed values implement `slog.LogValuer` and `fmt.Formatter`
 with domain-separated, non-reversible fingerprints. Generic structured logging,
 error wrapping, and formatting therefore cannot reveal the canonical token;
@@ -1602,10 +1600,7 @@ at their string boundary and are never diagnostic values.
 Tenant restart/update admission has a provider-side write-ahead boundary in the
 already-required placement database. The API accepts exactly one canonical
 UUIDv4 `Idempotency-Key` and converts it to an opaque `maintenanceid.ID` before
-acquiring mutation authority. A tenant listed in
-`maintenance_legacy_idempotency_tenants` may omit the header; its command ID is
-then derived from the provider, lease, command kind and the signed token's
-signature, so a retry with a new token is a new command. One atomic
+acquiring mutation authority. One atomic
 `beginMaintenanceCommand` transaction
 requires the exact current placement revision and matching confirmed backend,
 storage identity, lifecycle generation, provider, tenant, kind, and payload
@@ -2068,7 +2063,6 @@ All metrics fred defines use the `fred_` namespace and are exposed at `/metrics`
 |---|---|---|---|
 | `fred_api_requests_total` | counter | `method, path, status` | API request count. The `path` label is the matched-route TEMPLATE (e.g. `/v1/leases/{lease_uuid}/status`), with a single `unmatched` bucket for requests matching no route — bounding `path` to the finite set of registered routes + 1 (closes an unauthenticated path-scan cardinality vector, ENG-448/F28). The `method` label is one of the nine methods net/http names (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `CONNECT`, `OPTIONS`, `TRACE`) or `other`, because Go's server accepts any token as a method (ENG-2150). A `HEAD` request to a `GET` route is labeled `HEAD`. Both labels are derived inside `internal/metrics`, from the request itself |
 | `fred_api_request_duration_seconds` | histogram | `method, path, status` | Request latency. Same labels as `fred_api_requests_total` |
-| `fred_api_maintenance_legacy_key_total` | counter | — | Restart/update requests accepted without `Idempotency-Key` from a tenant in `maintenance_legacy_idempotency_tenants`, each keyed by its single-use signed token. Falling to zero means the integrator now sends keys and the tenant can be delisted |
 | `fred_api_rate_limit_rejections_total` | counter | `limiter` | `global`: IP budget for tenant/observability routes; `tenant`: authenticated tenant budget; `callback_ingress`: independent callback IP budget; `callback_storage`: verified backend storage budget. No IP, route, tenant, or storage UUID labels |
 | `fred_api_non_in_flight_callbacks_total` | counter | `backend, status` | Callbacks received at ingress outside exact in-flight operation settlement, including observations later dropped by lifecycle policy |
 | `fred_maintenance_pending` | gauge | `phase` | Pending durable commands by closed phase: `delivery_outstanding`, `completion_outstanding`, `confirmed_payload_outstanding` |
