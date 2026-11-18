@@ -351,37 +351,3 @@ jobs:
             echo "::error::No integration tests executed (0 PASS lines) — check the build tag / -run pattern."
             exit 1
           fi
-
-  k3s:
-    name: k3s-backend integration
-    # No root/btrfs/Docker needed: the test self-builds the binary into a TempDir
-    # and exercises the HTTP + callback path against a fake Fred. Just needs Go.
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Run k3s-backend integration suite
-        run: |
-          set -o pipefail
-          make test-integration-k3s 2>&1 | tee k3s-integration.log
-
-      - name: Guard — fail if any k3s integration test was SKIPPED
-        run: |
-          set -uo pipefail
-          if grep -Eq '^[[:space:]]*--- SKIP:' k3s-integration.log; then
-            grep -E '^[[:space:]]*--- SKIP:' k3s-integration.log || true
-            echo "::error::k3s integration tests were SKIPPED (go toolchain missing?). Failing."
-            exit 1
-          fi
-          passed="$(grep -cE '^[[:space:]]*--- PASS:' k3s-integration.log || true)"
-          echo "k3s integration tests passed: ${passed:-0}"
-          if [ "${passed:-0}" -lt 1 ]; then
-            echo "::error::No k3s integration tests executed."
-            exit 1
-          fi

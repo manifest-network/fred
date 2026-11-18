@@ -897,7 +897,7 @@ func authorizeRetained(info *backend.ProvisionInfo, callerTenant string) bool {
 
 // provisionReason returns the tenant-facing machine reason for a provision,
 // applying the ReasonUnknown read-boundary default so a FAILED provision never
-// surfaces an empty reason to the tenant (ENG-508). The docker/k3s store
+// surfaces an empty reason to the tenant (ENG-508). The docker store
 // boundaries already default, but a legacy or misbehaving HTTP backend may hand
 // back a failed status with no authored reason — this is the fail-closed
 // backstop at the API boundary. Non-failed statuses pass through unchanged

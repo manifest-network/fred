@@ -118,7 +118,7 @@ type Backend interface {
 	// ListRetentions returns the leases whose data this backend currently
 	// retains (soft-deleted, awaiting restore or grace-reap). Used by the
 	// reconciler to keep placement affinity for retained leases (ENG-333).
-	// Backends without retention (e.g. k3s) return an empty slice.
+	// Backends without retention return an empty slice.
 	ListRetentions(ctx context.Context) ([]RetainedLease, error)
 
 	// Name returns the backend's configured name.

@@ -457,7 +457,7 @@ restored one starts.
 
 ### Request Body Limits
 
-All requests are wrapped with `http.MaxBytesReader` enforcing a configurable maximum via `max_request_body_size`. The tenant-facing API (providerd) defaults to 1 MiB; the docker and k3s backends default to 2 MiB (`DefaultMaxRequestBodySize = 2 << 20`) to leave headroom over the raw tenant body providerd forwards. The backend defaults are overridable via `max_request_body_size` in the backend YAML or the `{DOCKER,K3S}_BACKEND_MAX_REQUEST_BODY_SIZE` env vars (ENG-448).
+All requests are wrapped with `http.MaxBytesReader` enforcing a configurable maximum via `max_request_body_size`. The tenant-facing API (providerd) defaults to 1 MiB; the docker backend defaults to 2 MiB (`DefaultMaxRequestBodySize = 2 << 20`) to leave headroom over the raw tenant body providerd forwards. The backend default is overridable via `max_request_body_size` in the backend YAML or the `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` env var (ENG-448).
 
 ### Query Parameter Bounds
 
@@ -749,7 +749,7 @@ When `production_mode: true`, Fred enforces security requirements at startup:
 
 The daemon refuses to start if any check fails.
 
-**Docker/k3s backend.** Each backend is a separate process with its own config and its own `production_mode` flag. When set, the backend rejects `callback_insecure_skip_verify` (which would disable TLS verification on the backend → Fred callback hop) and refuses to start. This mirrors the `backends[].tls_skip_verify` gate above, closing the same MITM exposure on the reverse (backend → Fred) direction. The Docker backend's production mode also requires `docker_host` to be a canonical absolute local Unix socket URL (`unix:///absolute/path`) and refuses to start otherwise.
+**Docker backend.** Each backend is a separate process with its own config and its own `production_mode` flag. When set, the backend rejects `callback_insecure_skip_verify` (which would disable TLS verification on the backend → Fred callback hop) and refuses to start. This mirrors the `backends[].tls_skip_verify` gate above, closing the same MITM exposure on the reverse (backend → Fred) direction. The Docker backend's production mode also requires `docker_host` to be a canonical absolute local Unix socket URL (`unix:///absolute/path`) and refuses to start otherwise.
 
 ## Known Limitations
 

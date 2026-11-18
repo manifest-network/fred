@@ -1,10 +1,9 @@
-.PHONY: all build build-mock build-docker build-k3s build-placement-preflight build-placement-repair install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore test-integration-k3s test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker run-k3s fmt generate verify help
+.PHONY: all build build-mock build-docker build-placement-preflight build-placement-repair install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
 MOCK_BINARY_NAME=mock-backend
 DOCKER_BINARY_NAME=docker-backend
-K3S_BINARY_NAME=k3s-backend
 PLACEMENT_PREFLIGHT_BINARY_NAME=placement-preflight
 PLACEMENT_REPAIR_BINARY_NAME=placement-repair
 
@@ -35,7 +34,7 @@ GOLANGCI_LINT_VERSION := $(shell cat .golangci-lint-version 2>/dev/null)
 LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
 # Default target
-all: build build-mock build-docker build-k3s build-placement-preflight build-placement-repair
+all: build build-mock build-docker build-placement-preflight build-placement-repair
 
 # Build providerd
 build:
@@ -54,12 +53,6 @@ build-docker:
 	@echo "Building $(DOCKER_BINARY_NAME)..."
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(DOCKER_BINARY_NAME) ./cmd/docker-backend
-
-# Build k3s-backend
-build-k3s:
-	@echo "Building $(K3S_BINARY_NAME)..."
-	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(K3S_BINARY_NAME) ./cmd/k3s-backend
 
 # Build the offline placement inspector, preparer, and fresh initializer
 build-placement-preflight:
@@ -81,8 +74,6 @@ install:
 	$(GOCMD) install $(LDFLAGS) ./cmd/mock-backend
 	@echo "Installing $(DOCKER_BINARY_NAME)..."
 	$(GOCMD) install $(LDFLAGS) ./cmd/docker-backend
-	@echo "Installing $(K3S_BINARY_NAME)..."
-	$(GOCMD) install $(LDFLAGS) ./cmd/k3s-backend
 	@echo "Installing $(PLACEMENT_PREFLIGHT_BINARY_NAME)..."
 	$(GOCMD) install $(LDFLAGS) ./cmd/placement-preflight
 	@echo "Installing $(PLACEMENT_REPAIR_BINARY_NAME)..."
@@ -145,13 +136,6 @@ test-integration-volume:
 test-integration-restore:
 	@echo "Running retain/restore integration tests (requires root + Docker + btrfs-progs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_BtrfsRenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
-
-# Run k3s-backend integration tests (requires `go` toolchain; cmd/k3s-backend/integration_test.go
-# self-builds the binary into t.TempDir and exercises the full HTTP + callback path against a fake Fred).
-# The current scaffold test does not require a live K3s cluster.
-test-integration-k3s:
-	@echo "Running k3s-backend integration tests..."
-	$(GOTEST) -tags integration -v ./cmd/k3s-backend/ -timeout 10m
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
@@ -220,13 +204,6 @@ run-docker: build-docker
 	@echo "Running $(DOCKER_BINARY_NAME) with config $(DOCKER_BACKEND_CONFIG)..."
 	@exec $(BUILD_DIR)/$(DOCKER_BINARY_NAME) --config $(DOCKER_BACKEND_CONFIG)
 
-# Run the k3s backend
-# Override config with: K3S_BACKEND_CONFIG=path/to/config.yaml make run-k3s
-K3S_BACKEND_CONFIG ?= config.k3s.yaml
-run-k3s: build-k3s
-	@echo "Running $(K3S_BINARY_NAME) with config $(K3S_BACKEND_CONFIG)..."
-	@exec $(BUILD_DIR)/$(K3S_BINARY_NAME) --config $(K3S_BACKEND_CONFIG)
-
 # Format code
 fmt:
 	@echo "Formatting code..."
@@ -248,7 +225,6 @@ help:
 	@echo "  build            - Build providerd"
 	@echo "  build-mock       - Build mock-backend for testing"
 	@echo "  build-docker     - Build docker-backend"
-	@echo "  build-k3s        - Build k3s-backend"
 	@echo "  build-placement-preflight - Build the placement inspector, preparer, and fresh initializer"
 	@echo "  build-placement-repair    - Build the offline placement inspector and exact repair tool"
 	@echo "  install          - Install binaries to GOPATH/bin"
@@ -262,7 +238,6 @@ help:
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
 	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, btrfs-progs)"
-	@echo "  test-integration-k3s           - Run k3s-backend integration tests (self-builds binary)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"
@@ -270,7 +245,6 @@ help:
 	@echo "  run-mock         - Build and run mock-backend (export MOCK_BACKEND_STORAGE_ID and MOCK_BACKEND_CALLBACK_SECRET)"
 	@echo "  run-mock-delay   - Run mock-backend with 2s provisioning delay (same variables as run-mock)"
 	@echo "  run-docker       - Build and run docker-backend (DOCKER_BACKEND_CONFIG=path to override)"
-	@echo "  run-k3s          - Build and run k3s-backend (K3S_BACKEND_CONFIG=path to override)"
 	@echo "  fmt              - Format code"
 	@echo "  generate         - Generate mocks"
 	@echo "  verify           - Verify dependencies"

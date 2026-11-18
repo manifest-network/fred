@@ -26,8 +26,8 @@ func collectors() []prometheus.Collector {
 // before the second one writes: these collectors are package globals, so a
 // separate test function would depend on Go running them in source order.
 //
-// Laziness is the invariant. Every fred binary links this package — providerd,
-// docker-backend, k3s-backend — so anything registered here materialises in all
+// Laziness is the invariant. Every fred binary links this package — providerd
+// and docker-backend — so anything registered here materialises in all
 // of them. That is only free because each collector is a *Vec: registered
 // eagerly like everything else, but exporting no child series until a package
 // that runs a component declares its counter. An unlabelled Counter, Gauge or

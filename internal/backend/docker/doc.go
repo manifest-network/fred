@@ -35,8 +35,7 @@
 // # Major components
 //
 //   - internal/backend/shared/leasesm: per-lease actor + state machine
-//     (substrate-agnostic; Docker is its only consumer today, since the k3s
-//     scaffold deliberately does not use it)
+//     (substrate-agnostic; Docker is its only consumer today)
 //   - lease_actor_factory.go, lease_actor_routing.go: factory wiring
 //     Docker dependencies into leasesm.NewLeaseActor, plus Backend-side
 //     routing/dispatch around the actor inbox (b.actors map, routeToLease,

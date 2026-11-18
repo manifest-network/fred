@@ -144,15 +144,10 @@ go build -o build/mock-backend ./cmd/mock-backend
 # Build only docker-backend
 go build -o build/docker-backend ./cmd/docker-backend
 
-# Build only k3s-backend
-go build -o build/k3s-backend ./cmd/k3s-backend
-
 # Build the offline placement tools
 go build -o build/placement-preflight ./cmd/placement-preflight
 go build -o build/placement-repair ./cmd/placement-repair
 ```
-
-> **k3s-backend is currently an experimental, non-functional scaffold (ENG-133):** the binary boots, serves the backend HTTP contract, and signs/verifies callbacks, but its provisioner returns `status=failed, error="not implemented"` for every provision. It is **not usable in production**; real Kubernetes provisioning lands in ENG-134+.
 
 ## Local Development Setup
 
@@ -174,7 +169,7 @@ cp config.example.yaml config.yaml
 
 ### Required Configuration
 
-All required fields are validated at startup. The daemon will fail to start with a clear error message if any required configuration is missing or invalid. Provider, Docker and K3s YAML configuration files must contain exactly one document; unknown keys, including nested keys, are rejected. Provider YAML and JSON configuration also reject case-insensitive key collisions, so aliases cannot silently override a security setting.
+All required fields are validated at startup. The daemon will fail to start with a clear error message if any required configuration is missing or invalid. Provider and Docker YAML configuration files must contain exactly one document; unknown keys, including nested keys, are rejected. Provider YAML and JSON configuration also reject case-insensitive key collisions, so aliases cannot silently override a security setting.
 
 | Option | Description |
 |--------|-------------|
@@ -192,7 +187,7 @@ All required fields are validated at startup. The daemon will fail to start with
 Backends are services that handle the actual resource provisioning. Backend and callback URLs must be absolute HTTP(S) URLs. Provider `production_mode: true` requires HTTPS in both directions and verifies backend peers using the configured private CA (or system roots); bundled backends must also enable production mode so callback peer verification cannot be disabled. HTTP is development-only because request HMAC does not authenticate backend responses and callback HMAC does not provide transport confidentiality.
 
 The currently deployed and production-validated execution envelope is
-`docker-backend` on XFS. K3s is a non-functional scaffold, and Docker's Btrfs
+`docker-backend` on XFS. Docker's Btrfs
 and ZFS volume implementations have automated coverage but are experimental and
 not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
@@ -322,13 +317,13 @@ placement_store_db_path: "/var/lib/fred/placements.db"
 
 Bundled backends also require a one-shot storage-lineage initialization before
 their first normal start. For a genuinely new empty Docker backend, run
-`docker-backend -config docker-backend.yaml -initialize-storage-identity new`;
-the k3s scaffold uses the corresponding `k3s-backend` command. Normal startup is
+`docker-backend -config docker-backend.yaml -initialize-storage-identity new`.
+Normal startup is
 verification-only and will not create or repair markers or authoritative
 journals. Existing v0.13 Docker storage instead uses the stopped-and-drained
 `adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v013x).
 
-Bundled Docker and k3s backends require a positive `callback_max_age` (default
+The bundled Docker backend requires a positive `callback_max_age` (default
 `24h`). The age applies to typed lifecycle observations;
 exact operation and maintenance completions never expire because they may be the
 only evidence that can settle Fred's durable write-ahead attempt or an exact
@@ -417,10 +412,7 @@ export PROVIDER_CALLBACK_BASE_URL=http://fred.example.com:8080 # only if the con
 # Print version (providerd, backend binaries, and placement tools support --version)
 ./build/providerd --version
 ./build/docker-backend --version
-./build/k3s-backend --version
 ```
-
-> **k3s-backend is currently an experimental, non-functional scaffold (ENG-133):** the binary boots, serves the backend HTTP contract, and signs/verifies callbacks, but its provisioner returns `status=failed, error="not implemented"` for every provision. It is **not usable in production**; real Kubernetes provisioning lands in ENG-134+.
 
 ## API Endpoints
 
@@ -1434,7 +1426,7 @@ they carry no `backend_storage_id` to select the HMAC key.
 The seal covers more than the substrate marker. Docker always binds
 `callbacks.db`, `releases.db`, and `retention.db` to the same storage UUID and
 to distinct store kinds; `retention.db` remains required when
-`retain_on_close: false`. K3s binds `callbacks.db` and `releases.db`.
+`retain_on_close: false`.
 Every authoritative database must be an unsymlinked, single-link regular file
 with exact mode `0600`; initialization and normal startup reject an insecure
 restore, and runtime re-attestation withdraws the whole backend lineage on
@@ -2036,7 +2028,6 @@ cmd/
 ├── providerd/          # Main daemon entry point
 ├── mock-backend/       # Mock backend for testing
 ├── docker-backend/     # Docker container backend
-├── k3s-backend/        # K3s container backend
 ├── placement-preflight/ # Offline placement inspector, v0.13 preparer, and fresh initializer
 ├── placement-repair/    # Offline placement inspector and exact repair tool
 ├── lease-token/        # Mints ADR-036 tenant bearer tokens for lease endpoints
@@ -2052,8 +2043,7 @@ internal/
 │   ├── router.go       # SKU-based routing
 │   ├── mock.go         # In-memory mock for unit tests
 │   ├── shared/         # Cross-backend durable journals, typed settlements, callback sender, and diagnostics
-│   ├── docker/         # Docker container backend implementation (actor-per-lease)
-│   └── k3s/            # K3s container backend implementation
+│   └── docker/         # Docker container backend implementation (actor-per-lease)
 ├── backendidentity/    # Durable backend storage identity and bound HTTP routes
 ├── callbackurl/        # Validated operation/lifecycle callback URL construction
 ├── chain/              # gRPC client, WebSocket subscriber, signer

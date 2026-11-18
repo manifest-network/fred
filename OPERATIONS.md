@@ -5,7 +5,7 @@ This document covers day-to-day operation of a Fred deployment: health checks, a
 For deployment and initial setup see [DEPLOYMENT.md](DEPLOYMENT.md). For metric definitions see [ARCHITECTURE.md](ARCHITECTURE.md#metrics-prometheus). Sample Grafana dashboards live in the `manifest-deploy` repository.
 
 The deployed and production-validated execution envelope is `docker-backend` on
-XFS. K3s is a non-functional scaffold; Docker's Btrfs and ZFS implementations
+XFS. Docker's Btrfs and ZFS implementations
 are experimental and not deployed. Their recovery notes remain here to document
 implemented behavior, not to grant production support.
 

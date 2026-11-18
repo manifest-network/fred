@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- The experimental `k3s-backend` is gone: the binary, its `k3s-backend` image target, `config.k3s.yaml.example`, the `K3S_BACKEND_*` environment variables, the `fred_k3s_backend_*` metrics, and the `build-k3s`, `run-k3s` and `test-integration-k3s` make targets. It was a scaffold that failed every provision and was never released as a binary or image. Fred no longer depends on `k8s.io/client-go`.
+
 ### Fixed
 
 ### Security

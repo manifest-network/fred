@@ -4,12 +4,10 @@
 // the docker backend for its callback, diagnostics, releases and retention
 // loops and its docker_reconciliation, docker_network_reclamation,
 // docker_projid_audit, docker_seccomp_census, docker_runtime_inventory,
-// docker_runtime_refresh and docker_volume_delete_hold workers, the k3s
-// backend for callback, diagnostics and releases (it has no retention store —
-// retention is docker-only, ENG-325). The goroutine-panic counter is written by
-// providerd for its payload-writer, ack-batcher, withdraw-scheduler,
-// timeout-checker and maintenance-recovery goroutines, by both bundled backends
-// for the shared callback-replay workers, and by the docker backend for its
+// docker_runtime_refresh and docker_volume_delete_hold workers. The
+// goroutine-panic counter is written by providerd for its payload-writer,
+// ack-batcher, withdraw-scheduler, timeout-checker and maintenance-recovery
+// goroutines, and by the docker backend for its callback-replay workers and its
 // container-death overflow reporter.
 //
 // It exists as a package of its own because its parent, internal/metrics, is

@@ -18,8 +18,8 @@
 //
 // Metrics for other binaries live elsewhere:
 //
-//   - the docker and k3s backends define their own `fred_docker_backend_*` /
-//     `fred_k3s_backend_*` sets in their package-local metrics files;
+//   - the docker backend defines its own `fred_docker_backend_*` set in its
+//     package-local metrics files;
 //   - the `fred_background_*` panic counters, which every binary writes, live in
 //     the background subpackage;
 //   - shared code that must reference no collector at all takes one by

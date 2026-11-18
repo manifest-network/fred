@@ -72,7 +72,7 @@ func resolveResourceProfilesForConfig(
 }
 
 // validateDockerResourceProfiles adds Docker's host-volume invariant to the
-// substrate-neutral shared schema. K3s legitimately persists scratch=0;
+// substrate-neutral shared schema. The schema itself permits scratch=0;
 // Docker does not: every new diskless authority must carry the positive value
 // captured before admission. Only a wholly absent v0.13 profile set may be
 // resolved from current configuration by an explicit compatibility path.

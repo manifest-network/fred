@@ -1956,8 +1956,8 @@ const shortIDLen = 12
 // (strip leading "type:" prefix such as "sha256:", then byte-bound to
 // 12 chars) without taking the docker library as a dependency. The
 // prefix strip is a no-op when there is no colon, and the byte-bounded
-// truncate is universal — K3s adapters can safely call this on pod
-// UIDs. Kept here so leasesm stays free of any docker import.
+// truncate is universal, so it is safe on any substrate's instance
+// IDs. Kept here so leasesm stays free of any docker import.
 func ShortID(id string) string {
 	if i := strings.IndexRune(id, ':'); i >= 0 {
 		id = id[i+1:]

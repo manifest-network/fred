@@ -11,10 +11,8 @@ import (
 // have to import docker. Every value the actor reports is one of leasesm's
 // closed lists, so each lands on a series that exists from startup.
 //
-// K3s (ENG-133) will provide its own SMMetrics implementation against its
-// own prometheus registry with K3s-flavored metric names; Docker keeps
-// `fred_docker_backend_lease_*` for backward compatibility with existing
-// operator dashboards.
+// Docker keeps `fred_docker_backend_lease_*` for backward compatibility with
+// existing operator dashboards.
 //
 // Zero-value ready (no state); the type is a struct rather than a
 // function-set so the implementation is named at each method site for

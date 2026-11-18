@@ -158,7 +158,7 @@ func (b *Backend) GetProvision(_ context.Context, leaseUUID string) (*backend.Pr
 	// lease must report `retained`, not the `failed` diagnostics it left behind.
 	// Both active and restoring records resolve to `retained` (a tenant polling
 	// during their own restore must still see retained, not a 404). Guarded for
-	// non-retaining configs (retentionStore == nil) and mock/k3s backends.
+	// non-retaining configs (retentionStore == nil).
 	if b.retentionStore != nil {
 		rec, retErr := b.retentionStore.Get(leaseUUID)
 		if retErr != nil {

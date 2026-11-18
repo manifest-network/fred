@@ -14,7 +14,6 @@ A production deployment has three independently runnable processes:
 |---|---|---|
 | `providerd` | Provider control host (1) | Subscribes to chain events, owns ADR-036 / HMAC auth, calls backends, batches lease acknowledgments |
 | `docker-backend` | Each Docker host (1..N) | Provisions containers, manages volumes, sends signed callbacks |
-| `k3s-backend` | Experimental — not for production | Kubernetes backend scaffold (ENG-133): boots and serves the backend contract but provisions nothing (every provision is reported as failed). Full K8s provisioning lands in ENG-134+. |
 | `manifestd` | Chain node (external) | Cosmos SDK chain that emits lease events |
 
 Common topology:
@@ -292,8 +291,8 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `host_address` — public IP or hostname tenants will use to reach containers
 - `callback_secret` — must match only this backend's corresponding
   `providerd` `backends[].hmac_secret` and must not be reused by another backend
-- `callback_max_age` — must be positive (default `24h`) in both Docker and k3s
-  production backends. It bounds typed lifecycle
+- `callback_max_age` — must be positive (default `24h`) in the Docker
+  backend. It bounds typed lifecycle
   observations. Exact operation/maintenance completions, operation and
   maintenance intents, and Docker's close intents do not expire: they may be the
   only evidence that can settle a durable placement attempt, classify a partial
@@ -321,15 +320,14 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
   on the same root filesystem. Storage-lineage initialization and runtime
   re-attestation fail closed if this mount or the pinned data-root inode changes
 
-**Environment variables** (docker-backend / k3s-backend) — each one set to a non-empty value overrides the corresponding YAML field; an unset or empty variable leaves the YAML value in place. No other field has an environment form:
+**Environment variables** (docker-backend) — each one set to a non-empty value overrides the corresponding YAML field; an unset or empty variable leaves the YAML value in place. No other field has an environment form:
 
-- `DOCKER_BACKEND_ADDR` / `K3S_BACKEND_ADDR` — override `listen_addr`
-- `DOCKER_BACKEND_CALLBACK_SECRET` / `K3S_BACKEND_CALLBACK_SECRET` — override `callback_secret` (lets you keep the secret out of the on-disk YAML)
+- `DOCKER_BACKEND_ADDR` — override `listen_addr`
+- `DOCKER_BACKEND_CALLBACK_SECRET` — override `callback_secret` (lets you keep the secret out of the on-disk YAML)
 - `DOCKER_BACKEND_CALLBACK_SECRET_NEXT` (docker-backend) — override `callback_secret_next` (see [Rotating a backend's HMAC key](#rotating-a-backends-hmac-key))
-- `DOCKER_BACKEND_HOST_ADDRESS` / `K3S_BACKEND_HOST_ADDRESS` — override `host_address`
-- `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` / `K3S_BACKEND_MAX_REQUEST_BODY_SIZE` — override the 2 MiB request-body cap (a value that is not a positive integer is ignored)
+- `DOCKER_BACKEND_HOST_ADDRESS` — override `host_address`
+- `DOCKER_BACKEND_MAX_REQUEST_BODY_SIZE` — override the 2 MiB request-body cap (a value that is not a positive integer is ignored)
 - `DOCKER_HOST` (docker-backend) — override `docker_host`, the Docker daemon endpoint
-- `KUBECONFIG` (k3s-backend) — used only when `kubeconfig_path` is empty in the YAML; `config.k3s.yaml.example` sets it, so remove that value to use the variable. A colon-separated list is merged by client-go
 
 **Deployment-automation prerequisite.** Before rolling this release, verify the
 rendered configuration on every host, not only the source template. Production
@@ -768,7 +766,7 @@ and preserve that safety evidence.
 | `<docker>/retention.db` | High — retained ownership, restore generation/finalizer, destination operation ID/callback pair/manifest/items/profiles, volume names, and source resource profiles are not reconstructible | Lost on disk failure → retained volumes can no longer be safely restored or reaped (orphaned on disk), and a committed or rolled-back restore cannot be classified or observed safely. The empty identity-bound file is always present and required, including when `retain_on_close` is false |
 | `<docker>/diagnostics.db` | Medium — failure diagnostics for past 7 days, but no lifecycle authority | May be recreated after loss while the backend is stopped; only historical diagnostics are lost. Open/create still refuses a symlink, hard link, non-regular file, or mode other than exact `0600`, but the file is not identity-bound or continuously re-attested |
 | `<docker>/callbacks.db` | Critical — write-ahead provision/restore operation rows (Pending/Succeeded/Failed), replacement intents, immutable resource/target authority, non-expiring destructive-close finalizers, durable exact/lifecycle deliveries, and per-lease FIFO evidence. Terminal operation rows remain after callback delivery as exact retry and restore-recovery authority until an authorized successor atomically retires them. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations are retained up to `callback_max_age`. Pre-identity v0.13 outbox rows must be drained while the old backend is still running and are never admitted into the current runtime queue | Accepted or terminal operation state, partial-replacement/close authority, immutable sizing, and queued callback evidence are not recreated. Normal startup refuses a missing file instead of rebuilding its schema. Losing a terminal restore result can make a safe source handback unknowable; absence is invalid rather than Failed. Losing a maintenance row can make an exact replacement cohort unclassifiable; losing a close row after teardown starts can turn an intentional zero-survivor cohort into unexplained release divergence. Restore this file with the matching `releases.db`, `retention.db`, marker pair, and substrate |
-| Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate; k3s uses its callback and release databases (by default `k3s-callbacks.db` and `k3s-releases.db`), both markers, and the cluster. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root and k3s keep both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
+| Backend storage-lineage seal | Critical — the marker pair plus every identity-bound authoritative store bind a backend name to one substrate generation | Docker's set is `callbacks.db`, `releases.db`, `retention.db`, both markers, and the substrate. Every authoritative database must remain an unsymlinked, single-link regular file with exact mode `0600`; startup and runtime re-attestation fail closed on drift. Restore the complete matching set. One missing, corrupt, foreign, cross-kind, or path/inode-replaced member intentionally prevents startup. Never copy markers onto replacement storage or rerun initialization to repair a committed seal. Whenever Docker has `volume_data_path`, the primary is `volume_data_path/.fred-backend-storage-identity.json` and the anchor is `callback_db_path.storage-identity-anchor.json`; Docker without a managed volume root keeps both adjacent to `callback_db_path`. If all paths share one mount, the set detects partial deletion/torn initialization but is not an independent backup—protect and snapshot the whole mount |
 | `placement_store_db_path` | Critical — provider binding, unresolved attempts, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable backend-name/storage pins, topology history, and the durable inventory baseline are non-derivable safety authority | Restore the exact file only while `providerd` is stopped, then [attest it](#restoring-an-older-placement-backup) before the first start. It must be an unsymlinked, single-link regular file with exact mode `0600`. Normal startup never creates, initializes, or migrates an absent/empty/unprepared replacement, and rejects a file bound to another provider. The fresh initializer is only for a genuinely new provider with zero total chain lease history; it is never recovery for a lost database |
 | `payload_store_db_path` | High — the manifest of every PENDING lease, the current manifest of every ACTIVE lease (Fred re-provisions from it after a crash or host reboot, including manifests a tenant `/update` replaced), and the exact bytes an in-flight provision attempt must re-send | Back it up and restore it together with `placement_store_db_path`, from the same moment, and only while `providerd` is stopped, as an unsymlinked, single-link regular file with exact mode `0600`. Tenants can re-upload only a PENDING lease's original manifest, which must match its on-chain hash. Without the file, an ACTIVE lease that needs re-provisioning is rebuilt from the latest active release its confirmed owner reports, and stays deferred (`payload not available`) while the owner reports none or cannot be read; an in-flight attempt stays unresolved. See [Restoring an older placement backup](#restoring-an-older-placement-backup) |
 | `token_tracker_db_path` | Preserve for replay protection; not durable lease authority | Persists across normal restarts. Losing, replacing, or restoring an older copy can reopen replay for consumed tokens until their signed expiry; see the [token validity window](SECURITY.md#token-replay-tenant-api). bbolt creates a missing file with mode `0600`, but this cache is not lineage/path identity-bound like placement or payload authority; replace it only while providerd is stopped |
@@ -1443,8 +1441,8 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
    image — `ghcr.io/manifest-network/fred` — which contains `providerd` plus
    both placement tools. The image still starts `providerd` by default; invoke
    a tool with `--entrypoint /placement-preflight` or
-   `--entrypoint /placement-repair`. There is no published `docker-backend` (or
-   `k3s-backend`) image; stateful production hosts run the `docker-backend`
+   `--entrypoint /placement-repair`. There is no published `docker-backend`
+   image; stateful production hosts run the `docker-backend`
    binary from its archive. The locally built backend image is for stateless
    development (see [Docker images](#docker-images)).
 2. Pull the new binary or image to your hosts.
@@ -1515,7 +1513,7 @@ inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
 fleet on `docker-backend` with XFS, matching
 [Components and topology](#components-and-topology) and the current
 [stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus).
-K3s remains a non-functional scaffold, and Btrfs/ZFS remain experimental. This
+Btrfs/ZFS remain experimental. This
 is a point-in-time rollout fact, not a permanent support or compatibility
 promise: re-inventory the deployments immediately before executing the cutover
 and extend the proof plan if the fleet has changed. Local development
@@ -1810,8 +1808,7 @@ delete a journal, or remove a load-bearing row to force adoption.
 
 Initialization is a crash-resumable lineage transaction. Before inspecting
 fresh/existing evidence, it binds the physical parent directory of both markers
-and every authoritative journal (Docker callbacks/releases/retention; k3s
-callbacks/releases). All inspection, creation, and publication then uses those
+and every authoritative journal (callbacks/releases/retention). All inspection, creation, and publication then uses those
 retained descriptors, and every parent pathname must continue to name the same
 device/inode. It first publishes a pending anchor containing the generated UUID
 and immutable fresh/existing profile. Only after that anchor is durable can its
@@ -1828,12 +1825,6 @@ against the unchanged stopped input; the pending anchor forces the same profile
 and identity. Do not switch modes, delete one output, or restore only part of
 the set. Once both markers are committed, initialization is verification-only
 and will never recreate, rebind, or repair a store.
-
-The experimental k3s scaffold supports only
-`-initialize-storage-identity new`, binds the seal to its cluster UID, and uses
-the same all-absent or all-existing rule for `callbacks.db` and `releases.db`.
-Its existing-profile proof requires a drained callback outbox and no active
-release; it does not adopt live workloads.
 
 Normal startup loads a typed verified-storage capability from the marker pair,
 verifies the entire authoritative set before recovery or cleanup, and opens the
@@ -1932,7 +1923,7 @@ substrate before making later profile changes.
 
 v0.13.0 allowed an explicit
 `callback_max_age: 0`; before restarting each upgraded backend, replace that
-value with a positive duration because current Docker and k3s binaries reject
+value with a positive duration because the current Docker backend rejects
 zero at startup. If the key is omitted, the `24h` default remains in effect and
 no config edit is needed. A v0.13.0 backend can accept the new additive request
 fields, but it does not persist the separate typed
@@ -2565,8 +2556,7 @@ from a proven safe snapshot under the rollback rules below.
 
 The backend storage-lineage seal has its own rollback boundary. Roll Docker's
 marker pair, `callbacks.db`, `releases.db`, `retention.db`, and substrate back as
-one stopped snapshot; for k3s the corresponding set is its marker pair,
-`callbacks.db`, `releases.db`, and cluster state. A current binary rejects an
+one stopped snapshot. A current binary rejects an
 individually missing, foreign, cross-kind, or path-replaced store, but it cannot
 distinguish a complete matching snapshot from the original lineage. Fence the
 original before starting a restored copy. Even files that each carry the same
@@ -2685,9 +2675,9 @@ stopped-process backup before upgrading.
 
 ## Docker images
 
-`goreleaser` publishes only the `providerd` image (`ghcr.io/manifest-network/fred`, built from `Dockerfile.goreleaser`). The `docker-backend` and `k3s-backend` images are **not** published. Stateful production hosts use the released native `docker-backend` binary under systemd with XFS. The local `docker-backend` image below supports stateless development only; `k3s-backend` remains an experimental scaffold.
+`goreleaser` publishes only the `providerd` image (`ghcr.io/manifest-network/fred`, built from `Dockerfile.goreleaser`). The `docker-backend` image is **not** published. Stateful production hosts use the released native `docker-backend` binary under systemd with XFS. The local `docker-backend` image below supports stateless development only.
 
-The repo ships a multi-stage `Dockerfile` with three named targets:
+The repo ships a multi-stage `Dockerfile` with two named targets:
 
 ```bash
 # providerd
@@ -2695,14 +2685,11 @@ docker build --target providerd -t fred-providerd .
 
 # docker-backend (stateless development only)
 docker build --target docker-backend -t fred-docker-backend .
-
-# k3s-backend (experimental scaffold — see below; not for production)
-docker build --target k3s-backend -t fred-k3s-backend .
 ```
 
-The `docker-backend` stage is intentionally last in the `Dockerfile`, so a target-less `docker build .` defaults to producing the `docker-backend` image. `k3s-backend` is an experimental, non-functional scaffold (ENG-133) — it boots and serves the backend contract but provisions nothing (every provision is reported as failed); it is not for production. Full Kubernetes provisioning lands in ENG-134+.
+The `docker-backend` stage is intentionally last in the `Dockerfile`, so a target-less `docker build .` defaults to producing the `docker-backend` image.
 
-All three run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
+Both run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
 
 **`docker-backend` (stateless development only)** — the image contains no
 `xfs_quota`, `btrfs`, or `zfs` executable. Its `/data` volume persists the

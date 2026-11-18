@@ -72,8 +72,7 @@ const (
 
 // InstanceState is a substrate-agnostic snapshot of a workload
 // instance. The Docker backend translates ContainerInfo into this
-// shape; the K3s backend will translate a Pod's containerStatuses
-// entry.
+// shape.
 //
 // OOMKilled is exposed as a separate field rather than encoded inside
 // Phase so callers can distinguish "exited cleanly" from "killed by
@@ -103,8 +102,7 @@ type InstanceState struct {
 
 // InstanceInspector wraps the substrate-specific "inspect this
 // instance" operation. The Docker backend implements this around
-// DockerClient.InspectContainer; K3s will implement it around
-// pod-status inspection.
+// DockerClient.InspectContainer.
 type InstanceInspector interface {
 	InspectInstance(ctx context.Context, instanceID string) (*InstanceState, error)
 }
@@ -318,8 +316,7 @@ type LeaseProvisionStore interface {
 // SMMetrics is the observability seam for substrate-specific metric
 // emission. Each substrate provides its own implementation, owning
 // the prometheus registry, naming, and labels — the Docker backend
-// keeps `fred_docker_backend_lease_*` names; K3s will choose its own
-// substrate-flavored namespacing. The SM/actor code calls these
+// keeps `fred_docker_backend_lease_*` names. The SM/actor code calls these
 // methods at fixed sites; the substrate adapter shapes the
 // counter/label semantics.
 //
