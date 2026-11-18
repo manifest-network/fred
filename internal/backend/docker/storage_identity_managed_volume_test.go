@@ -282,58 +282,6 @@ func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testi
 	}
 }
 
-func TestInitializeStorageIdentityRejectsHiddenZFSChildBeforePublication(t *testing.T) {
-	cfg := storageIdentityLegacyRetentionTestConfig(t)
-	cfg.VolumeDataPath = t.TempDir()
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-	name := canonicalVolumeName("11111111-1111-4111-8111-111111111111", "app", 0)
-
-	binDir := t.TempDir()
-	logPath := filepath.Join(t.TempDir(), "zfs.log")
-	fakeZFS := filepath.Join(binDir, "zfs")
-	require.NoError(t, os.WriteFile(fakeZFS, []byte(`#!/bin/sh
-printf '%s\n' "$*" >> "$FRED_TEST_ZFS_LOG"
-if [ "$*" = "list -H -o name $FRED_TEST_ZFS_ROOT" ]; then
-  printf '%s\n' 'tank/fred'
-  exit 0
-fi
-if [ "$*" = 'list -H -r -d 1 -o name tank/fred' ]; then
-  printf '%s\n%s\n' 'tank/fred' "tank/fred/$FRED_TEST_ZFS_CHILD"
-  exit 0
-fi
-if [ "$*" = "list -H -p -o name,mounted,mountpoint tank/fred/$FRED_TEST_ZFS_CHILD" ]; then
-  printf '%s\tno\t%s/%s\n' "tank/fred/$FRED_TEST_ZFS_CHILD" "$FRED_TEST_ZFS_ROOT" "$FRED_TEST_ZFS_CHILD"
-  exit 0
-fi
-exit 97
-`), 0o700))
-	t.Setenv("PATH", binDir)
-	t.Setenv("FRED_TEST_ZFS_LOG", logPath)
-	t.Setenv("FRED_TEST_ZFS_ROOT", cfg.VolumeDataPath)
-	t.Setenv("FRED_TEST_ZFS_CHILD", name)
-	volumes := &zfsVolumeManager{dataPath: cfg.VolumeDataPath, logger: slog.Default()}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-
-	_, err := initializeStorageIdentityWithDependencies(
-		ctx,
-		cfg,
-		StorageIdentityInitializeAdopt,
-		storageIdentityPreflightDockerMock(t),
-		volumes,
-	)
-	require.ErrorContains(t, err, "interrupted unmounted create")
-	commands, readErr := os.ReadFile(logPath)
-	require.NoError(t, readErr)
-	assert.Contains(t, string(commands), "list -H -r -d 1 -o name tank/fred",
-		"the proof must inventory datasets that have no expected directory")
-	assert.NotContains(t, string(commands), "mount tank/fred/",
-		"one-shot lineage proof must not recover an interrupted dataset")
-	assertStorageIdentityAuthorityUnchanged(t, cfg, before)
-}
-
 func TestStorageIdentityAdoptionRejectsRetentionVolumeIdentityMismatch(t *testing.T) {
 	const (
 		source = "33333333-3333-4333-8333-333333333333"

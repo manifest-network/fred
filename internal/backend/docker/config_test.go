@@ -535,7 +535,7 @@ func TestConfig_Validate_Volume(t *testing.T) {
 	})
 
 	t.Run("valid volume_filesystem values", func(t *testing.T) {
-		for _, fs := range []string{"btrfs", "xfs", "zfs"} {
+		for _, fs := range []string{"btrfs", "xfs"} {
 			cfg := validConfig()
 			cfg.VolumeFilesystem = fs
 			assert.NoError(t, cfg.Validate(), "filesystem %q should be valid", fs)
@@ -547,7 +547,15 @@ func TestConfig_Validate_Volume(t *testing.T) {
 		cfg.VolumeFilesystem = "ext4"
 		err := cfg.Validate()
 		require.Error(t, err)
-		assert.ErrorContains(t, err, "volume_filesystem must be btrfs, xfs, or zfs")
+		assert.ErrorContains(t, err, "volume_filesystem must be btrfs or xfs")
+	})
+
+	t.Run("zfs is no longer a volume_filesystem", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.VolumeFilesystem = "zfs"
+		err := cfg.Validate()
+		require.Error(t, err)
+		assert.ErrorContains(t, err, `volume_filesystem must be btrfs or xfs (got "zfs")`)
 	})
 
 	t.Run("empty volume_filesystem is valid", func(t *testing.T) {

@@ -236,7 +236,7 @@ func TestReapingFootprintUsesCompleteProofInventory(t *testing.T) {
 	proofName := "fred-retained-u1-app-0"
 	b.volumes = &mockVolumeManager{
 		ListFn: func() ([]string, error) {
-			return nil, nil // an unmounted ZFS dataset has no bind-ready directory
+			return nil, nil // a volume whose deletion is held has no bind-ready directory
 		},
 		ListForProofFn: func(context.Context) ([]string, error) {
 			return []string{proofName}, nil

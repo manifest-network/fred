@@ -5,8 +5,8 @@ This document covers day-to-day operation of a Fred deployment: health checks, a
 For deployment and initial setup see [DEPLOYMENT.md](DEPLOYMENT.md). For metric definitions see [ARCHITECTURE.md](ARCHITECTURE.md#metrics-prometheus). Sample Grafana dashboards live in the `manifest-deploy` repository.
 
 The deployed and production-validated execution envelope is `docker-backend` on
-XFS. Docker's Btrfs and ZFS implementations
-are experimental and not deployed. Their recovery notes remain here to document
+XFS. Docker's Btrfs implementation
+is experimental and not deployed. Its recovery notes remain here to document
 implemented behavior, not to grant production support.
 
 ---
@@ -298,7 +298,7 @@ If `lease_actor_stuck_seconds` exceeds your alert threshold, one specific lease'
 
 **Common causes and remedies:**
 - **`docker stop` hanging**: a container is ignoring SIGTERM and the grace period is long. Lower `container_stop_timeout`.
-- **Volume cleanup hanging on btrfs/zfs**: a quota or subvolume operation is blocked in the kernel. Inspect the filesystem state directly.
+- **Volume cleanup hanging on btrfs**: a quota or subvolume operation is blocked in the kernel. Inspect the filesystem state directly.
 - **Genuine deadlock**: file an issue with the goroutine dump. The actor will not unblock. Later messages for the lease queue behind it, or are refused once its 16-message inbox is full, so retries from the reconciler or providerd reach the same wedged actor: nothing moves for that lease until docker-backend restarts.
 
 A stalled or failing image pull is not a cause: image preparation runs in a worker goroutine, so it delays provisions without raising this gauge. docker-backend makes these registry requests itself, so dockerd logs and a manual `docker pull` show neither the requests nor their errors. Search the docker-backend log for `resolve immutable image:` (a Docker Hub quota refusal contains `TOOMANYREQUESTS` or `429`), check `fred_docker_backend_image_registry_requests_total{status=~"429|5xx|error"}`, and follow [Registry rate limits](#registry-rate-limits).
@@ -438,10 +438,8 @@ require offline verification` distinguishes a repaired root from ordinary limit
 refresh. Preserve its path and previous project attributes, then verify historical
 descendant tagging during stopped-writer maintenance; the warning does not attest
 the existing tree. Full setup is in the xfs section and the
-systemd note of [DEPLOYMENT.md](DEPLOYMENT.md#xfs-good-for-large-fleets). The `zfs`
-backend is exempt (it supports `zfs allow` delegation, so a properly-delegated
-non-root host is not rejected) and the `noop` backend is unaffected (no privileged
-ops).
+systemd note of [DEPLOYMENT.md](DEPLOYMENT.md#xfs-good-for-large-fleets). The `noop`
+backend is unaffected (no privileged ops).
 
 **XFS project-ID ownership.** Project IDs and dquots are global to the containing
 XFS filesystem. `volume_data_path` being a subdirectory does not create a quota
@@ -934,19 +932,14 @@ typed forms before operation-intent recovery:
   [Held volume deletions](#held-volume-deletions). Only a contradiction of the
   stage's own authority, or an outcome that cannot be classified, still latches
   and stops the current backend instance.
-- **ZFS:** an exact managed child with the configured mountpoint but
-  `mounted=no` is preserved interrupted-create evidence. Startup attempts to
-  mount and re-attest that exact child; it never destroys it. A different
-  mountpoint, collision, failed mount, or ambiguous result fails startup.
 - **Btrfs:** there is no private stage. The create command publishes the
   subvolume before setting its qgroup limit, so operation-intent recovery, the
   fail-closed startup quota reconciliation, and orphan classification converge
   an interrupted result.
 
 First fix the filesystem or quota-control-plane error and retry the same sealed
-backend. Do not rename or delete a create/delete stage, synthesize a marker,
-change a ZFS
-mountpoint, or destroy a dataset merely to make readiness green. If retry still
+backend. Do not rename or delete a create/delete stage, or synthesize a marker
+merely to make readiness green. If retry still
 fails, do not leave `Restart=on-failure` probing the lineage every few seconds:
 run `systemctl stop docker-backend` (`fred-docker-backend` under
 manifest-deploy), verify the unit and process are fully
@@ -958,14 +951,11 @@ new process retries recovery.
 
 The stopped `-preflight-storage-identity-adoption` and
 `-initialize-storage-identity` commands are deliberately different: they refuse
-XFS create/delete stages and unmounted ZFS children without normalizing them.
-Neither XFS form can originate from v0.13.0, so finding one during an unsealed
+XFS create/delete stages without normalizing them.
+Neither form can originate from v0.13.0, so finding one during an unsealed
 v0.13 cutover
 means an upgraded process already mutated the root or the wrong snapshot is in
-use; preserve the evidence and restore the matching stopped snapshot. For an
-unmounted ZFS child, verify the exact child and configured mountpoint, then
-remount it or restore the matching pool snapshot before rerunning the same
-one-shot mode. Never interpret a failed one-shot command as cleanup authority.
+use; preserve the evidence and restore the matching stopped snapshot. Never interpret a failed one-shot command as cleanup authority.
 
 ---
 

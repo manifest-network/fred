@@ -48,8 +48,8 @@ RETENTION_DB_PATH="$REPO_ROOT/retention.db"
 DIAGNOSTICS_DB_PATH="$REPO_ROOT/diagnostics.db"
 
 # Volume data path. Fred writes managed volume subdirs under this path.
-# Must be on a filesystem supported by fred's quota backends (btrfs, xfs
-# with project quotas, or zfs). The default lives under $HOME so dev
+# Must be on a filesystem supported by fred's quota backends (btrfs, or xfs
+# with project quotas). The default lives under $HOME so dev
 # setups don't need sudo; for production-shaped layouts override with
 # e.g. VOLUME_DATA_PATH=/var/lib/fred/volumes.
 VOLUME_DATA_PATH="${VOLUME_DATA_PATH:-$HOME/fred-volumes}"

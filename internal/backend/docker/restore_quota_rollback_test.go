@@ -69,7 +69,7 @@ func quotaRollbackProvision() map[string]*provision {
 // volumeManager contract. Pin the rollback ordering once per concrete kind so
 // a future kind-specific shortcut cannot bypass the immutable source cap.
 func TestRollbackRestoreAdoption_ReappliesImmutableSourceQuota_AllVolumeBackends(t *testing.T) {
-	for _, kind := range []string{"btrfs", "xfs", "zfs"} {
+	for _, kind := range []string{"btrfs", "xfs"} {
 		t.Run(kind, func(t *testing.T) {
 			b := newBackendForProvisionTest(t, &mockDockerClient{}, quotaRollbackProvision())
 			rs := attachRetentionStore(t, b)
@@ -247,7 +247,7 @@ func TestReconcileRestoring_QuotaRestoreRetriesBeforeSourceReactivation(t *testi
 	quotaWorks := false
 	var quotaAttempts int
 	b.volumes = &kindedMockVolumeManager{
-		kind: "zfs",
+		kind: "xfs",
 		mockVolumeManager: &mockVolumeManager{
 			RenameVolumeFn: func(string, string) error { return nil },
 			UsageFn: func(context.Context, string) (int64, error) {
@@ -257,7 +257,7 @@ func TestReconcileRestoring_QuotaRestoreRetriesBeforeSourceReactivation(t *testi
 				quotaAttempts++
 				require.Equal(t, int64(100), diskMB)
 				if !quotaWorks {
-					return errors.New("transient ZFS control-plane outage")
+					return errors.New("transient quota control-plane outage")
 				}
 				return nil
 			},

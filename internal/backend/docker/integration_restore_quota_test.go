@@ -326,16 +326,6 @@ func TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems(t *test
 				return setupResult{mgr: mgr, xfsMount: mount}
 			},
 		},
-		{
-			name: "zfs",
-			setup: func(t *testing.T) setupResult {
-				mount, _ := setupZFSPool(t)
-				mgr, err := newVolumeManager(mount, "zfs", 1024, slog.Default())
-				require.NoError(t, err)
-				require.NoError(t, mgr.Validate())
-				return setupResult{mgr: mgr}
-			},
-		},
 	}
 
 	for _, tc := range cases {
@@ -352,13 +342,9 @@ func TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems(t *test
 
 			hostPath, _, err := mgr.Create(ctx, canonical, oldCapMiB)
 			require.NoError(t, err)
-			if tc.name == "zfs" {
-				writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5)
-			} else {
-				require.NoError(t, os.WriteFile(
-					filepath.Join(hostPath, "seed.bin"), make([]byte, 5*bytesPerMiB), 0o600,
-				))
-			}
+			require.NoError(t, os.WriteFile(
+				filepath.Join(hostPath, "seed.bin"), make([]byte, 5*bytesPerMiB), 0o600,
+			))
 			require.NoError(t, mgr.RenameVolume(ctx, canonical, retained))
 			require.NoError(t, mgr.RenameVolume(ctx, retained, newCanonical))
 			_, _, err = mgr.Create(ctx, newCanonical, promotedCapMiB)
@@ -392,7 +378,7 @@ func TestIntegration_RestoreRollback_ReappliesSourceQuota_AllFilesystems(t *test
 			}
 			// Existing data is ~5 MiB; a fresh 25 MiB incompressible write must
 			// cross the restored 20 MiB cap. This enforcement probe is common to
-			// btrfs qgroup, XFS project quota, and ZFS refquota.
+			// btrfs qgroup and XFS project quota.
 			out, writeErr := exec.Command(
 				"dd", "if=/dev/urandom", "of="+filepath.Join(mgr.HostPath(retained), "probe.bin"),
 				"bs=1M", "count=25",

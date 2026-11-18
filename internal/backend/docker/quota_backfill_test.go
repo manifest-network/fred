@@ -278,7 +278,7 @@ func TestReconcileVolumeQuotas_ConcreteManagerFailuresReachReadinessGate(t *test
 	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
 	volumeName := canonicalVolumeName(leaseUUID, "app", 0)
 
-	for _, kind := range []string{"btrfs", "xfs", "zfs"} {
+	for _, kind := range []string{"btrfs", "xfs"} {
 		t.Run(kind, func(t *testing.T) {
 			b := newBackendForProvisionTest(t, &mockDockerClient{}, nil)
 			root := t.TempDir()
@@ -293,10 +293,6 @@ func TestReconcileVolumeQuotas_ConcreteManagerFailuresReachReadinessGate(t *test
 				manager = &xfsVolumeManager{
 					dataPath: root, mountPoint: root, logger: b.logger,
 					activeIDs: make(map[uint32]string), volumeToID: make(map[string]uint32),
-				}
-			case "zfs":
-				manager = &zfsVolumeManager{
-					dataPath: root, parentDataset: "tank/fred", logger: b.logger,
 				}
 			default:
 				t.Fatalf("unexpected manager kind %q", kind)

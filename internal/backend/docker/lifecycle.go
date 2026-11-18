@@ -606,7 +606,7 @@ func (d *DockerClient) ExtractImageContent(ctx context.Context, imageName imagee
 		// The extractor owns one byte budget across all writable paths; maxEntries
 		// is instead applied per-path (not decremented) because the true cross-path /
 		// volume-wide inode gate is the caller's XFS ihard quota. On a filesystem without
-		// an inode quota (btrfs/zfs) this backstop therefore bounds entries at
+		// an inode quota (btrfs) this backstop therefore bounds entries at
 		// maxDetectedWritablePaths x maxEntries, not maxEntries alone. See ENG-548.
 		_, skippedSymlinks, extractErr := extractor.extract(ctx, rc, extractDir)
 		_ = rc.Close()
@@ -727,7 +727,7 @@ func (e tarExtractor) extract(ctx context.Context, src io.Reader, destDir string
 
 		// Bound the number of inode-consuming entries (dirs/files/symlinks). Empty
 		// files pass the byte budget but each costs an inode; this backstops the
-		// XFS ihard quota and is the only inode bound on btrfs/zfs. Implicit parent
+		// XFS ihard quota and is the only inode bound on btrfs. Implicit parent
 		// dirs created via MkdirAll for a nested entry are not counted, so the cap
 		// is permissive-only — acceptable for a defense-in-depth backstop behind
 		// the XFS ihard quota. See ENG-548.

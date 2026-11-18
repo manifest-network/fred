@@ -705,11 +705,9 @@ func TestXFSLoadProjectIDsRejectsMalformedManagedEntry(t *testing.T) {
 //
 // These tests exercise the shared descriptor-relative renameAtStorageRoot helper and the
 // per-backend RenameVolume wrappers. They avoid filesystem-specific
-// tooling (xfs_quota, btrfs CLI, zfs CLI) by operating on plain
+// tooling (xfs_quota, btrfs CLI) by operating on plain
 // directories under t.TempDir() — the rename semantics are identical
-// across xfs and btrfs (os.Rename on a managed root). The zfs path
-// shells out to the `zfs` binary and is integration-test territory; it's
-// not covered by this unit suite.
+// across xfs and btrfs (os.Rename on a managed root).
 
 func TestRenameAtStorageRoot_Idempotent(t *testing.T) {
 	root := t.TempDir()
@@ -1016,11 +1014,6 @@ func TestVolumeManager_HostPath(t *testing.T) {
 	})
 	t.Run("btrfs", func(t *testing.T) {
 		mgr := &btrfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
-		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
-		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
-	})
-	t.Run("zfs", func(t *testing.T) {
-		mgr := &zfsVolumeManager{dataPath: "/var/lib/fred/volumes"}
 		name := canonicalVolumeName("550e8400-e29b-41d4-a716-446655440000", "app", 0)
 		assert.Equal(t, filepath.Join("/var/lib/fred/volumes", name), mgr.HostPath(name))
 	})

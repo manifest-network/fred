@@ -357,11 +357,8 @@ runtime lineage drift deletes the header and returns `503`.
 
 Storage-lineage proof does not accept a canonical-looking directory name as
 substrate authority. Every managed name is parsed as one typed path component
-and then proved as an actual Btrfs subvolume, a real directory on the configured
-XFS root with a regular no-follow nonzero project-ID marker, or the exact
-depth-one ZFS child with its exact managed mountpoint. ZFS proof inventory unions
-the directory view with the child-dataset view, so an unmounted or externally
-mounted child cannot disappear as apparent absence. Container bind evidence
+and then proved as an actual Btrfs subvolume or a real directory on the configured
+XFS root with a regular no-follow nonzero project-ID marker. Container bind evidence
 must independently match its label-derived volume and exact target-derived
 subtree, with no symlink in any component. The XFS marker is durable project-ID
 authority; startup separately re-applies the kernel project tag and limits and
@@ -386,7 +383,7 @@ during a daemon/filesystem call; it cannot make an external daemon or CLI
 mutation atomic with the marker proof. Local recursive deletion and directory
 rename are descriptor-rooted after exact managed-volume-name validation, and
 XFS project-marker access uses attested, no-follow descriptor lookups. External
-Docker, ZFS, btrfs, and xfs_quota operations still require a substrate-native
+Docker, btrfs, and xfs_quota operations still require a substrate-native
 generation/CAS primitive to close the residual same-root replacement window.
 Live XFS quota repair reads and changes only the pinned volume-root inode with
 `FS_IOC_FSGETXATTR` / `FS_IOC_FSSETXATTR`, preserving unrelated attributes and
@@ -429,10 +426,8 @@ volume is durably gone. Only a contradiction of the authority itself, or an
 outcome that cannot be classified, latches the backend. Offline proof refuses
 the private authority rather than turning it into mutation permission.
 
-ZFS retains an exact
-unmounted child after an ambiguous create and normal sealed startup remounts and
-re-attests it rather than destroying it. The stopped preflight and initializer
-reject either form without mutation. Failure or ambiguity preserves the evidence
+The stopped preflight and initializer
+reject either XFS stage form without mutation. Failure or ambiguity preserves the evidence
 and prevents readiness.
 
 Bundled backends retain old HMAC-authenticated, identity-unbound mutation paths
@@ -492,7 +487,7 @@ Stateful-volume seed data is extracted from tenant-controlled container images v
 - **Permission stripping:** setuid/setgid bits are cleared on every entry; ownership uses `Root.Lchown` (never `Chown`) so a symlink is never followed during the ownership change.
 - **Symlinks:** links whose targets point outside the root are still created but are harmless — `os.Root` refuses to extract any *later* entry *through* them, and they only resolve inside the bind-mounted container.
 - **Byte budget (overflow-safe):** each regular file is checked against the *remaining* budget (`maxBytes - totalBytes`) rather than a running sum, so a tenant-controlled `hdr.Size` near `math.MaxInt64` cannot overflow past the gate; negative sizes are rejected outright. This bounds zip-bomb / oversized-image extraction.
-- **Entry-count cap (`maxEntries`, ENG-548):** the number of extracted entries (dirs/files/symlinks) is capped per writable path, so a crafted image can't flood the host with zero-byte files. It is applied per path rather than shared across paths — on a filesystem without an inode quota (btrfs/zfs) the effective bound across all of a container's writable paths is therefore `maxDetectedWritablePaths × maxEntries`, not `maxEntries` alone; on XFS, the volume-wide `ihard` project quota is the true cross-path gate.
+- **Entry-count cap (`maxEntries`, ENG-548):** the number of extracted entries (dirs/files/symlinks) is capped per writable path, so a crafted image can't flood the host with zero-byte files. It is applied per path rather than shared across paths — on a filesystem without an inode quota (btrfs) the effective bound across all of a container's writable paths is therefore `maxDetectedWritablePaths × maxEntries`, not `maxEntries` alone; on XFS, the volume-wide `ihard` project quota is the true cross-path gate.
 
 ## Rate Limiting
 
@@ -697,8 +692,7 @@ Network isolation places each lease's containers in a dedicated Docker bridge ne
 **Daemon capabilities vs. container privileges.** Tenant containers run with
 `CapDrop: ["ALL"]`. The docker-backend daemon needs `CAP_SYS_ADMIN` for XFS/btrfs
 quota limits, granted by systemd capabilities or by running as root; startup
-rejects a missing capability (`internal/backend/docker/capability.go`). ZFS uses
-`zfs allow` delegation and is exempt, as is the noop backend. Repairing an XFS
+rejects a missing capability (`internal/backend/docker/capability.go`). The noop backend is exempt. Repairing an XFS
 root inode owned by another UID can additionally need `CAP_FOWNER`. Live repair
 touches that root only, never tenant-owned descendants. The preliminary probe
 checks `CAP_SYS_ADMIN`; quota reconciliation attempts all expected present live

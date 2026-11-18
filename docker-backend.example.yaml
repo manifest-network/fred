@@ -184,8 +184,8 @@ sku_profiles:
     disk_mb: 4096
 
   # Stateful SKU profiles — containers with disk_mb > 0 get bind-mounted
-  # volumes with quota enforcement (btrfs subvolumes, xfs project quotas, or
-  # zfs datasets). Image VOLUME paths (e.g., /data for redis) are automatically
+  # volumes with quota enforcement (btrfs subvolumes or xfs project quotas).
+  # Image VOLUME paths (e.g., /data for redis) are automatically
   # discovered and bind-mounted. Data persists across container restarts and
   # re-provisions but is destroyed on deprovision.
   #
@@ -461,7 +461,7 @@ host_address: ""
 # omitted, that seeding is best-effort and skipped. Diskless image VOLUME paths
 # are always tmpfs overrides, never durable binds.
 #
-# The filesystem of the volume_data_path must be btrfs, xfs, or zfs.
+# The filesystem of the volume_data_path must be btrfs or xfs.
 # If volume_filesystem is not set, it is auto-detected.
 #
 # Setting it explicitly SELECTS the backend but does not override the check: the daemon
@@ -476,11 +476,10 @@ host_address: ""
 #   - xfs:   project quotas (requires pquota mount option)
 #            *** the only backend validated and used in production ***
 #   - btrfs: subvolumes with qgroup quotas   (experimental, untested)
-#   - zfs:   child datasets with quota property (experimental, untested)
 #
 # Only xfs is exercised in production (all mainnet/Morpheus backends run XFS
 # with pquota, and per-volume disk + inode quotas are enforced only on XFS).
-# The btrfs and zfs backends are implemented but not tested in any deployment;
+# The btrfs backend is implemented but not tested in any deployment;
 # use xfs for production.
 volume_data_path: "/var/lib/fred/volumes"
 # Required whenever volume_data_path is set, including an all-diskless managed-

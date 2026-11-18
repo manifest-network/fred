@@ -63,10 +63,9 @@ func newVolumeCleanupContext(parent context.Context) (context.Context, context.C
 // create, rename, requota, recover, or destroy storage.
 type volumeReader interface {
 	// ListForProof returns the complete managed-volume substrate inventory under
-	// a caller-owned deadline. For directory-backed managers this is the same
-	// namespace as List. ZFS additionally inventories child datasets so an
-	// unmounted or externally-mounted dataset cannot disappear from the proof
-	// merely because its expected directory is absent.
+	// a caller-owned deadline. For btrfs this is the same namespace as List. XFS
+	// additionally lists every name whose deletion is held, so a volume cannot
+	// disappear from the proof merely because its directory is already gone.
 	ListForProof(context.Context) ([]string, error)
 
 	// AttestManagedVolume proves that name is backed by this manager's exact
@@ -183,7 +182,7 @@ type volumeMutationSink interface {
 
 	// RenameVolume atomically renames a managed volume from oldName to
 	// newName, preserving data and per-volume metadata (xfs project ID,
-	// btrfs subvolume identity, zfs dataset name). Idempotent: if the new
+	// btrfs subvolume identity). Idempotent: if the new
 	// name already exists and the old does not, returns nil; if both
 	// exist, returns an error so the operator can intervene; if neither
 	// exists, returns an error.
@@ -326,7 +325,6 @@ func (n *noopVolumeManager) OpenProjectIDAudit(context.Context, managedVolumeNam
 const (
 	btrfsMagic = 0x9123683E
 	xfsMagic   = 0x58465342
-	zfsMagic   = 0x2FC12FC1
 )
 
 // detectFilesystem returns the filesystem type of the given path
@@ -341,10 +339,8 @@ func detectFilesystem(path string) (string, error) {
 		return "btrfs", nil
 	case xfsMagic:
 		return "xfs", nil
-	case zfsMagic:
-		return "zfs", nil
 	default:
-		return "", fmt.Errorf("unsupported filesystem (magic 0x%X) at %s; volume quotas require btrfs, xfs, or zfs", stat.Type, path)
+		return "", fmt.Errorf("unsupported filesystem (magic 0x%X) at %s; volume quotas require btrfs or xfs", stat.Type, path)
 	}
 }
 
@@ -359,7 +355,7 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 	// Reject a nonsense volume_filesystem before touching the disk, so a typo reports itself
 	// as a typo rather than as whatever the probe below happens to find.
 	switch filesystem {
-	case "", "btrfs", "xfs", "zfs":
+	case "", "btrfs", "xfs":
 	default:
 		return nil, fmt.Errorf("unsupported volume_filesystem: %s", filesystem)
 	}
@@ -396,10 +392,8 @@ func newVolumeManager(dataPath, filesystem string, minAvgFileBytes int64, logger
 			return nil, fmt.Errorf("resolve xfs mount point for volume_data_path %q: %w", dataPath, err)
 		}
 		return newXFSVolumeManager(dataPath, mountPoint, minAvgFileBytes, logger), nil
-	case "zfs":
-		return &zfsVolumeManager{dataPath: dataPath, logger: logger}, nil
 	default:
-		return nil, fmt.Errorf("unsupported volume_filesystem %q; must be btrfs, xfs, or zfs", filesystem)
+		return nil, fmt.Errorf("unsupported volume_filesystem %q; must be btrfs or xfs", filesystem)
 	}
 }
 

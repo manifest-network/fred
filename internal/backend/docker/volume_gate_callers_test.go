@@ -15,8 +15,7 @@ import (
 
 // The two volume-mutation gates keep their documented callers (ENG-1117).
 // Start takes the gate that accepts held deletions; only the new, adopt and
-// preflight identity proof takes the strict gate, which refuses them. ZFS
-// holds no deletion, so its Start gate is the strict one by delegation. Any
+// preflight identity proof takes the strict gate, which refuses them. Any
 // other production reference, call or method value, fails here.
 func TestVolumeMutationGatesKeepTheirDocumentedCallers(t *testing.T) {
 	got := volumeGateReferences(t, ".")
@@ -26,7 +25,6 @@ func TestVolumeMutationGatesKeepTheirDocumentedCallers(t *testing.T) {
 			"projectVolumeRead",
 		},
 		"RequireNoInterruptedVolumeMutations": {
-			"(*zfsVolumeManager).RequireNoUnheldVolumeMutations",
 			"acquireDockerStorageIdentityProof",
 			"projectVolumeRead",
 		},

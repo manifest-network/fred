@@ -949,61 +949,11 @@ func setupXFSLoopback(t *testing.T) string {
 	return mountDir
 }
 
-// setupZFSPool creates a ZFS pool backed by a sparse loopback image and
-// mounts it at a dedicated directory. Returns the mountpoint and pool name.
-// Cleanup (zpool destroy) is registered via t.Cleanup.
-// Skips if root, zfs, or zpool are absent, or if pool creation fails with a
-// device-unavailable error (common in containers without ZFS kernel modules).
-func setupZFSPool(t *testing.T) (mountPath, poolName string) {
-	t.Helper()
-
-	if os.Getuid() != 0 {
-		t.Skip("zfs pool requires root")
-	}
-	if _, err := exec.LookPath("zfs"); err != nil {
-		t.Skip("zfs not found:", err)
-	}
-	if _, err := exec.LookPath("zpool"); err != nil {
-		t.Skip("zpool not found:", err)
-	}
-
-	tmpDir := t.TempDir()
-	imgFile := filepath.Join(tmpDir, "zfs.img")
-	// Pool names must be unique to avoid collisions when tests run in parallel.
-	poolName = fmt.Sprintf("fredtest%d", time.Now().UnixNano())
-	mountPath = filepath.Join(tmpDir, "mnt")
-	require.NoError(t, os.MkdirAll(mountPath, 0755))
-
-	// 512 MiB: ZFS needs more headroom than btrfs/xfs due to metadata.
-	out, err := exec.Command("truncate", "-s", "512M", imgFile).CombinedOutput()
-	require.NoError(t, err, "truncate: %s", out)
-
-	out, err = exec.Command("zpool", "create", "-m", mountPath, poolName, imgFile).CombinedOutput()
-	if err != nil {
-		s := string(out)
-		if strings.Contains(s, "Unable to open") ||
-			strings.Contains(s, "no such device") ||
-			strings.Contains(s, "not a block device") ||
-			strings.Contains(s, "permission denied") {
-			t.Skipf("zfs pool creation unavailable: %s", s)
-		}
-		require.NoError(t, err, "zpool create: %s", out)
-	}
-
-	t.Cleanup(func() {
-		_ = exec.Command("zpool", "destroy", "-f", poolName).Run()
-	})
-
-	return mountPath, poolName
-}
-
 // writeIncompressibleMiB writes mib MiB of incompressible data to path and
-// syncs. ZFS defaults to compression=on, and with any compression setting it
-// stores all-zero blocks as holes — so zero-filled test data (dd if=/dev/zero
-// / make([]byte,N)) would be elided and never consume space, leaving
-// `referenced` at the empty baseline and the refquota unfilled. /dev/urandom is
-// incompressible so the bytes are actually allocated; the sync flushes the txg
-// so `referenced` reflects the write immediately (it updates at txg commit).
+// syncs. A compressing filesystem can store zero-filled test data (dd
+// if=/dev/zero / make([]byte,N)) in far less space than its length, so it would
+// not fill a quota. /dev/urandom is incompressible so the bytes are actually
+// allocated; the sync makes the usage visible to the next quota read.
 func writeIncompressibleMiB(t *testing.T, path string, mib int) {
 	t.Helper()
 	out, err := exec.Command("dd", "if=/dev/urandom", "of="+path, "bs=1M", fmt.Sprintf("count=%d", mib)).CombinedOutput()
@@ -1697,7 +1647,7 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 
 // TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin is the btrfs analogue of
 // the ENG-454 regression: btrfs `qgroup limit` is a privileged ioctl requiring
-// CAP_SYS_ADMIN, and (unlike zfs) has no delegation alternative — so the daemon
+// CAP_SYS_ADMIN with no delegation alternative — so the daemon
 // must hold the capability. Proven by running it as root (succeeds) vs a
 // dropped-privilege subprocess (fails). Guards against the same "tests run as
 // root, prod runs unprivileged" fidelity gap on btrfs hosts.
@@ -1719,39 +1669,6 @@ func TestIntegration_Btrfs_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 		"setting a btrfs qgroup limit without CAP_SYS_ADMIN must fail: %s", dropOut)
 	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
 		assert.Contains(t, strings.ToLower(string(dropOut)), "not permitted",
-			"expected a permission error, got: %s", dropOut)
-	}
-}
-
-// TestIntegration_Zfs_QuotaSet_RequiresPrivilege documents that setting a zfs
-// refquota requires privilege for a plain (non-delegated) non-root process —
-// proven by root (succeeds) vs a dropped-privilege subprocess (fails). ZFS is
-// the deliberate exception to the startup CAP_SYS_ADMIN guard: `zfs allow` can
-// delegate create/quota to a non-root user WITHOUT the capability, which is why
-// requireCapSysAdmin is not called for zfs. This test pins the underlying
-// privilege requirement (absent delegation) so the exemption stays intentional.
-func TestIntegration_Zfs_QuotaSet_RequiresPrivilege(t *testing.T) {
-	_, pool := setupZFSPool(t) // requires root
-	ctx := context.Background()
-
-	dataset := pool + "/fred-cap-probe"
-	out, err := exec.CommandContext(ctx, "zfs", "create", dataset).CombinedOutput()
-	require.NoError(t, err, "root zfs create: %s", out)
-
-	// As root: setting refquota SUCCEEDS.
-	rootOut, rootErr := exec.CommandContext(ctx, "zfs", "set", "refquota=10M", dataset).CombinedOutput()
-	require.NoError(t, rootErr, "root should set refquota: %s", rootOut)
-
-	// As a dropped-privilege (nobody) child with no `zfs allow` delegation: FAILS.
-	dropped := exec.CommandContext(ctx, "zfs", "set", "refquota=5M", dataset)
-	dropped.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: 65534, Gid: 65534},
-	}
-	dropOut, dropErr := dropped.CombinedOutput()
-	require.Error(t, dropErr,
-		"a non-root process without zfs-allow delegation must NOT set refquota (got success: %s)", dropOut)
-	if len(dropOut) > 0 { // message shape is a bonus signal; require.Error is the guarantee
-		assert.Contains(t, strings.ToLower(string(dropOut)), "permission",
 			"expected a permission error, got: %s", dropOut)
 	}
 }
@@ -1934,30 +1851,6 @@ func TestIntegration_Btrfs_ReconcileBackfill_EndToEnd(t *testing.T) {
 	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
 }
 
-// TestIntegration_Zfs_ReconcileBackfill_EndToEnd is the zfs analogue: the
-// reconcile re-applies refquota to the lease's smaller disk_mb via the real
-// manager, and a write past it is rejected. (refquota cannot be lowered below
-// current usage, so the seed write stays under the smaller cap.)
-func TestIntegration_Zfs_ReconcileBackfill_EndToEnd(t *testing.T) {
-	mount, _ := setupZFSPool(t) // requires root
-	ctx := context.Background()
-	mgr, err := newVolumeManager(mount, "zfs", 1024, slog.Default())
-	require.NoError(t, err)
-	require.NoError(t, mgr.Validate()) // resolves parentDataset
-
-	const lease = "550e8400-e29b-41d4-a716-446655440001"
-	volName := canonicalVolumeName(lease, "app", 0)
-	hostPath, _, err := mgr.Create(ctx, volName, 100) // large initial refquota
-	require.NoError(t, err)
-	writeIncompressibleMiB(t, filepath.Join(hostPath, "seed.bin"), 5) // under both caps
-
-	b := backendForReconcileTest(t, mgr, mount, lease, "app", "zfs-small", 20)
-	require.NoError(t, b.reconcileVolumeQuotas(ctx))
-
-	// The reconcile tightened refquota to 20 MiB → 30 MiB more is rejected.
-	writeIncompressibleExpectFail(t, filepath.Join(hostPath, "big.bin"), 30)
-}
-
 // TestIntegration_Btrfs_SubdirDataPath_Measures guards that the btrfs backend
 // still measures correctly when volume_data_path is a subdirectory of the mount
 // (ENG-449 "validate other fs too"). btrfs tools operate on any path within the
@@ -1984,36 +1877,6 @@ func TestIntegration_Btrfs_SubdirDataPath_Measures(t *testing.T) {
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, got, int64(writeMiB*1024*1024), "Usage under-reports: %d", got)
 	assert.LessOrEqual(t, got, int64((writeMiB+6)*1024*1024), "Usage over-reports: %d", got)
-}
-
-// TestIntegration_Usage_ZFS verifies that zfsVolumeManager.Usage returns the
-// dataset's referenced bytes within a metadata-overhead bound.
-func TestIntegration_Usage_ZFS(t *testing.T) {
-	mountPath, _ := setupZFSPool(t)
-	ctx := context.Background()
-
-	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
-	require.NoError(t, err)
-	require.NoError(t, mgr.Validate())
-
-	const volName = "fred-550e8400-e29b-41d4-a716-446655440002-app-0"
-	const capMiB = int64(100)
-
-	hostPath, created, err := mgr.Create(ctx, volName, capMiB)
-	require.NoError(t, err)
-	require.True(t, created)
-	t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, volName) })
-
-	const writeMiB = 10
-	writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), writeMiB)
-
-	got, err := mgr.Usage(ctx, volName)
-	require.NoError(t, err)
-
-	const wantMin = int64(writeMiB * 1024 * 1024)
-	const wantMax = int64((writeMiB + 6) * 1024 * 1024)
-	assert.GreaterOrEqual(t, got, wantMin, "Usage too low: got %d, want >= %d", got, wantMin)
-	assert.LessOrEqual(t, got, wantMax, "Usage too high: got %d, want <= %d", got, wantMax)
 }
 
 // TestIntegration_DemotePromote_Btrfs is the end-to-end demote/promote quota
@@ -2273,154 +2136,5 @@ func TestIntegration_DemotePromote_XFS(t *testing.T) {
 			"of="+filepath.Join(hostPath, "big2.bin"), "bs=1M", "count=25").CombinedOutput()
 		require.NoError(t, werr,
 			"25 MiB must fit the promoted 100 MiB bhard; dd output: %s", out)
-	})
-}
-
-// TestIntegration_DemotePromote_ZFS exercises the demote/promote quota flow on
-// a real ZFS pool. The key ZFS-specific assertion is that the gate's precondition
-// (usage ≤ new cap) prevents `zfs set refquota` from being called with a value
-// below the dataset's `referenced`, which ZFS would reject with "cannot set
-// refquota below referenced value".
-func TestIntegration_DemotePromote_ZFS(t *testing.T) {
-	mountPath, _ := setupZFSPool(t)
-	ctx := context.Background()
-
-	const largeMiB, mediumMiB = int64(100), int64(20)
-
-	mgr, err := newVolumeManager(mountPath, "zfs", 1024, slog.Default())
-	require.NoError(t, err)
-	// Validate resolves and caches the parent dataset name required by all ZFS ops.
-	require.NoError(t, mgr.Validate())
-
-	b := newBackendForTest(&mockDockerClient{}, nil)
-	useVolumeManager(b, mgr)
-	b.cfg.SKUProfiles["test-large"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: largeMiB}
-	b.cfg.SKUProfiles["test-medium"] = SKUProfile{CPUCores: 0.5, MemoryMB: 512, DiskMB: mediumMiB}
-	mediumProfiles := map[string]SKUProfile{"test-medium": b.cfg.SKUProfiles["test-medium"]}
-
-	// (a) 5 MiB data fits 20 MiB medium: gate passes, `zfs set refquota` at
-	//     medium succeeds because referenced (~5 MiB) < refquota (20 MiB).
-	//     Write beyond medium then fails — confirming refquota is the enforcer.
-	t.Run("fits_medium_refquota_succeeds", func(t *testing.T) {
-		origLease := newIntegrationLeaseUUID()
-		canon := canonicalVolumeName(origLease, "app", 0)
-		retained := retainedName(canon)
-
-		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err)
-
-		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 5)
-
-		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
-
-		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID: origLease,
-			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
-			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
-				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
-			RetainedVolumeNames: []string{retained},
-		}
-		err = b.checkDemoteFit(ctx, rec,
-			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
-			mediumProfiles, b.logger)
-		require.NoError(t, err, "5 MiB fits 20 MiB medium: gate must pass")
-
-		newLease := newIntegrationLeaseUUID()
-		newCanon := canonicalVolumeName(newLease, "app", 0)
-		require.NoError(t, mgr.RenameVolume(context.Background(), retained, newCanon))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, newCanon) })
-
-		// Create at medium cap issues `zfs set refquota=20M <dataset>`.
-		// Since referenced (~5 MiB) < refquota (20 MiB) the set must NOT fail with
-		// "cannot set refquota below referenced value" — that ZFS error only arises
-		// when the gate is bypassed and data > new cap reaches this call.
-		_, _, err = mgr.Create(ctx, newCanon, mediumMiB)
-		require.NoError(t, err,
-			"zfs set refquota at 20 MiB must succeed when referenced is only ~5 MiB")
-
-		// refquota is now 20 MiB; a write beyond it must fail. Use /dev/urandom:
-		// zero-filled data would be stored as holes (ZFS compression=on default)
-		// and never reach the refquota, so dd would spuriously succeed.
-		newHostPath := mgr.HostPath(newCanon)
-		out, werr := exec.Command("dd", "if=/dev/urandom",
-			"of="+filepath.Join(newHostPath, "big.bin"), "bs=1M", "count=25").CombinedOutput()
-		require.Error(t, werr,
-			"writing 25 MiB beyond the 20 MiB ZFS refquota must fail; dd output: %s", out)
-	})
-
-	// (b) promote: Create at large cap on an existing medium-capped dataset must
-	//     clear any stale quota= so refquota is the sole enforcer. Simulates the
-	//     pre-ENG-438 state by explicitly setting quota= before the promote call,
-	//     then asserts quota is none (0 in parsable output) afterwards. A stale
-	//     smaller quota= would otherwise silently bind on promote and cap the lease
-	//     at the old size even after `zfs set refquota=<larger>` succeeds.
-	t.Run("promote_clears_legacy_quota", func(t *testing.T) {
-		const lease = "550e8400-e29b-41d4-a716-446655440003"
-		canon := canonicalVolumeName(lease, "app", 0)
-
-		// Create at medium cap — hits the fresh-create path (no legacy quota).
-		_, _, err := mgr.Create(ctx, canon, mediumMiB)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
-
-		// Resolve the ZFS dataset name so we can inspect and set properties directly.
-		dsOut, dsErr := exec.Command("zfs", "list", "-H", "-o", "name", filepath.Join(mountPath, canon)).CombinedOutput()
-		require.NoError(t, dsErr, "resolve dataset name: %s", dsOut)
-		dataset := strings.TrimSpace(string(dsOut))
-
-		// Simulate a pre-ENG-438 dataset that had quota= set by the old code.
-		// ZFS enforces the tighter of quota and refquota simultaneously; without
-		// the fix, a promote would leave this stale smaller quota= in place.
-		out, setErr := exec.Command("zfs", "set", "quota="+fmt.Sprintf("%dM", mediumMiB), dataset).CombinedOutput()
-		require.NoError(t, setErr, "zfs set legacy quota: %s", out)
-
-		// Promote: Create at large cap hits the idempotent-reuse path and must
-		// issue `zfs set refquota=100M quota=none <dataset>` so the stale quota is cleared.
-		_, _, err = mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err, "promote Create at large cap must succeed")
-
-		// Assert that quota= is now none. With -Hp, quota=none is reported as "0".
-		// A non-zero value here means the stale quota= was not cleared and would
-		// silently cap writes at mediumMiB despite the refquota promotion.
-		quotaOut, quotaErr := exec.Command("zfs", "get", "-Hp", "-o", "value", "quota", dataset).CombinedOutput()
-		require.NoError(t, quotaErr, "zfs get quota: %s", quotaOut)
-		require.Equal(t, "0", strings.TrimSpace(string(quotaOut)),
-			"legacy quota= must be none (0) after promote so refquota is the sole cap")
-	})
-
-	// (c) 25 MiB data exceeds 20 MiB medium: gate refuses, preventing the
-	//     `zfs set refquota < referenced` error that ZFS would return if we
-	//     proceeded directly to Create at medium cap.
-	t.Run("exceeds_medium_gate_refuses", func(t *testing.T) {
-		origLease := newIntegrationLeaseUUID()
-		canon := canonicalVolumeName(origLease, "app", 0)
-		retained := retainedName(canon)
-
-		hostPath, _, err := mgr.Create(ctx, canon, largeMiB)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, canon) })
-
-		// 25 MiB of incompressible data so `referenced` actually reflects it
-		// (ZFS compression=on default would elide zero-filled data as holes).
-		writeIncompressibleMiB(t, filepath.Join(hostPath, "data.bin"), 25)
-
-		require.NoError(t, mgr.RenameVolume(context.Background(), canon, retained))
-		t.Cleanup(func() { _ = volDestroyer(t, mgr).Destroy(ctx, retained) })
-
-		rec := &shared.RetentionEntry{
-			OriginalLeaseUUID: origLease,
-			Items:             []backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}},
-			ResourceProfiles: frozenRetainedProfilesForTest(t, b,
-				[]backend.LeaseItem{{SKU: "test-large", ServiceName: "app", Quantity: 1}}),
-			RetainedVolumeNames: []string{retained},
-		}
-		err = b.checkDemoteFit(ctx, rec,
-			[]backend.LeaseItem{{SKU: "test-medium", ServiceName: "app", Quantity: 1}},
-			mediumProfiles, b.logger)
-		// Gate refuses — prevents `zfs set refquota=20M` on a ~25 MiB dataset,
-		// which would fail: "cannot set refquota below referenced value."
-		require.ErrorIs(t, err, backend.ErrDemoteDataExceedsTier,
-			"gate must refuse 25 MiB data for 20 MiB medium, preventing ZFS refquota-below-referenced error")
 	})
 }
