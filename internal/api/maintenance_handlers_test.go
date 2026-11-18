@@ -126,26 +126,35 @@ func TestMaintenanceHandlersValidateIdempotencyKeyBeforeConsumingBearerToken(t *
 		Bech32Prefix: "manifest",
 	})
 
-	for _, endpoint := range []string{"restart", "update"} {
-		request := httptest.NewRequest(
-			http.MethodPost, "/v1/leases/"+leaseUUID+"/"+endpoint,
-			strings.NewReader(`{"payload":"dGVzdA=="}`),
-		)
-		request.SetPathValue("lease_uuid", leaseUUID)
-		request.Header.Set(
-			"Authorization",
-			"Bearer "+testutil.CreateTestToken(keyPair, leaseUUID, time.Now()),
-		)
-		request.Header.Set(idempotencyKeyHeader, "not-a-canonical-uuidv4")
-		response := httptest.NewRecorder()
+	for name, keys := range map[string][]string{
+		"absent":    nil,
+		"empty":     {""},
+		"malformed": {"not-a-canonical-uuidv4"},
+		"repeated":  {"550e8400-e29b-41d4-a716-446655440000", "6ba7b811-9dad-41d1-80b4-00c04fd430c8"},
+	} {
+		for _, endpoint := range []string{"restart", "update"} {
+			request := httptest.NewRequest(
+				http.MethodPost, "/v1/leases/"+leaseUUID+"/"+endpoint,
+				strings.NewReader(`{"payload":"dGVzdA=="}`),
+			)
+			request.SetPathValue("lease_uuid", leaseUUID)
+			request.Header.Set(
+				"Authorization",
+				"Bearer "+testutil.CreateTestToken(keyPair, leaseUUID, time.Now()),
+			)
+			for _, key := range keys {
+				request.Header.Add(idempotencyKeyHeader, key)
+			}
+			response := httptest.NewRecorder()
 
-		if endpoint == "restart" {
-			handlers.RestartLease(response, request)
-		} else {
-			handlers.UpdateLease(response, request)
+			if endpoint == "restart" {
+				handlers.RestartLease(response, request)
+			} else {
+				handlers.UpdateLease(response, request)
+			}
+
+			assert.Equal(t, http.StatusBadRequest, response.Code, "%s %s", name, endpoint)
 		}
-
-		assert.Equal(t, http.StatusBadRequest, response.Code)
 	}
 	assert.Zero(t, trackerCalls, "invalid command identity must not consume replay authority")
 }

@@ -624,16 +624,6 @@ var (
 
 // API metrics
 var (
-	// APIMaintenanceLegacyKeyTotal counts restart/update requests accepted
-	// without Idempotency-Key from a tenant listed in
-	// maintenance_legacy_idempotency_tenants.
-	APIMaintenanceLegacyKeyTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Subsystem: "api",
-		Name:      "maintenance_legacy_key_total",
-		Help:      "Restart/update requests accepted without Idempotency-Key, each keyed by its single-use signed token",
-	})
-
 	// apiCallbackSignatureKeyTotal counts callbacks verified, by the backend
 	// whose key verified them and the key slot: "current" (the key providerd
 	// also signs with) or "previous" (hmac_secret_previous during a rotation).

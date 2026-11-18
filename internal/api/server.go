@@ -125,9 +125,6 @@ type ServerConfig struct {
 	CallbackCanonicalPathPrefix string                             // Path prefix prepended to inbound URIs before HMAC verification (proxy stripPrefix compensation)
 	TokenTrackerDBPath          string                             // Path to token tracker database (enables replay protection)
 	CallbackBaseURL             string                             // Base URL for backend callbacks (used by restart/update)
-	// MaintenanceLegacyIdempotencyTenants may omit Idempotency-Key on
-	// restart/update; see HandlersConfig.
-	MaintenanceLegacyIdempotencyTenants []string
 	// BillingPolicy is required: payload uploads and restores are refused for
 	// a lease it classifies as billing-only, which Fred never deploys. It is
 	// the same policy the provision manager binds into placement.
@@ -202,8 +199,6 @@ func NewServer(cfg ServerConfig, deps ServerDeps) (*Server, error) {
 		BillingPolicy:      cfg.BillingPolicy,
 		ProviderUUID:       cfg.ProviderUUID,
 		Bech32Prefix:       cfg.Bech32Prefix,
-
-		MaintenanceLegacyIdempotencyTenants: cfg.MaintenanceLegacyIdempotencyTenants,
 	})
 
 	// Parse trusted proxies for secure X-Forwarded-For handling

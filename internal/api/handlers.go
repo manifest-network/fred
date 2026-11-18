@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -136,8 +134,6 @@ type Handlers struct {
 	billingPolicy      *placement.BillingPolicy
 	providerUUID       string
 	bech32Prefix       string
-	// legacyIdempotencyTenants may omit Idempotency-Key on restart/update.
-	legacyIdempotencyTenants map[string]struct{}
 }
 
 // HandlersConfig configures a Handlers instance.
@@ -157,10 +153,6 @@ type HandlersConfig struct {
 	BillingPolicy *placement.BillingPolicy
 	ProviderUUID  string
 	Bech32Prefix  string
-	// MaintenanceLegacyIdempotencyTenants lists tenants whose restart/update
-	// requests may omit Idempotency-Key; each such request is keyed by its
-	// single-use signed token. Empty keeps the header mandatory.
-	MaintenanceLegacyIdempotencyTenants []string
 }
 
 // NewHandlers creates a new Handlers instance.
@@ -200,13 +192,6 @@ func NewHandlers(cfg HandlersConfig) *Handlers {
 		billingPolicy:     cfg.BillingPolicy,
 		providerUUID:      cfg.ProviderUUID,
 		bech32Prefix:      cfg.Bech32Prefix,
-		legacyIdempotencyTenants: func() map[string]struct{} {
-			tenants := make(map[string]struct{}, len(cfg.MaintenanceLegacyIdempotencyTenants))
-			for _, tenant := range cfg.MaintenanceLegacyIdempotencyTenants {
-				tenants[tenant] = struct{}{}
-			}
-			return tenants
-		}(),
 	}
 }
 
@@ -1147,15 +1132,11 @@ type LeaseReleasesResponse struct {
 
 // RestartLease handles POST /v1/leases/{lease_uuid}/restart
 func (h *Handlers) RestartLease(w http.ResponseWriter, r *http.Request) {
-	key, ok := h.parseMaintenanceKey(w, r)
+	requestID, ok := parseMaintenanceKey(w, r)
 	if !ok {
 		return
 	}
 	token, leaseUUID, ok := h.authenticateMaintenanceToken(w, r)
-	if !ok {
-		return
-	}
-	requestID, ok := h.maintenanceID(w, key, token, leaseUUID, maintenanceapp.KindRestart)
 	if !ok {
 		return
 	}
@@ -1366,15 +1347,11 @@ func inventoryReconcilingBody() ErrorResponse {
 
 // UpdateLease handles POST /v1/leases/{lease_uuid}/update
 func (h *Handlers) UpdateLease(w http.ResponseWriter, r *http.Request) {
-	key, ok := h.parseMaintenanceKey(w, r)
+	requestID, ok := parseMaintenanceKey(w, r)
 	if !ok {
 		return
 	}
 	token, leaseUUID, ok := h.authenticateMaintenanceToken(w, r)
-	if !ok {
-		return
-	}
-	requestID, ok := h.maintenanceID(w, key, token, leaseUUID, maintenanceapp.KindUpdate)
 	if !ok {
 		return
 	}
@@ -1420,85 +1397,21 @@ func (h *Handlers) authenticateMaintenanceToken(
 
 const errMsgIdempotencyKeyRequired = "Idempotency-Key header must occur exactly once"
 
-// maintenanceKey is a request's idempotency identity before authentication.
-// A keyless request has none until authentication consumes its single-use
-// token; only a tenant listed for legacy keys may then derive one from it.
-type maintenanceKey struct {
-	id      maintenanceid.ID
-	keyless bool
-}
-
-// parseMaintenanceKey refuses a malformed or repeated header before
-// authentication. An absent header is deferred to authentication only when
-// some tenant may use legacy keys; otherwise it is refused here, as before.
-func (h *Handlers) parseMaintenanceKey(
-	w http.ResponseWriter,
-	r *http.Request,
-) (maintenanceKey, bool) {
+// parseMaintenanceKey requires exactly one canonical UUIDv4 Idempotency-Key.
+// An absent, repeated or malformed header is refused before authentication,
+// so it never consumes the request's single-use token.
+func parseMaintenanceKey(w http.ResponseWriter, r *http.Request) (maintenanceid.ID, bool) {
 	values := r.Header.Values(idempotencyKeyHeader)
-	if len(values) == 0 && len(h.legacyIdempotencyTenants) != 0 {
-		return maintenanceKey{keyless: true}, true
-	}
 	if len(values) != 1 || values[0] == "" {
 		writeError(w, errMsgIdempotencyKeyRequired, http.StatusBadRequest)
-		return maintenanceKey{}, false
+		return maintenanceid.ID{}, false
 	}
 	id, err := maintenanceid.Parse(values[0])
 	if err != nil {
 		writeError(w, "Idempotency-Key must be a canonical UUIDv4", http.StatusBadRequest)
-		return maintenanceKey{}, false
-	}
-	return maintenanceKey{id: id}, true
-}
-
-// maintenanceID resolves the command identity after authentication. A keyless
-// request from a listed tenant is keyed by its signed token, which the replay
-// tracker has just consumed: a retry needs a new token and becomes a new
-// command, as with the pre-key API, and a replayed token is refused before
-// this point. The request body is deliberately not part of the key, so a later
-// identical request is never mistaken for a replay.
-func (h *Handlers) maintenanceID(
-	w http.ResponseWriter,
-	key maintenanceKey,
-	token *AuthToken,
-	leaseUUID string,
-	kind maintenanceapp.Kind,
-) (maintenanceid.ID, bool) {
-	if !key.keyless {
-		return key.id, true
-	}
-	if _, listed := h.legacyIdempotencyTenants[token.Tenant]; !listed || token.Signature == "" {
-		writeError(w, errMsgIdempotencyKeyRequired, http.StatusBadRequest)
 		return maintenanceid.ID{}, false
 	}
-	id := legacyMaintenanceID(h.providerUUID, leaseUUID, kind, token.Signature)
-	metrics.APIMaintenanceLegacyKeyTotal.Inc()
-	slog.Warn("maintenance request without Idempotency-Key keyed by its signed token",
-		"lease_uuid", leaseUUID, "tenant", token.Tenant, "maintenance_id", id.String())
 	return id, true
-}
-
-// legacyMaintenanceID hashes length-prefixed fields, so no field can absorb a
-// neighbor's bytes. The signature is the low-S canonical form Validate keeps.
-func legacyMaintenanceID(
-	providerUUID string,
-	leaseUUID string,
-	kind maintenanceapp.Kind,
-	signature string,
-) maintenanceid.ID {
-	digest := sha256.New()
-	for _, field := range []string{
-		"fred/maintenance-legacy-idempotency-key/v1", providerUUID, leaseUUID,
-		strconv.Itoa(int(kind)), signature,
-	} {
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(field)))
-		digest.Write(length[:])
-		digest.Write([]byte(field))
-	}
-	var sum [sha256.Size]byte
-	copy(sum[:], digest.Sum(nil))
-	return maintenanceid.Derive(sum)
 }
 
 func (h *Handlers) writeMaintenanceResult(

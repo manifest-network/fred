@@ -2657,10 +2657,7 @@ Never run two `providerd` or `docker-backend` instances against the same bbolt f
 
 `POST /v1/leases/{uuid}/restart` and `POST /v1/leases/{uuid}/update` are tenant-initiated, asynchronous. Each captures its source, creates a replacement under volume exclusion, and verifies startup before activating the new release.
 
-Both endpoints require exactly one canonical UUIDv4 `Idempotency-Key`, except
-for a tenant listed in `maintenance_legacy_idempotency_tenants`: its request may
-omit the header and is then keyed by its single-use signed token, so a retry
-with a new token is a new command. Fred
+Both endpoints require exactly one canonical UUIDv4 `Idempotency-Key`. Fred
 writes the authenticated tenant, lease-scoped key, command kind, update payload
 fingerprint and exact placement/storage/lifecycle route to the required
 placement database before dispatch. Pending commands retain the same

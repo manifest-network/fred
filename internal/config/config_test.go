@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cosmos/cosmos-sdk/types/bech32"
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -811,27 +810,6 @@ func TestConfig_Validate_NumericFields(t *testing.T) {
 				c.SubSignerCount = -1
 			},
 			wantErr: "sub_signer_count must be non-negative",
-		},
-		{
-			name: "legacy idempotency tenant with the wrong prefix",
-			modify: func(c *Config) {
-				c.MaintenanceLegacyIdempotencyTenants = []string{"cosmos1qypqxpq9qcrsszg2pvxq6rs0zqg3yyc5lzv7xu"}
-			},
-			wantErr: "is not a manifest account address",
-		},
-		{
-			name: "legacy idempotency tenant in non-canonical case",
-			modify: func(c *Config) {
-				c.MaintenanceLegacyIdempotencyTenants = []string{strings.ToUpper(testLegacyTenant)}
-			},
-			wantErr: "maintenance_legacy_idempotency_tenants",
-		},
-		{
-			name: "legacy idempotency tenant listed twice",
-			modify: func(c *Config) {
-				c.MaintenanceLegacyIdempotencyTenants = []string{testLegacyTenant, testLegacyTenant}
-			},
-			wantErr: "is listed twice",
 		},
 		{
 			name: "unparseable sub_signer_min_balance with sub_signer_count > 0",
@@ -1961,6 +1939,31 @@ backends:
 	assert.Equal(t, 100.0, cfg.RateLimitRPS)
 }
 
+// The legacy-idempotency tenant list is gone, so the strict loader must refuse
+// a config that still sets it rather than silently ignore it.
+func TestLoad_RejectsRemovedMaintenanceLegacyIdempotencyTenants(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configContent := `
+provider_uuid: "abcdef01-2345-6789-abcd-ef0123456789"
+provider_address: "manifest1xyz"
+key_name: "filekey"
+keyring_dir: "/file/keyring"
+callback_base_url: "http://localhost:8080"
+callback_secret: "a]Gy4/r^SfN?b{Ye9t#L@F8z&V+mWkPq"
+placement_store_db_path: "/var/lib/fred/placements.db"
+maintenance_legacy_idempotency_tenants: ["manifest1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgvsrx5"]
+backends:
+  - name: "mock"
+    url: "http://localhost:9000"
+    default: true
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644))
+
+	_, err := Load(configPath)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "maintenance_legacy_idempotency_tenants")
+}
+
 // validConfig returns a Config that passes Validate(), for mutation in tests.
 func validConfig() Config {
 	return Config{
@@ -2106,21 +2109,6 @@ func TestConfig_Validate_CreditCheckZeroGracePeriod(t *testing.T) {
 		c.CreditCheckZeroGracePeriod = -1 * time.Second
 		require.ErrorContains(t, c.Validate(), "credit_check_zero_grace_period cannot be negative")
 	})
-}
-
-// testLegacyTenant is a canonical manifest account address.
-var testLegacyTenant = func() string {
-	address, err := bech32.ConvertAndEncode("manifest", make([]byte, 20))
-	if err != nil {
-		panic(err)
-	}
-	return address
-}()
-
-func TestConfig_Validate_AcceptsCanonicalLegacyIdempotencyTenants(t *testing.T) {
-	cfg := validConfig()
-	cfg.MaintenanceLegacyIdempotencyTenants = []string{testLegacyTenant}
-	require.NoError(t, cfg.Validate())
 }
 
 func TestConfig_Validate_BillingOnlySKUs(t *testing.T) {

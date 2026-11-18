@@ -30,7 +30,6 @@ var unlabelledMetricNames = []string{
 	"fred_payload_size_bytes",
 	"fred_payload_stored_count",
 	"fred_placement_inventory_recovery_pending",
-	"fred_api_maintenance_legacy_key_total",
 	"fred_placement_write_failures_total",
 	"fred_provisioner_callback_deprovision_owned_success_total",
 	"fred_provisioner_callback_settlement_claim_wait_timeouts_total",
@@ -122,7 +121,7 @@ func allCollectors() []prometheus.Collector {
 	return []prometheus.Collector{
 		MaintenancePending, MaintenancePendingBytes, MaintenancePendingOldestAge, maintenanceAdmissionRefusalsTotal,
 		// Provisioning
-		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, APIMaintenanceLegacyKeyTotal, unboundBackendEventsTotal,
+		PlacementWriteFailuresTotal, PlacementInventoryRecoveryPending, unboundBackendEventsTotal,
 		apiCallbackSignatureKeyTotal, apiCallbackAuthFailuresTotal, APICallbackPreviousKeyConfigured,
 		placementSnapshotsTotal, placementSnapshotPruneFailuresTotal, PlacementUnprojectedFencedReporter,
 		InFlightProvisions,
