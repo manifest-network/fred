@@ -25,7 +25,7 @@ on:
       # touching any non-.md file still matches a positive pattern and runs.
       - "!**/*.md"
   push:
-    branches: [main]
+    branches: [main, "release/**"]
     paths:
       # Test runtime dependencies structurally: moving a helper into a new
       # package must not make dependency-only changes skip integration.
