@@ -16,6 +16,7 @@ on:
       # package must not make dependency-only changes skip integration.
       - "internal/**"
       - "cmd/**"
+      - "test/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -31,6 +32,7 @@ on:
       # package must not make dependency-only changes skip integration.
       - "internal/**"
       - "cmd/**"
+      - "test/**"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -57,8 +59,10 @@ concurrency:
 
 jobs:
   docker-xfs:
-    # The display name (and therefore the status-check name) carries the store.
-    name: docker + xfs integration (root, ${{ matrix.image_store }})
+    # The display name (and therefore the status-check name) carries the suite
+    # and the store. The in-process legs keep the name they had before the e2e
+    # legs existed.
+    name: ${{ matrix.suite == 'e2e' && 'e2e' || 'docker + xfs integration' }} (root, ${{ matrix.image_store }})
     # MUST be the full ubuntu image (not ubuntu-slim): we need passwordless
     # sudo→root, loop devices, and low-level mount — ubuntu-slim's job container
     # is unprivileged and cannot do any of that.
@@ -73,6 +77,12 @@ jobs:
         # (manifest-deploy roles/common/templates/daemon.json.j2); containerd
         # keeps index/platform-manifest admission covered.
         image_store: [overlay2, containerd]
+        # in-process: the suites inside internal/backend/docker and
+        # internal/fstree. e2e: the black-box suite in test/e2e, which runs the
+        # built binaries as separate processes. Both need the same privileged
+        # environment, so they share every setup step below; each is its own
+        # job, because one e2e run sweeps the Docker daemon it runs on.
+        suite: [in-process, e2e]
     env:
       DOCKER_ENGINE_VERSION: "29.7.2"
       # Read by the daemon.json step, the preflight, the run step and the
@@ -265,7 +275,28 @@ jobs:
             if [ "$ok" -ne 1 ]; then echo "::error::failed to pull $img after 3 attempts"; exit 1; fi
           done
 
+      - name: Declare the image data path
+        # Read by both suites, which must tell docker-backend where the leg's
+        # image store keeps its content.
+        run: |
+          case "$FRED_TEST_IMAGE_STORE" in
+            containerd)
+              # containerd.io uses this separately managed content root.
+              # Production requires image_data_path explicitly for snapshotter
+              # image stores.
+              echo "FRED_TEST_IMAGE_DATA_PATH=/var/lib/containerd" >> "$GITHUB_ENV"
+              ;;
+            overlay2)
+              # Left unset, as in the deployed docker-backend config: the
+              # classic store keeps image data under Docker's data root.
+              ;;
+            *)
+              echo "::error::unknown FRED_TEST_IMAGE_STORE '$FRED_TEST_IMAGE_STORE'"; exit 1
+              ;;
+          esac
+
       - name: Run docker + xfs integration suite (as root)
+        if: matrix.suite == 'in-process'
         # `-run Integration` covers the ENTIRE docker package: core lifecycle,
         # stack, restart/update, reconciler, idempotency, image admission and
         # immutable platform binding, volume/quota, and the
@@ -276,23 +307,17 @@ jobs:
         # also carries FRED_TEST_IMAGE_STORE and FRED_TEST_IMAGE_DATA_PATH.
         run: |
           set -o pipefail
-          case "$FRED_TEST_IMAGE_STORE" in
-            containerd)
-              # containerd.io uses this separately managed content root.
-              # Production requires image_data_path explicitly for snapshotter
-              # image stores.
-              export FRED_TEST_IMAGE_DATA_PATH=/var/lib/containerd
-              ;;
-            overlay2)
-              # Left unset, as in the deployed docker-backend config: the
-              # classic store keeps image data under Docker's data root.
-              unset FRED_TEST_IMAGE_DATA_PATH
-              ;;
-            *)
-              echo "::error::unknown FRED_TEST_IMAGE_STORE '$FRED_TEST_IMAGE_STORE'"; exit 1
-              ;;
-          esac
           sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m 2>&1 | tee integration.log
+
+      - name: Run e2e suite (built unprivileged, run as root)
+        if: matrix.suite == 'e2e'
+        # No sudo here: `make test-e2e` builds the binaries under test and the
+        # test binaries as the runner account, then runs only the test binaries
+        # under sudo, with no `-run` filter. The log goes where the guard below
+        # reads it.
+        run: |
+          set -o pipefail
+          make test-e2e 2>&1 | tee integration.log
 
       - name: Guard — fail if any integration test was SKIPPED
         # A green-but-skipped run is the exact failure mode ENG-330 exists to kill.
@@ -312,3 +337,11 @@ jobs:
             echo "::error::No integration tests executed (0 PASS lines) — check the build tag / -run pattern."
             exit 1
           fi
+
+      - name: Upload e2e process logs
+        if: failure() && matrix.suite == 'e2e'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-logs-${{ matrix.image_store }}
+          path: build/e2e/logs/
+          if-no-files-found: ignore

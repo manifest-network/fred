@@ -18,6 +18,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // TestIntegration_Docker_RetainRestoreLifecycle exercises the full soft-delete
@@ -34,7 +35,7 @@ import (
 //     retention record is deleted, the new lease's canonical volume exists, and
 //     the retained volume is gone.
 func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -202,7 +203,7 @@ func TestIntegration_Docker_RetainRestoreLifecycle(t *testing.T) {
 // reaper hard-deletes a soft-deleted lease's record and retained volume once the
 // (tiny) grace window elapses.
 func TestIntegration_Docker_RetainGraceReap(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	// Grace window sized so the record is deterministically observable AFTER

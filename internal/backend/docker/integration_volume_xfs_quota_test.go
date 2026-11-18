@@ -13,13 +13,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // Exercise the real kernel attributes. Root repair
 // must restore inheritance without recursively retagging historical descendants;
 // such descendants require offline repair outside the startup readiness budget.
 func TestIntegration_XFS_QuotaRepairTouchesOnlyRoot(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := testutil.SetupXFSLoopback(t)
 	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
@@ -66,7 +68,7 @@ func TestIntegration_XFS_QuotaRepairTouchesOnlyRoot(t *testing.T) {
 }
 
 func TestIntegration_XFS_QuotaRootIOCTLPreservesPinnedInodeAndOtherAttributes(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := testutil.SetupXFSLoopback(t)
 	displayPath := filepath.Join(mount, "root-before-rename")
 	require.NoError(t, os.Mkdir(displayPath, 0o700))
 	root, err := os.OpenRoot(displayPath)

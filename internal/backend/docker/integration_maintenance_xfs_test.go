@@ -18,6 +18,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS proves the
@@ -26,7 +27,7 @@ import (
 // again, but it cannot append another release, start another worker, emit a
 // second callback, lose volume data, or drop the XFS project quota.
 func TestIntegration_Maintenance_ExactReplaySurvivesBackendRestart_XFS(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mountPath, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0o700))
 	callbackServer, callbackCh := startCallbackServer(t)

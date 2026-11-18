@@ -28,6 +28,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/leasesm"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	fredtestutil "github.com/manifest-network/fred/internal/testutil"
 )
 
 // requireXFSProjectVolume asserts that path is a managed XFS volume root: a
@@ -138,7 +139,7 @@ func drainCallbacks(ch <-chan backend.CallbackPayload) {
 }
 
 func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := fredtestutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -288,7 +289,7 @@ func containersForLease(t *testing.T, leaseUUID string) int {
 // unit test cannot: that fred refuses BEFORE Docker is asked to resolve the Source, and
 // that no container is created with a redirected mount.
 func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := fredtestutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -468,7 +469,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := fredtestutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -638,7 +639,7 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 // multi-unit lease (Quantity=2) gets separate, isolated XFS project volumes
 // per instance. Data written in one container must not be visible in the other.
 func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := fredtestutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -731,7 +732,7 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 // enforcement actually prevents writes beyond the configured disk limit.
 // A small write should succeed; a large write should fail with ENOSPC/EDQUOT.
 func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := fredtestutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -804,59 +805,6 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// setupXFSLoopback creates an XFS filesystem on a loopback file, mounted with
-// the pquota option required for project-quota enforcement. Returns the mount
-// path. Cleanup (umount) is registered via t.Cleanup.
-// Skips if root, mkfs.xfs, xfs_quota, or a usable loop device are absent.
-func setupXFSLoopback(t *testing.T) string {
-	t.Helper()
-
-	if os.Getuid() != 0 {
-		t.Skip("xfs loopback requires root")
-	}
-	if _, err := exec.LookPath("mkfs.xfs"); err != nil {
-		t.Skip("mkfs.xfs not found:", err)
-	}
-	if _, err := exec.LookPath("xfs_quota"); err != nil {
-		t.Skip("xfs_quota not found:", err)
-	}
-
-	tmpDir := t.TempDir()
-	imgFile := filepath.Join(tmpDir, "xfs.img")
-	mountDir := filepath.Join(tmpDir, "mnt")
-	require.NoError(t, os.MkdirAll(mountDir, 0755))
-
-	// 512M: modern xfsprogs refuses to mkfs an XFS filesystem smaller than
-	// 300MB ("Filesystem must be larger than 300MB"). The per-volume project
-	// quotas (tens of MiB) are independent of this backing-image size.
-	out, err := exec.Command("truncate", "-s", "512M", imgFile).CombinedOutput()
-	require.NoError(t, err, "truncate: %s", out)
-
-	out, err = exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput()
-	require.NoError(t, err, "mkfs.xfs: %s", out)
-
-	// pquota enables project-quota enforcement. Loop-device support is a
-	// prerequisite just like root and xfsprogs above, but it can't be probed
-	// reliably ahead of time. Some environments (containers, restricted/hardened
-	// hosts, many CI runners) have no usable loop devices even as root, where
-	// `mount -o loop` fails with a "failed to set up loop device" error. Skip
-	// there rather than fail — only a genuine (non-loop) mount error should
-	// fail the test.
-	out, err = exec.Command("mount", "-o", "loop,pquota", imgFile, mountDir).CombinedOutput()
-	if err != nil {
-		if strings.Contains(string(out), "set up loop device") {
-			t.Skipf("xfs loopback unavailable (loop device setup failed): %s", out)
-		}
-		require.NoError(t, err, "mount: %s", out)
-	}
-
-	t.Cleanup(func() {
-		_ = exec.Command("umount", "-l", mountDir).Run()
-	})
-
-	return mountDir
-}
-
 // writeIncompressibleMiB writes mib MiB of incompressible data to path and
 // syncs. A compressing filesystem can store zero-filled test data (dd
 // if=/dev/zero / make([]byte,N)) in far less space than its length, so it would
@@ -897,7 +845,7 @@ func backendForReconcileTest(t *testing.T, mgr volumeManager, dataPath, lease, s
 // TestIntegration_Usage_XFS verifies that xfsVolumeManager.Usage returns the
 // project's used bytes (1 KiB block granularity) within a metadata-overhead bound.
 func TestIntegration_Usage_XFS(t *testing.T) {
-	mountDir := setupXFSLoopback(t)
+	mountDir := fredtestutil.SetupXFSLoopback(t)
 	ctx := context.Background()
 
 	mgr, err := newVolumeManager(mountDir, "xfs", 1024, slog.Default())
@@ -936,7 +884,7 @@ func TestIntegration_Usage_XFS(t *testing.T) {
 //     → Usage()'s `report -p` could not find the projid ("project id N not found");
 //   - `limit -p` silently no-op'd → the disk_mb cap was never enforced.
 func TestIntegration_XFS_SubdirDataPath_TagsMeasuresEnforces(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes") // subdir of the XFS mount
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 
@@ -1007,7 +955,7 @@ func xfsProjectInodeCount(t *testing.T, mount string, projID uint32) int64 {
 // its CAP_SYS_ADMIN probe — paired with a generous bhard so only the inode
 // count binds.
 func TestIntegration_XFS_InodeQuota_EnforcesEDQUOT(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	ctx := context.Background()
 
 	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
@@ -1097,7 +1045,7 @@ func requireXFSProjectEventuallyAbsent(t *testing.T, mount string, projID uint32
 // dir removed hides the entry" kernel behavior on the CI kernel — the one claim the
 // mechanism research could confirm by semantics but not by primary documentation.
 func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes") // subdir of the mount (production layout)
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
@@ -1146,7 +1094,7 @@ func TestIntegration_XFS_Destroy_ClearsQuotaEntry(t *testing.T) {
 // publish past) the stage, and explicit recovery must remove both the directory
 // evidence and its kernel dquot without ever publishing the final volume name.
 func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes") // subdir of the mount (production layout)
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
@@ -1213,7 +1161,7 @@ func TestIntegration_XFS_InterruptedCreateStageRecoveryClearsQuota(t *testing.T)
 // refuses to clear the old dquot while that inode remains (a residual hold),
 // and converges once the descriptor is closed, also across a restart.
 func TestIntegration_XFS_DeleteStageRecoveryWaitsForOpenUnlinkedInode(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0o700))
 	ctx := context.Background()
@@ -1338,7 +1286,7 @@ func TestIntegration_XFS_DestroyDeletesChainDeeperThanFDLimit(t *testing.T) {
 
 func destroyDeepXFSChainUnderLowFDLimit(t *testing.T) {
 	const depth = 4096
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0o700))
 	ctx := context.Background()
@@ -1395,7 +1343,7 @@ func setXFSFileProjectID(t *testing.T, path string, projID uint32) {
 // cannot be recreated, and once the planted inode is deleted the retry clears
 // everything.
 func TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0o700))
 	ctx := context.Background()
@@ -1444,7 +1392,7 @@ func TestIntegration_XFS_DestroyHoldsForeignTaggedInodeUsage(t *testing.T) {
 // volume first detaches from its project, and the deletion completes and clears
 // the dquot. 70,000 levels fit the 262,144-inode floor.
 func TestIntegration_XFS_DestroyCutsChainDeeperThanMaxDepth(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0o700))
 	ctx := context.Background()
@@ -1499,7 +1447,7 @@ func runWithoutCapSysAdmin(t *testing.T, cmdline string) ([]byte, error) {
 }
 
 func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
-	mount := setupXFSLoopback(t) // requires root
+	mount := fredtestutil.SetupXFSLoopback(t) // requires root
 	ctx := context.Background()
 
 	// Sanity: our own detector agrees the (root) test process can set quotas.
@@ -1528,7 +1476,7 @@ func TestIntegration_XFS_QuotaSet_RequiresCapSysAdmin(t *testing.T) {
 // files remain outside the project; repairing them requires stopped-writer
 // offline maintenance, never recursive work in startup or reuse.
 func TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites(t *testing.T) {
-	mount := setupXFSLoopback(t) // requires root
+	mount := fredtestutil.SetupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
@@ -1584,7 +1532,7 @@ func TestIntegration_XFS_EnsureQuota_RepairsRootForNewWrites(t *testing.T) {
 // composes enumeration (name derivation + existence gate + SKU sizing) with the
 // real EnsureQuota, catching wiring bugs the mock-based unit test cannot.
 func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
-	mount := setupXFSLoopback(t) // requires root
+	mount := fredtestutil.SetupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
@@ -1625,7 +1573,7 @@ func TestIntegration_XFS_ReconcileBackfill_EndToEnd(t *testing.T) {
 // retention with its project tags intact, and reconciliation must apply the
 // retained record's smaller cap while preserving accounting.
 func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
-	mount := setupXFSLoopback(t) // requires root
+	mount := fredtestutil.SetupXFSLoopback(t) // requires root
 	dataPath := filepath.Join(mount, "volumes")
 	require.NoError(t, os.MkdirAll(dataPath, 0700))
 	ctx := context.Background()
@@ -1681,7 +1629,7 @@ func TestIntegration_XFS_ReconcileBackfill_RetainedVolume(t *testing.T) {
 // the quota is lowered, (b) the gate refuses when data exceeds the smaller
 // tier, (c) a promote raises the cap.
 func TestIntegration_DemotePromote_XFS(t *testing.T) {
-	mountDir := setupXFSLoopback(t)
+	mountDir := fredtestutil.SetupXFSLoopback(t)
 	ctx := context.Background()
 
 	const largeMiB, mediumMiB = int64(100), int64(20)
