@@ -118,7 +118,7 @@ actual containing mountpoint and `volume_data_path` to the managed directory
 beneath it; for example, `/data` and `/data/fred/volumes`. Preserve these paths
 and the matching storage identity across restarts and upgrades.
 
-The docker-backend places each container's data on a quota-enforced host directory. Three filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` and `zfs` backends have automated coverage but are **not production-validated and not used in any deployment** — treat them as experimental.
+The docker-backend places each container's data on a quota-enforced host directory. Two filesystems are implemented, but **`xfs` is the only backend validated and used in production.** All mainnet and Morpheus backends run XFS with `pquota`, and per-volume disk *and* inode (`ihard`) quotas are exercised only on XFS. **Use `xfs` for production deployments** (see below). The `btrfs` backend has automated coverage but is **not production-validated and not used in any deployment** — treat it as experimental.
 
 #### xfs (good for large fleets)
 
@@ -189,12 +189,12 @@ Each container gets a directory with an xfs project quota.
 > recursive healing path is required. Inventory, authority and root-enforcement
 > errors still fail startup closed.
 
-#### Experimental backends (not production-validated or deployed)
+#### Experimental backend (not production-validated or deployed)
 
-> **Not production-ready.** The `btrfs` and `zfs` backends are implemented but
-> have **no production coverage** — no mainnet/Morpheus backend runs them, and the
+> **Not production-ready.** The `btrfs` backend is implemented but
+> has **no production coverage** — no mainnet/Morpheus backend runs it, and the
 > per-volume inode (`ihard`) exhaustion protection enforced on XFS has no
-> production-validated equivalent here. They are documented for completeness only; use `xfs` for any
+> production-validated equivalent here. It is documented for completeness only; use `xfs` for any
 > production deployment.
 
 #### btrfs (experimental)
@@ -213,16 +213,6 @@ echo "/dev/nvme1n1 /var/lib/fred/volumes btrfs defaults 0 0" >> /etc/fstab
 ```
 
 Each container gets a btrfs subvolume with a qgroup quota.
-
-#### zfs (experimental)
-
-```bash
-zpool create fredpool /dev/nvme1n1
-zfs create fredpool/volumes
-zfs set mountpoint=/var/lib/fred/volumes fredpool/volumes
-```
-
-Each container gets a child dataset with the `quota` property set.
 
 #### Set the config
 
@@ -775,7 +765,7 @@ Ordinary file-copy backups must be taken with the owning daemon stopped (bbolt's
 file lock refuses a second bbolt open). Snapshot each backend's marker pair,
 complete authoritative-store set, and substrate as one unit so a restore cannot
 mix generations or times. For zero-downtime backups, use an atomic
-filesystem-level snapshot (LVM, ZFS, btrfs) — bbolt files are crash-consistent.
+filesystem-level snapshot (LVM, btrfs) — bbolt files are crash-consistent.
 providerd can also snapshot `placements.db` and `payloads.db` itself while it
 runs; see [Online snapshots](#online-snapshots).
 Restoring a complete matching snapshot intentionally preserves the same lineage,
@@ -1513,7 +1503,7 @@ inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
 fleet on `docker-backend` with XFS, matching
 [Components and topology](#components-and-topology) and the current
 [stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus).
-Btrfs/ZFS remain experimental. This
+Btrfs remains experimental. This
 is a point-in-time rollout fact, not a permanent support or compatibility
 promise: re-inventory the deployments immediately before executing the cutover
 and extend the proof plan if the fleet has changed. Local development
@@ -1656,11 +1646,8 @@ inventory check still refuses any unexplained managed volume.
 
 The managed-volume check proves more than a directory name. Every inventory
 entry must have the canonical live or retained lease/service/index grammar and
-must be backed by the configured quota substrate: an actual Btrfs subvolume, an
-XFS directory with a regular no-follow nonzero project-ID marker, or the exact
-ZFS child dataset mounted at the exact managed path. ZFS inventory includes
-depth-one child datasets even when they are unmounted or mounted elsewhere, so
-they cannot disappear from the proof with their expected directory. Container
+must be backed by the configured quota substrate: an actual Btrfs subvolume or an
+XFS directory with a regular no-follow nonzero project-ID marker. Container
 bind evidence must name the exact volume derived from its labels and the exact
 target-derived subtree (or `_wp` subtree), with no symlinked path component;
 lexically naming one volume while resolving into another is rejected. Repair or
@@ -1683,10 +1670,7 @@ name or remove it to force a verdict. Likewise,
 that cannot originate from v0.13.0. Its paired final volume may already be
 markerless or absent, so deleting or editing the empty sibling could erase the
 only safe recovery proof. Preserve the complete snapshot and determine why an
-upgraded process reached this root. An exact ZFS managed child that is unmounted
-is also rejected rather than omitted. Verify its exact child dataset
-and configured mountpoint, then remount it or restore the matching pool snapshot
-before rerunning the proof.
+upgraded process reached this root.
 
 The preflight also rejects an interrupted v0.13 deprovision when the journals
 contain an active release, no managed container cohort, and a semantically
@@ -1863,8 +1847,7 @@ aggregate parent deadline. Any cleanup or outcome ambiguity preserves the stage
 and triggers the backend-wide graceful exit above; the supervisor's fresh
 `Start` must recover it before serving. Startup never promotes recovered debris
 into a tenant volume.
-An exact unmounted ZFS child is remounted and re-attested at its
-configured path without being destroyed. Either recovery preserves its evidence
+Stage recovery preserves its evidence
 and fails startup on an ambiguous or failed mutation. Btrfs has no private stage:
 an interrupted create is an already-published subvolume, which operation
 recovery classifies before fatal quota reconciliation. Unattributed managed
@@ -2692,7 +2675,7 @@ The `docker-backend` stage is intentionally last in the `Dockerfile`, so a targe
 Both run as the `nonroot` user (UID 65532) on a `gcr.io/distroless/static-debian12` base.
 
 **`docker-backend` (stateless development only)** — the image contains no
-`xfs_quota`, `btrfs`, or `zfs` executable. Its `/data` volume persists the
+`xfs_quota` or `btrfs` executable. Its `/data` volume persists the
 backend's databases and storage identity; it does not supply managed tenant
 storage. Installing quota tools on the host does not make them available inside
 this image. Containerized stateful backend operation is unsupported.

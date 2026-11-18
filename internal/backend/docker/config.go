@@ -226,7 +226,7 @@ type Config struct {
 	VolumeMountPath string `yaml:"volume_mount_path"`
 
 	// VolumeFilesystem specifies the filesystem type for volume quota enforcement.
-	// Supported values: "btrfs", "xfs", "zfs". If empty, auto-detected from VolumeDataPath.
+	// Supported values: "btrfs", "xfs". If empty, auto-detected from VolumeDataPath.
 	VolumeFilesystem string `yaml:"volume_filesystem"`
 
 	// MinAvgFileBytes is the smallest average file size (bytes) a volume's workload
@@ -801,10 +801,10 @@ func (c *Config) Validate() error {
 	}
 	if c.VolumeFilesystem != "" {
 		switch c.VolumeFilesystem {
-		case "btrfs", "xfs", "zfs":
+		case "btrfs", "xfs":
 			// valid
 		default:
-			return fmt.Errorf("volume_filesystem must be btrfs, xfs, or zfs (got %q)", c.VolumeFilesystem)
+			return fmt.Errorf("volume_filesystem must be btrfs or xfs (got %q)", c.VolumeFilesystem)
 		}
 	}
 

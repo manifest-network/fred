@@ -108,8 +108,8 @@ test-volume:
 	$(GOTEST) -v ./internal/backend/docker/ -run "TestDoProvision_Stateful|TestDoProvision_Volume|TestDoProvision_Cleanup|TestProvision_ReProvisionKeeps|TestDeprovision_Destroys|TestDeprovision_Volume|TestCleanupOrphaned"
 
 # Run Docker integration tests, plus fstree's mount boundary tests, so CI's
-# SKIP guard covers both. Requires root, Docker, btrfs-progs, xfsprogs,
-# zfsutils and capsh, plus FRED_TEST_IMAGE_STORE (see CONTRIBUTING.md).
+# SKIP guard covers both. Requires root, Docker, btrfs-progs, xfsprogs
+# and capsh, plus FRED_TEST_IMAGE_STORE (see CONTRIBUTING.md).
 # Usage: sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m
 test-integration:
 	@echo "Running Docker integration tests..."
@@ -233,7 +233,7 @@ help:
 	@echo "  test                    - Run tests"
 	@echo "  test-models             - Run the pinned Quint simulation suite"
 	@echo "  test-volume             - Run volume unit tests"
-	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, btrfs/xfs/zfs tools)"
+	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, btrfs/xfs tools)"
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"

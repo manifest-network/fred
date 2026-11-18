@@ -391,7 +391,7 @@ func (b *btrfsVolumeManager) Validate() error {
 	}
 
 	// `btrfs subvolume create` and `btrfs qgroup limit` are privileged ioctls
-	// requiring CAP_SYS_ADMIN (no delegation alternative, unlike zfs). The
+	// requiring CAP_SYS_ADMIN (no delegation alternative). The
 	// qgroup show read above succeeds without it, so fail fast at startup rather
 	// than rejecting every provision at runtime (ENG-454).
 	if err := requireCapSysAdmin(b.Kind(), b.logger); err != nil {

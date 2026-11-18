@@ -520,7 +520,7 @@ func TestProjidAuditSkipsUnsupportedManagers(t *testing.T) {
 	before := auditCounters()
 	auditor.passWithin(t.Context(), time.Minute)
 	requireAuditDeltas(t, before, nil)
-	for _, manager := range []volumeReader{&noopVolumeManager{}, &btrfsVolumeManager{}, &zfsVolumeManager{}} {
+	for _, manager := range []volumeReader{&noopVolumeManager{}, &btrfsVolumeManager{}} {
 		_, err := manager.OpenProjectIDAudit(t.Context(), mustManagedVolumeName(t, auditVolumeName(20)))
 		require.ErrorIs(t, err, errProjectIDAuditUnsupported)
 	}

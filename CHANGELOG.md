@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- docker-backend no longer supports ZFS for managed volumes. `volume_filesystem: zfs` is now rejected at config validation, and a `volume_data_path` on ZFS fails startup as an unsupported filesystem. The ZFS driver was experimental and no deployment used it. Use XFS, the only production-validated filesystem; btrfs remains experimental. The integration suite no longer needs `zfsutils-linux`.
 - The experimental `k3s-backend` is gone: the binary, its `k3s-backend` image target, `config.k3s.yaml.example`, the `K3S_BACKEND_*` environment variables, the `fred_k3s_backend_*` metrics, and the `build-k3s`, `run-k3s` and `test-integration-k3s` make targets. It was a scaffold that failed every provision and was never released as a binary or image. Fred no longer depends on `k8s.io/client-go`.
 
 ### Fixed

@@ -188,7 +188,7 @@ Backends are services that handle the actual resource provisioning. Backend and 
 
 The currently deployed and production-validated execution envelope is
 `docker-backend` on XFS. Docker's Btrfs
-and ZFS volume implementations have automated coverage but are experimental and
+volume implementation has automated coverage but is experimental and
 not deployed; use XFS for production. See [Deployment](DEPLOYMENT.md#filesystem-setup).
 
 Leases are routed to backends using the **`skus`** field — an exact list of on-chain SKU UUIDs. A backend with no `skus` matches nothing. A SKU that no backend lists goes to the fallback backend: the one with `default: true` (at most one may set it), or the first configured backend when none does. A fenced fallback receives no new provisions. When multiple backends match the same SKU, Fred routes each new provision to the least-loaded matching backend — the SKU-matching backend reporting the lowest allocated-CPU ratio from its `/stats` endpoint (ENG-318), preferring backends that do not report `disk_withheld`. Ties break by fewest in-flight provisions, then by a round-robin counter; round-robin is also the fallback when no matching backend exposes usable load stats.

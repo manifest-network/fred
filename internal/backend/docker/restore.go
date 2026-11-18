@@ -2306,8 +2306,8 @@ type retainedQuotaTarget struct {
 // retention record becomes Active again.
 //
 // A promote restore raises the physical quota through volumeManager.Create.
-// Merely renaming the volume back does not undo that change on btrfs, XFS, or
-// ZFS. RollbackRestoring would then publish the smaller immutable source footprint
+// Merely renaming the volume back does not undo that change on btrfs or
+// XFS. RollbackRestoring would then publish the smaller immutable source footprint
 // while the filesystem still permits growth to the larger destination cap.
 // This helper closes that under-accounting window by requiring three proofs:
 // the durable snapshot maps every retained volume to one exact old cap, current

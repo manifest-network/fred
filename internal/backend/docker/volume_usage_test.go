@@ -60,10 +60,3 @@ func TestParseXfsReportUsedBlocks_NotFound(t *testing.T) {
 		t.Fatalf("expected error for missing project id")
 	}
 }
-
-func TestParseZfsReferenced(t *testing.T) {
-	v, err := parseZfsReferenced("1073741824\n")
-	if err != nil || v != 1073741824 {
-		t.Fatalf("parseZfsReferenced = %d, %v; want 1073741824, nil", v, err)
-	}
-}

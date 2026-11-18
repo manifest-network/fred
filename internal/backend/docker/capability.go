@@ -9,10 +9,9 @@ import (
 // quotas (not root and no ambient CAP_SYS_ADMIN). It is called from the
 // Validate() of backends whose quota operations REQUIRE that capability with no
 // delegation alternative — xfs (quotactl Q_XSETQLIM) and btrfs (subvolume/qgroup
-// ioctls). It is deliberately NOT called for zfs (which supports `zfs allow`
-// delegation, so a cap check would wrongly reject a properly-delegated non-root
-// host) or for the noop backend (no privileged ops). Failing fast at startup
-// beats failing every provision at runtime with an unenforced disk cap.
+// ioctls). It is not called for the noop backend (no privileged ops). Failing
+// fast at startup beats failing every provision at runtime with an unenforced
+// disk cap.
 //
 // The privilege probe (daemonCanSetQuotas) is Linux-only; see capability_linux.go
 // and capability_nonlinux.go.

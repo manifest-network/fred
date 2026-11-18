@@ -2748,9 +2748,7 @@ func (b *Backend) Start(ctx context.Context) error {
 	// idempotent: treating an arbitrary read error from RequireNoInterruptedVolumeMutations
 	// as a Boolean "work exists" signal would conflate timeout/inventory failure
 	// with typed recovery evidence. Recover before operation intents: an
-	// unpublished XFS stage carries no tenant bytes and must be cleared, while an
-	// exact unmounted ZFS child must be mounted before Docker/inventory recovery
-	// can classify its owner.
+	// unpublished XFS stage carries no tenant bytes and must be cleared.
 	// These are filesystem/quota-only phases: their local cap must not inherit a
 	// configured container stop grace. Both remain children of startupCtx, so the
 	// documented aggregate startup deadline cannot be reset or exceeded here.

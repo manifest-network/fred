@@ -160,6 +160,8 @@ func TestParseManagedVolumeName_RequiresCanonicalIdentity(t *testing.T) {
 		"fred-" + leaseUUID + "-app.example-0",
 		"fred-" + leaseUUID + "-/../../outside-0",
 		`fred-` + leaseUUID + `-app\..\outside-0`,
+		"fred-" + leaseUUID + "-app-0@snapshot",
+		"fred-" + leaseUUID + "-app-0#bookmark",
 	} {
 		value := value
 		t.Run("reject_"+value, func(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// daemonCanSetQuotas reports whether an exec'd quota tool (xfs_quota / btrfs /
-// zfs) launched by this daemon will run with CAP_SYS_ADMIN.
+// daemonCanSetQuotas reports whether an exec'd quota tool (xfs_quota / btrfs)
+// launched by this daemon will run with CAP_SYS_ADMIN.
 //
 // An exec'd child gets the capability only if it lands in the child's permitted
 // set. Across execve, for a child with no file capabilities:
