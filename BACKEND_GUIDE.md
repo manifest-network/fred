@@ -104,8 +104,6 @@ manifest, and a UUID that maps to no profile is refused as `unknown_sku`.
 |-----|-----|----------------------|
 | `a1b2c3d4-...-1234567890ab` | `docker-small` | Run each instance with 0.5 CPU, 512 MB memory and a 1 GB disk quota (Docker backend) |
 | `b2c3d4e5-...-2345678901bc` | `docker-large` | Run each instance with 2 CPU, 2 GB memory and a 4 GB disk quota (Docker backend) |
-| `d4e5f6a7-...-5678901234ef` | `k8s-small` | Create deployment with 1 CPU, 512MB |
-| `e5f6a7b8-...-6789012345f0` | `k8s-large` | Create deployment with 4 CPU, 4GB |
 | `c3d4e5f6-...-4567890123de` | `gpu-a100` | Allocate A100 GPU node |
 
 **Note:** The `mock-backend` included with Fred ignores the SKU entirely - it provisions the same fake resource regardless of SKU. This is intentional for testing purposes.
@@ -140,7 +138,7 @@ backend accepts one key only.
 ## Durable Backend Storage Identity
 
 A configured backend name is a routing label; it is not proof that the same
-disk, Docker daemon, or Kubernetes cluster is still behind that label. Every
+disk or Docker daemon is still behind that label. Every
 backend implementation must therefore seal one canonical lowercase UUIDv4 to
 its durable storage lineage and keep it stable across process restarts. A
 replacement storage substrate must receive a new backend name. Never generate

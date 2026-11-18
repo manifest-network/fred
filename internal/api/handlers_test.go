@@ -1413,10 +1413,10 @@ func TestExtractConnectionDetails(t *testing.T) {
 			name: "metadata passed through",
 			input: backend.LeaseInfo{
 				Host:     "test.example.com",
-				Metadata: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
+				Metadata: map[string]string{"region": "us-east-1", "backend": "docker"},
 			},
 			expectedHost: "test.example.com",
-			expectedMeta: map[string]string{"region": "us-east-1", "backend": "kubernetes"},
+			expectedMeta: map[string]string{"region": "us-east-1", "backend": "docker"},
 		},
 		{
 			name: "single instance with ports",

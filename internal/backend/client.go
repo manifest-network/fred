@@ -30,7 +30,7 @@ import (
 )
 
 // Backend defines the interface for interacting with a provisioning backend.
-// Any backend (Kubernetes, GPU, VM, etc.) must implement these operations.
+// Any backend (containers, GPU, VM, etc.) must implement these operations.
 type Backend interface {
 	// Provision starts async provisioning of a resource.
 	// The backend will call the callback URL when provisioning completes.

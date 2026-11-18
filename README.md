@@ -584,7 +584,7 @@ Returns connection details for an active lease from the backend. Requires ADR-03
     "protocol": "https",
     "metadata": {
       "region": "us-east-1",
-      "backend": "kubernetes"
+      "backend": "docker"
     }
   }
 }

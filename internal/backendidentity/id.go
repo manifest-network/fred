@@ -37,7 +37,7 @@ var (
 	// ErrIdentityDrift marks a permanent contradiction between the storage
 	// lineage sealed at startup and the substrate currently reachable by the
 	// backend. Callers must fail-stop rather than retry the operation against a
-	// replacement substrate. Temporary Docker/Kubernetes reachability failures
+	// replacement substrate. Temporary substrate reachability failures
 	// deliberately do not wrap this sentinel.
 	ErrIdentityDrift = errors.New("backend storage identity drift")
 

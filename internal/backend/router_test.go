@@ -25,15 +25,15 @@ func (backend routerNamedBackend) Name() string { return backend.name }
 
 func TestRouter_Route(t *testing.T) {
 	// Create mock backends
-	k8sBackend := NewMockBackend(MockBackendConfig{Name: "kubernetes"})
+	batchBackend := NewMockBackend(MockBackendConfig{Name: "batch"})
 	gpuBackend := NewMockBackend(MockBackendConfig{Name: "gpu"})
 	vmBackend := NewMockBackend(MockBackendConfig{Name: "vm"})
 
 	router, err := NewRouter(RouterConfig{
 		Backends: []BackendEntry{
 			{
-				Backend:   k8sBackend,
-				Match:     MatchCriteria{SKUs: []string{"k8s-small", "k8s-large"}},
+				Backend:   batchBackend,
+				Match:     MatchCriteria{SKUs: []string{"batch-small", "batch-large"}},
 				IsDefault: true,
 			},
 			{
@@ -52,14 +52,14 @@ func TestRouter_Route(t *testing.T) {
 		sku      string
 		wantName string
 	}{
-		{"k8s-small", "kubernetes"},
-		{"k8s-large", "kubernetes"},
+		{"batch-small", "batch"},
+		{"batch-large", "batch"},
 		{"gpu-a100", "gpu"},
 		{"gpu-h100-4x", "gpu"},
 		{"vm-ubuntu", "vm"},
 		{"vm-windows-server", "vm"},
-		{"unknown-sku", "kubernetes"}, // Falls back to default
-		{"", "kubernetes"},            // Empty falls back to default
+		{"unknown-sku", "batch"}, // Falls back to default
+		{"", "batch"},            // Empty falls back to default
 	}
 
 	for _, tt := range tests {
@@ -286,7 +286,7 @@ func TestRouter_RouteAll(t *testing.T) {
 		Backends: []BackendEntry{
 			{Backend: backendA, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
 			{Backend: backendB, Match: MatchCriteria{SKUs: []string{"gpu-a100"}}},
-			{Backend: backendC, Match: MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: backendC, Match: MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 	require.NoError(t, err)
@@ -298,8 +298,8 @@ func TestRouter_RouteAll(t *testing.T) {
 	assert.Contains(t, names, "backend-a")
 	assert.Contains(t, names, "backend-b")
 
-	// One backend matches k8s-small
-	matches = router.RouteAll("k8s-small")
+	// One backend matches batch-small
+	matches = router.RouteAll("batch-small")
 	assert.Len(t, matches, 1)
 	assert.Equal(t, "backend-c", matches[0].Name())
 

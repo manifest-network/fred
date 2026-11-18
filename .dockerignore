@@ -10,9 +10,11 @@ build/
 *.swo
 config.yaml
 config-*.yaml
+config.*.yaml
 config.docker.yaml
 config.mock.yaml
 docker-backend.yaml
+*-backend.yaml
 *.pem
 *.key
 *.crt

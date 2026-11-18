@@ -2147,12 +2147,12 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 					State:  billingtypes.LEASE_STATE_PENDING,
 					Items:  []billingtypes.LeaseItem{{SkuUuid: "gpu-a100-4x", Quantity: 1}},
 				},
-				// K8s lease should go to k8s-backend (default)
+				// batch lease should go to batch-backend (default)
 				{
-					Uuid:   "k8s-lease",
+					Uuid:   "batch-lease",
 					Tenant: "tenant-2",
 					State:  billingtypes.LEASE_STATE_PENDING,
-					Items:  []billingtypes.LeaseItem{{SkuUuid: "k8s-small", Quantity: 1}},
+					Items:  []billingtypes.LeaseItem{{SkuUuid: "batch-small", Quantity: 1}},
 				},
 				// Unknown SKU should go to default backend
 				{
@@ -2166,12 +2166,12 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 	}
 
 	gpuBackend := &mockReconcilerBackend{name: "gpu-backend", provisions: []backend.ProvisionInfo{}}
-	k8sBackend := &mockReconcilerBackend{name: "k8s-backend", provisions: []backend.ProvisionInfo{}}
+	batchBackend := &mockReconcilerBackend{name: "batch-backend", provisions: []backend.ProvisionInfo{}}
 
 	router, _ := backend.NewRouter(backend.RouterConfig{
 		Backends: []backend.BackendEntry{
 			{Backend: gpuBackend, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100-4x"}}},
-			{Backend: k8sBackend, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: batchBackend, Match: backend.MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 
@@ -2192,19 +2192,19 @@ func TestReconciler_ReconcileAll_SKUBasedRouting(t *testing.T) {
 		assert.Equal(t, "gpu-a100-4x", gpuCalls[0].RoutingSKU())
 	}
 
-	// Verify K8s and unknown leases went to K8s backend (default)
-	k8sBackend.mu.Lock()
-	k8sCalls := k8sBackend.provisionCalls
-	k8sBackend.mu.Unlock()
+	// Verify batch and unknown leases went to batch backend (default)
+	batchBackend.mu.Lock()
+	batchCalls := batchBackend.provisionCalls
+	batchBackend.mu.Unlock()
 
-	assert.Len(t, k8sCalls, 2)
+	assert.Len(t, batchCalls, 2)
 
 	// Verify the SKUs are passed correctly
 	skus := make(map[string]bool)
-	for _, call := range k8sCalls {
+	for _, call := range batchCalls {
 		skus[call.RoutingSKU()] = true
 	}
-	assert.True(t, skus["k8s-small"])
+	assert.True(t, skus["batch-small"])
 	assert.True(t, skus["unknown-sku"])
 }
 
@@ -2474,7 +2474,7 @@ func TestReconciler_ParallelBackendFetching(t *testing.T) {
 		Backends: []backend.BackendEntry{
 			{Backend: backend1, Match: backend.MatchCriteria{SKUs: []string{"gpu-a100"}}},
 			{Backend: backend2, Match: backend.MatchCriteria{SKUs: []string{"vm-basic"}}},
-			{Backend: backend3, Match: backend.MatchCriteria{SKUs: []string{"k8s-small"}}, IsDefault: true},
+			{Backend: backend3, Match: backend.MatchCriteria{SKUs: []string{"batch-small"}}, IsDefault: true},
 		},
 	})
 

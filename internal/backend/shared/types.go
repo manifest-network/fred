@@ -1,5 +1,5 @@
 // Package shared provides backend-agnostic components that can be reused
-// across different backend implementations (Docker, Kubernetes, Nomad, etc.).
+// across different backend implementations (Docker today).
 //
 // # What lives here
 //
@@ -28,7 +28,7 @@
 //     already durable
 //
 // All of these are consumed by the docker backend and are usable by any
-// future in-process backend (Kubernetes, Nomad, etc.). An HTTP-only backend in
+// future in-process backend. An HTTP-only backend in
 // a separate process implements the same callback contract (BACKEND_GUIDE.md)
 // with its own durable outbox; CallbackSender requires an identity-bound
 // CallbackStore, so it cannot be reused on its own.

@@ -2,7 +2,7 @@
 // provisioning backends.
 //
 // Fred supports multiple backends, each responsible for provisioning a specific
-// type of resource (e.g., Kubernetes deployments, GPU allocations, VMs). The
+// type of resource (e.g., containers, GPU allocations, VMs). The
 // Router directs leases to the appropriate backend based on exact SKU UUID matching.
 //
 // # Backend Interface

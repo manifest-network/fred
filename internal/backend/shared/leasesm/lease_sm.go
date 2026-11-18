@@ -1373,7 +1373,7 @@ func (lsm *leaseSM) onEnterFailedFromCohortDivergence(ctx context.Context, args 
 // the only piece of substrate-shaped metadata the SM otherwise needs at the
 // post-death log line, and lifting it into InstanceState avoids a parallel
 // pending-state field. Substrate adapters populate ServiceName from their
-// own conventions (Docker labels, K8s pod annotations); leases without a
+// own conventions (Docker labels, for example); leases without a
 // meaningful service name leave it empty.
 type diagResult struct {
 	containerID string
