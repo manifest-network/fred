@@ -184,8 +184,8 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	// 3. Verify the volume exists as a project-tagged XFS directory with a
 	//    live project-quota entry.
 	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
-	subvolPath := filepath.Join(mountPath, volumeID)
-	projID := requireXFSProjectVolume(t, mountPath, subvolPath)
+	volumePath := filepath.Join(mountPath, volumeID)
+	projID := requireXFSProjectVolume(t, mountPath, volumePath)
 
 	// 4. Verify container has bind mount for /data
 	containerID := getContainerID(t, leaseUUID)
@@ -199,7 +199,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 		[]string{"redis-cli", "-e", "--raw", "SAVE"})))
 
 	// 6. Verify data file exists on host volume
-	dataDir := filepath.Join(subvolPath, "data")
+	dataDir := filepath.Join(volumePath, "data")
 	entries, err := os.ReadDir(dataDir)
 	require.NoError(t, err, "should be able to read volume data directory")
 	found := false
@@ -218,7 +218,7 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	// 8. Verify the volume and its project-quota entry are destroyed
 	requireXFSProjectEventuallyAbsent(t, mountPath, projID)
 
-	_, statErr := os.Stat(subvolPath)
+	_, statErr := os.Stat(volumePath)
 	assert.True(t, errors.Is(statErr, fs.ErrNotExist), "volume directory should be gone after deprovision")
 }
 
@@ -332,8 +332,8 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	}
 
 	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
-	subvolPath := filepath.Join(mountPath, volumeID)
-	dataDir := filepath.Join(subvolPath, "data")
+	volumePath := filepath.Join(mountPath, volumeID)
+	dataDir := filepath.Join(volumePath, "data")
 
 	// 2. POSITIVE CONTROL. Without this the refusal below could pass vacuously — a guard
 	//    that rejected everything would look identical. Assert the healthy Source is the
@@ -359,7 +359,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 	waitForProvisionStatus(t, b, leaseUUID, backend.ProvisionStatusFailed, 30*time.Second)
 	drainCallbacks(callbackCh)
 
-	require.NoError(t, os.Rename(dataDir, filepath.Join(subvolPath, "realdata")))
+	require.NoError(t, os.Rename(dataDir, filepath.Join(volumePath, "realdata")))
 	// Relative and in-root: os.Root permits it, which is exactly the gap. An ABSOLUTE
 	// target or one escaping the root is refused by os.Root itself (ENG-539) and would
 	// make this test pass for the wrong reason.
@@ -418,7 +418,7 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 		"no container may be left for a lease whose bind Source was refused")
 
 	// 7. The guard must not have touched tenant data — it rejects, it does not repair.
-	assert.FileExists(t, filepath.Join(subvolPath, "realdata", "dump.rdb"),
+	assert.FileExists(t, filepath.Join(volumePath, "realdata", "dump.rdb"),
 		"the tenant's data under the link target must be left untouched")
 	linkInfo, err := os.Lstat(dataDir)
 	require.NoError(t, err)
@@ -516,8 +516,8 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 
 	// Record volume path for later comparison
 	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
-	subvolPath := filepath.Join(mountPath, volumeID)
-	_, err = os.Stat(subvolPath)
+	volumePath := filepath.Join(mountPath, volumeID)
+	_, err = os.Stat(volumePath)
 	require.NoError(t, err, "volume should exist before kill")
 
 	// 3. Kill the container to simulate crash
@@ -569,7 +569,7 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 		"data should persist across re-provision")
 
 	// 8. Verify same volume reused (path still exists)
-	_, err = os.Stat(subvolPath)
+	_, err = os.Stat(volumePath)
 	assert.NoError(t, err, "same volume path should still exist after re-provision")
 
 	// Cleanup
@@ -680,11 +680,11 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	}
 
 	// Verify two separate project-tagged XFS volumes exist
-	subvol0 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName))
-	subvol1 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-1", leaseUUID, manifest.DefaultServiceName))
+	volume0 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName))
+	volume1 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-1", leaseUUID, manifest.DefaultServiceName))
 
-	projID0 := requireXFSProjectVolume(t, mountPath, subvol0)
-	projID1 := requireXFSProjectVolume(t, mountPath, subvol1)
+	projID0 := requireXFSProjectVolume(t, mountPath, volume0)
+	projID1 := requireXFSProjectVolume(t, mountPath, volume1)
 	require.NotEqual(t, projID0, projID1, "each instance must own a distinct XFS project")
 
 	// Get both containers
@@ -703,9 +703,9 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	assert.NotEqual(t, out0, out1, "containers should have different data (isolated volumes)")
 
 	// Verify on the host filesystem: volumes contain different files
-	hostData0, err := os.ReadFile(filepath.Join(subvol0, "data", "marker.txt"))
+	hostData0, err := os.ReadFile(filepath.Join(volume0, "data", "marker.txt"))
 	require.NoError(t, err)
-	hostData1, err := os.ReadFile(filepath.Join(subvol1, "data", "marker.txt"))
+	hostData1, err := os.ReadFile(filepath.Join(volume1, "data", "marker.txt"))
 	require.NoError(t, err)
 	assert.NotEqual(t, string(hostData0), string(hostData1),
 		"host volumes should contain different data")
@@ -714,9 +714,9 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
 
-	_, err = os.Stat(subvol0)
+	_, err = os.Stat(volume0)
 	assert.True(t, errors.Is(err, fs.ErrNotExist), "volume 0 should be destroyed after deprovision, got err: %v", err)
-	_, err = os.Stat(subvol1)
+	_, err = os.Stat(volume1)
 	assert.True(t, errors.Is(err, fs.ErrNotExist), "volume 1 should be destroyed after deprovision, got err: %v", err)
 }
 

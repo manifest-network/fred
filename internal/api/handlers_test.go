@@ -6597,7 +6597,7 @@ func TestRestoreLease_MalformedBackendErrorBodyIsNotForwarded(t *testing.T) {
 			body := rec.Body.String()
 			assert.NotContains(t, body, hostPathSentinel,
 				"the raw backend body must never reach the tenant response")
-			assert.NotContains(t, body, "qgroup", "no fragment of the raw body may reach the tenant")
+			assert.NotContains(t, body, "xfs_quota", "no fragment of the raw body may reach the tenant")
 			assert.NotContains(t, body, "/var/lib/fred", "no host path may reach the tenant")
 			assert.NotContains(t, body, "not applied",
 				"an ambiguous response cannot prove that the backend did not start work")

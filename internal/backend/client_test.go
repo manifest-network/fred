@@ -784,7 +784,7 @@ func TestHTTPClient_MalformedErrorBody_IsNeverForwarded(t *testing.T) {
 
 			assert.NotContains(t, err.Error(), hostPathSentinel,
 				"the raw backend body must never survive into the error a tenant can read")
-			assert.NotContains(t, err.Error(), "qgroup",
+			assert.NotContains(t, err.Error(), "xfs_quota",
 				"no fragment of the raw body may survive either")
 			assert.ErrorIs(t, err, ErrMalformedErrorBody)
 			assert.NotErrorIs(t, err, ErrValidation,
