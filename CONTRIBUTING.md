@@ -12,7 +12,7 @@ For an overview of what Fred does and how it's structured, start with [README.md
 - **Docker Engine 28.1+ (API 1.49+)** with iptables enabled — required for `make test-integration` and the docker-backend's immutable image admission.
 - **(Optional) `manifestd`** — only needed if you want to run end-to-end against a local chain via `scripts/dev-init.sh`.
 - **`golangci-lint`**, at the version pinned in `.golangci-lint-version` — required by `make lint`, which now fails rather than skipping when it's absent or mismatched. See [Linting](#linting) for the install command.
-- **(Optional) root, `btrfs-progs`, `xfsprogs` and `capsh` (`libcap2-bin`)** — for the privileged integration tests, which exercise filesystem quotas. The full `make test-integration` needs all of them; `make test-integration-volume` and `make test-integration-restore` need only root + `btrfs-progs`.
+- **(Optional) root, `btrfs-progs`, `xfsprogs` and `capsh` (`libcap2-bin`)** — for the privileged integration tests, which exercise filesystem quotas. The full `make test-integration` needs all of them; `make test-integration-volume` and `make test-integration-restore` need only root, Docker and `xfsprogs`.
 
 ---
 
@@ -142,16 +142,16 @@ Integration tests require a running Docker Engine 28.1+ daemon and use the `inte
 sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker integration suite (also sweeps the slower retain/restore tests; ~15-25 min, so raise the 15m default ceiling)
 make test-integration-stack        # stack/compose-based provisions
 make test-integration-restart-update   # restart, update, release-history flows
-sudo -E env "PATH=$PATH" make test-integration-volume  # btrfs quota subset (root + btrfs-progs)
+sudo -E env "PATH=$PATH" make test-integration-volume  # provision-path volume subset on an XFS loopback (root + xfsprogs)
 ```
 
-Volume tests need root because they create loopback filesystems and set filesystem quotas. The full suite covers btrfs and XFS project quotas, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the btrfs subset. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
+Volume tests need root because they create loopback filesystems and set filesystem quotas. The full suite covers btrfs and XFS project quotas, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the provision-path volume tests, which run on an XFS loopback with project quotas; the btrfs loopback now backs only the btrfs driver's own tests. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
 
 **CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the btrfs and XFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 
-> **Convention:** an integration test that needs a missing prerequisite (root, btrfs, a loop device, Docker) must gate via `t.Skip`/`t.Skipf` — never a bare early `return`. The CI guard detects a misprovisioned runner by looking for `--- SKIP:` in the test output; a test that silently returns instead of skipping would slip past it and reopen the ENG-330 gap.
+> **Convention:** an integration test that needs a missing prerequisite (root, the filesystem tools, a loop device, Docker) must gate via `t.Skip`/`t.Skipf` — never a bare early `return`. The CI guard detects a misprovisioned runner by looking for `--- SKIP:` in the test output; a test that silently returns instead of skipping would slip past it and reopen the ENG-330 gap.
 
 ### Stress tests
 

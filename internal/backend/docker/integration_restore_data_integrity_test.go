@@ -53,7 +53,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -68,7 +67,7 @@ import (
 )
 
 // retainRestoreBackend builds a real-Docker backend wired for the soft-delete +
-// restore round-trip: btrfs at mountPath, RetainOnClose on, an isolated
+// restore round-trip: XFS at mountPath, RetainOnClose on, an isolated
 // retention DB, and the background reaper disabled so it can't race assertions.
 // (Mirrors the config block in integration_restore_test.go.)
 func retainRestoreBackend(t *testing.T, mountPath string) *Backend {
@@ -77,7 +76,7 @@ func retainRestoreBackend(t *testing.T, mountPath string) *Backend {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.RetainOnClose = true
 		cfg.RetentionDBPath = filepath.Join(t.TempDir(), "retention.db")
 		cfg.RetentionMaxAge = 0 // reaping disabled
@@ -101,7 +100,7 @@ func ownerUID(t *testing.T, path string) uint32 {
 // (not substring) on read-back from the restored lease's container AND on the
 // host volume, plus mode preservation.
 func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 
@@ -141,7 +140,7 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 	require.NoError(t, b.Deprovision(ctx, origLease))
 	cb = waitForCallback(t, callbackCh, origLease, 30*time.Second)
 	require.Equal(t, backend.CallbackStatusDeprovisioned, cb.Status)
-	require.True(t, cb.Retained, "real btrfs retain must set the ground-truth Retained flag")
+	require.True(t, cb.Retained, "real XFS retain must set the ground-truth Retained flag")
 
 	// Restore into a new lease.
 	newLease := newIntegrationLeaseUUID()
@@ -191,7 +190,7 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 // on the correctly-indexed new canonical volume — a single-volume sentinel test
 // can't catch a cross-index mis-mapping in retainedToNewCanonical.
 func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 
@@ -263,16 +262,19 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 	require.NoError(t, b.Deprovision(ctx, newLease))
 }
 
-// TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata extends the
-// subvol-id check (TestIntegration_Docker_BtrfsRenameVolume_PreservesSubvolID)
-// to NESTED file metadata: ownership (uid/gid), mode, mtime, symlink target, and
-// (where the fs supports it) a user xattr must all survive RenameVolume. This is
+// TestIntegration_Docker_RenameVolume_PreservesNestedMetadata pins volume
+// identity and NESTED file metadata across RenameVolume on a real XFS project
+// directory: the volume root's inode and project ID, plus nested ownership
+// (uid/gid), mode, mtime, symlink target, and (where the fs supports it) a
+// user xattr must all survive. This is
 // the foundation of restore data integrity — the rename is metadata-only, so
 // bytes AND on-disk ownership are preserved by construction; the only thing
 // restore re-applies afterward is the top-dir chown (see OwnershipBoundary).
-func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
-	mgr := &btrfsVolumeManager{dataPath: mountPath, logger: slog.Default()}
+func TestIntegration_Docker_RenameVolume_PreservesNestedMetadata(t *testing.T) {
+	mountPath := setupXFSLoopback(t)
+	mgr, err := newVolumeManager(mountPath, "xfs", 1024, slog.Default())
+	require.NoError(t, err)
+	require.NoError(t, mgr.Validate())
 
 	const oldLeaseUUID = "550e8400-e29b-41d4-a716-446655440110"
 	const newLeaseUUID = "550e8400-e29b-41d4-a716-446655440111"
@@ -285,9 +287,10 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing
 	)
 	wantMtime := time.Unix(1_600_000_000, 0)
 
-	oldPath := filepath.Join(mountPath, oldName)
-	out, err := exec.Command("btrfs", "subvolume", "create", oldPath).CombinedOutput()
-	require.NoError(t, err, "btrfs subvolume create: %s", out)
+	oldPath, created, err := mgr.Create(context.Background(), oldName, 16)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.Equal(t, filepath.Join(mountPath, oldName), oldPath)
 
 	// Populate a nested file + a symlink, then stamp ownership/mode/mtime.
 	nestedDir := filepath.Join(oldPath, "nested", "dir")
@@ -309,8 +312,10 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing
 		t.Log("user xattr not supported on this fs; skipping the xattr assertion")
 	}
 
-	originalID := extractSubvolID(t, oldPath)
-	require.NotEmpty(t, originalID)
+	originalInode := inodeNumber(t, oldPath)
+	originalProjID, err := readProjectIDFile(oldPath)
+	require.NoError(t, err)
+	require.NotZero(t, originalProjID)
 
 	// Rename via the manager (the restore adopt primitive).
 	require.NoError(t, mgr.RenameVolume(context.Background(), oldName, newName))
@@ -340,12 +345,27 @@ func TestIntegration_Docker_BtrfsRenameVolume_PreservesNestedMetadata(t *testing
 		assert.Equal(t, xattrVal, string(buf[:n]), "xattr value must survive rename")
 	}
 
-	// Subvol identity preserved (reinforces the rename-is-metadata-only invariant).
-	assert.Equal(t, originalID, extractSubvolID(t, newPath),
-		"btrfs subvolume ID must be preserved across rename")
+	// Volume identity preserved (reinforces the rename-is-metadata-only invariant):
+	// a re-created root would carry a new inode, and a copy would lose the project.
+	assert.Equal(t, originalInode, inodeNumber(t, newPath),
+		"the volume root inode must be preserved across rename")
+	renamedProjID, err := readProjectIDFile(newPath)
+	require.NoError(t, err)
+	assert.Equal(t, originalProjID, renamedProjID, "the XFS project ID must be preserved across rename")
+	assert.Equal(t, originalProjID, integrationXFSAttributes(t, newPath).ProjectID,
+		"the renamed root must still carry its project tag")
 
-	out, _ = exec.Command("btrfs", "subvolume", "delete", newPath).CombinedOutput()
-	t.Logf("cleanup btrfs subvolume delete: %s", out)
+	require.NoError(t, volDestroyer(t, mgr).Destroy(context.Background(), newName))
+}
+
+// inodeNumber returns path's inode number (no symlink follow).
+func inodeNumber(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	require.NoError(t, err)
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	require.True(t, ok, "expected *syscall.Stat_t for %s", path)
+	return st.Ino
 }
 
 // TestIntegration_Docker_RetainRestore_OwnershipBoundary characterizes the
@@ -401,7 +421,7 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 }
 
 // TestIntegration_Docker_Close_WritablePathOnly_Reclaimed pins the ENG-406
-// reclaim policy end-to-end on real btrfs: a lease whose only on-disk volume is
+// reclaim policy end-to-end on real XFS: a lease whose only on-disk volume is
 // writable-path-only — backed solely by a _wp subtree, no declared VOLUME — is
 // DESTROYED (reclaimed) at close, NOT soft-deleted into the retained namespace.
 //
@@ -428,7 +448,7 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 // never starts (the writable path is detected at image-inspect time and bound
 // regardless of the command).
 func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 	// Writable-path detection only runs under a read-only rootfs. That is the

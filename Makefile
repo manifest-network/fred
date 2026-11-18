@@ -125,17 +125,17 @@ test-integration-restart-update:
 	@echo "Running restart/update/releases integration tests..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartFromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
 
-# Run volume integration tests (requires root + Docker + btrfs-progs)
+# Run volume integration tests (requires root + Docker + xfsprogs)
 # Usage: sudo -E env "PATH=$PATH" make test-integration-volume
 test-integration-volume:
-	@echo "Running volume integration tests (requires root + Docker + btrfs-progs)..."
+	@echo "Running volume integration tests (requires root + Docker + xfsprogs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
 
-# Run retain/restore integration tests (requires root + Docker + btrfs-progs)
+# Run retain/restore integration tests (requires root + Docker + xfsprogs)
 # Usage: sudo -E env "PATH=$PATH" make test-integration-restore
 test-integration-restore:
-	@echo "Running retain/restore integration tests (requires root + Docker + btrfs-progs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_BtrfsRenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
+	@echo "Running retain/restore integration tests (requires root + Docker + xfsprogs)..."
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_RenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
@@ -146,7 +146,7 @@ test-coverage:
 # Run all tests with coverage including volume integration tests
 # Usage: sudo -E env "PATH=$PATH" make test-coverage-all
 test-coverage-all:
-	@echo "Running all tests with coverage (requires root + Docker + btrfs-progs)..."
+	@echo "Running all tests with coverage (requires root + Docker + btrfs-progs + xfsprogs)..."
 	$(GOTEST) -tags integration -v -coverprofile=coverage.out -timeout 10m ./...
 	$(GOCMD) tool cover -html=coverage.out -o coverage.html
 
@@ -236,8 +236,8 @@ help:
 	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, btrfs/xfs tools)"
 	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
-	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, btrfs-progs)"
-	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, btrfs-progs)"
+	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, xfsprogs)"
+	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, xfsprogs)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"

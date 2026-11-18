@@ -63,13 +63,13 @@ func replaceWithLegacyRuntimeContainer(t *testing.T, ctx context.Context, leaseU
 }
 
 func TestIntegration_Docker_RuntimeRefreshMovesALegacyLeaseToItsOwnNetwork(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(true)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 	})
 	ctx := context.Background()
 	leaseUUID := newIntegrationLeaseUUID()

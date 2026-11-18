@@ -33,6 +33,10 @@ import (
 // setupBtrfsLoopback creates a btrfs filesystem on a loopback file and mounts it.
 // Returns the mount path. Cleanup is registered via t.Cleanup.
 // Skips the test if requirements (root, btrfs-progs) are not met.
+//
+// Only the tests of the btrfs driver itself use this fixture. Everything that
+// needs a real managed volume without caring which driver backs it stands on
+// setupXFSLoopback, the production filesystem.
 func setupBtrfsLoopback(t *testing.T) string {
 	t.Helper()
 
@@ -86,6 +90,24 @@ func setupBtrfsLoopback(t *testing.T) string {
 	})
 
 	return mountDir
+}
+
+// requireXFSProjectVolume asserts that path is a managed XFS volume root: a
+// directory tagged with the project ID its marker records, with a live entry
+// in the mount's project-quota report. It returns that project ID.
+func requireXFSProjectVolume(t *testing.T, mount, path string) uint32 {
+	t.Helper()
+	info, err := os.Lstat(path)
+	require.NoError(t, err, "volume root should exist")
+	require.True(t, info.IsDir(), "volume root should be a directory")
+	projID, err := readProjectIDFile(path)
+	require.NoError(t, err)
+	require.NotZero(t, projID)
+	require.Equal(t, projID, integrationXFSAttributes(t, path).ProjectID,
+		"volume root must be tagged with its recorded project ID")
+	require.True(t, xfsReportListsProject(t, mount, projID),
+		"volume project %d must have a project-quota entry", projID)
+	return projID
 }
 
 // execInContainer runs a command inside a running container and returns stdout.
@@ -178,14 +200,14 @@ func drainCallbacks(ch <-chan backend.CallbackPayload) {
 }
 
 func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 	})
 
 	ctx := context.Background()
@@ -221,11 +243,11 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 		t.Fatal("timeout waiting for provision callback")
 	}
 
-	// 3. Verify btrfs subvolume exists
+	// 3. Verify the volume exists as a project-tagged XFS directory with a
+	//    live project-quota entry.
 	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
 	subvolPath := filepath.Join(mountPath, volumeID)
-	out, err := exec.Command("btrfs", "subvolume", "show", subvolPath).CombinedOutput()
-	require.NoError(t, err, "btrfs subvolume should exist: %s", out)
+	projID := requireXFSProjectVolume(t, mountPath, subvolPath)
 
 	// 4. Verify container has bind mount for /data
 	containerID := getContainerID(t, leaseUUID)
@@ -255,9 +277,8 @@ func TestIntegration_Docker_StatefulVolumeLifecycle(t *testing.T) {
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
 
-	// 8. Verify btrfs subvolume destroyed
-	_, err = exec.Command("btrfs", "subvolume", "show", subvolPath).CombinedOutput()
-	assert.Error(t, err, "btrfs subvolume should be destroyed after deprovision")
+	// 8. Verify the volume and its project-quota entry are destroyed
+	requireXFSProjectEventuallyAbsent(t, mountPath, projID)
 
 	_, statErr := os.Stat(subvolPath)
 	assert.True(t, errors.Is(statErr, fs.ErrNotExist), "volume directory should be gone after deprovision")
@@ -311,7 +332,7 @@ func containersForLease(t *testing.T, leaseUUID string) int {
 }
 
 // TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected pins the ENG-795 guard through
-// the real provision path, over a real managed btrfs volume, with a real Docker daemon.
+// the real provision path, over a real managed XFS volume, with a real Docker daemon.
 //
 // buildStatefulVolumeBinds confines subdir creation with os.Root, which is escape-safe but
 // NOT symlink-free: os.Root's MkdirAll deliberately succeeds when the leaf is a symlink
@@ -329,14 +350,14 @@ func containersForLease(t *testing.T, leaseUUID string) int {
 // unit test cannot: that fred refuses BEFORE Docker is asked to resolve the Source, and
 // that no container is created with a redirected mount.
 func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		// testBackendWithRealDocker parks the reconciler at 1h; step 3 needs it to
 		// observe the killed container and move the lease to Failed.
 		cfg.ReconcileInterval = 2 * time.Second
@@ -509,14 +530,14 @@ func TestIntegration_Docker_StatefulVolumeSymlinkLeafRejected(t *testing.T) {
 }
 
 func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		cfg.ReconcileInterval = 2 * time.Second // fast reconciler for re-provision
 	})
 
@@ -555,11 +576,11 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	execInContainer(t, containerID, []string{"redis-cli", "SET", "persist_key", "persist_value"})
 	execInContainer(t, containerID, []string{"redis-cli", "SAVE"})
 
-	// Record subvolume path for later comparison
+	// Record volume path for later comparison
 	volumeID := fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName)
 	subvolPath := filepath.Join(mountPath, volumeID)
 	_, err = os.Stat(subvolPath)
-	require.NoError(t, err, "subvolume should exist before kill")
+	require.NoError(t, err, "volume should exist before kill")
 
 	// 3. Kill the container to simulate crash
 	killContainer(t, containerID)
@@ -609,9 +630,9 @@ func TestIntegration_Docker_VolumePersistsAcrossReProvision(t *testing.T) {
 	assert.Contains(t, result, "persist_value",
 		"data should persist across re-provision")
 
-	// 8. Verify same subvolume reused (path still exists)
+	// 8. Verify same volume reused (path still exists)
 	_, err = os.Stat(subvolPath)
-	assert.NoError(t, err, "same subvolume path should still exist after re-provision")
+	assert.NoError(t, err, "same volume path should still exist after re-provision")
 
 	// Cleanup
 	err = b.Deprovision(ctx, leaseUUID)
@@ -676,17 +697,17 @@ func TestIntegration_Docker_EphemeralVolumeOverrideTmpfs(t *testing.T) {
 }
 
 // TestIntegration_Docker_MultiInstanceVolumeIsolation verifies that a
-// multi-unit lease (Quantity=2) gets separate, isolated btrfs subvolumes
+// multi-unit lease (Quantity=2) gets separate, isolated XFS project volumes
 // per instance. Data written in one container must not be visible in the other.
 func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 	})
 
 	ctx := context.Background()
@@ -720,14 +741,13 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 		t.Fatal("timeout waiting for provision callback")
 	}
 
-	// Verify two separate btrfs subvolumes exist
+	// Verify two separate project-tagged XFS volumes exist
 	subvol0 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-0", leaseUUID, manifest.DefaultServiceName))
 	subvol1 := filepath.Join(mountPath, fmt.Sprintf("fred-%s-%s-1", leaseUUID, manifest.DefaultServiceName))
 
-	out, err := exec.Command("btrfs", "subvolume", "show", subvol0).CombinedOutput()
-	require.NoError(t, err, "subvolume 0 should be a btrfs subvolume: %s", out)
-	out, err = exec.Command("btrfs", "subvolume", "show", subvol1).CombinedOutput()
-	require.NoError(t, err, "subvolume 1 should be a btrfs subvolume: %s", out)
+	projID0 := requireXFSProjectVolume(t, mountPath, subvol0)
+	projID1 := requireXFSProjectVolume(t, mountPath, subvol1)
+	require.NotEqual(t, projID0, projID1, "each instance must own a distinct XFS project")
 
 	// Get both containers
 	containers := inspectProvisionContainers(t, leaseUUID)
@@ -744,22 +764,22 @@ func TestIntegration_Docker_MultiInstanceVolumeIsolation(t *testing.T) {
 	assert.Contains(t, out1, "data-bravo", "container 1 should see its own marker")
 	assert.NotEqual(t, out0, out1, "containers should have different data (isolated volumes)")
 
-	// Verify on the host filesystem: subvolumes contain different files
+	// Verify on the host filesystem: volumes contain different files
 	hostData0, err := os.ReadFile(filepath.Join(subvol0, "data", "marker.txt"))
 	require.NoError(t, err)
 	hostData1, err := os.ReadFile(filepath.Join(subvol1, "data", "marker.txt"))
 	require.NoError(t, err)
 	assert.NotEqual(t, string(hostData0), string(hostData1),
-		"host subvolumes should contain different data")
+		"host volumes should contain different data")
 
-	// Deprovision and verify both subvolumes are destroyed
+	// Deprovision and verify both volumes are destroyed
 	err = b.Deprovision(ctx, leaseUUID)
 	require.NoError(t, err)
 
 	_, err = os.Stat(subvol0)
-	assert.True(t, errors.Is(err, fs.ErrNotExist), "subvolume 0 should be destroyed after deprovision, got err: %v", err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "volume 0 should be destroyed after deprovision, got err: %v", err)
 	_, err = os.Stat(subvol1)
-	assert.True(t, errors.Is(err, fs.ErrNotExist), "subvolume 1 should be destroyed after deprovision, got err: %v", err)
+	assert.True(t, errors.Is(err, fs.ErrNotExist), "volume 1 should be destroyed after deprovision, got err: %v", err)
 }
 
 // TestIntegration_Docker_OrphanedVolumeCleanup verifies that an unclaimed
@@ -825,18 +845,18 @@ func extractSubvolID(t *testing.T, path string) string {
 	return ""
 }
 
-// TestIntegration_Docker_VolumeQuotaEnforced verifies that btrfs quota
+// TestIntegration_Docker_VolumeQuotaEnforced verifies that XFS project quota
 // enforcement actually prevents writes beyond the configured disk limit.
 // A small write should succeed; a large write should fail with ENOSPC/EDQUOT.
 func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
-	mountPath := setupBtrfsLoopback(t)
+	mountPath := setupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(false)
 		cfg.VolumeDataPath = mountPath
 		cfg.VolumeMountPath = mountPath
-		cfg.VolumeFilesystem = "btrfs"
+		cfg.VolumeFilesystem = "xfs"
 		// Custom SKU with a tiny 5MB disk quota
 		cfg.SKUProfiles = map[string]SKUProfile{
 			"docker-tiny": {
@@ -850,7 +870,7 @@ func TestIntegration_Docker_VolumeQuotaEnforced(t *testing.T) {
 	ctx := context.Background()
 	leaseUUID := newIntegrationLeaseUUID()
 
-	// redis:7 declares VOLUME /data → bind-mounted to 5MB btrfs subvolume.
+	// redis:7 declares VOLUME /data → bind-mounted to a 5MB XFS project volume.
 	// Using "sleep" as command so redis-server doesn't start and consume space.
 	appManifest := manifest.Manifest{
 		Image:   "redis:7",
@@ -933,7 +953,8 @@ func setupXFSLoopback(t *testing.T) string {
 	out, err = exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput()
 	require.NoError(t, err, "mkfs.xfs: %s", out)
 
-	// pquota enables project-quota enforcement. Same loop-skip guard as btrfs.
+	// pquota enables project-quota enforcement. Loop-device support cannot be
+	// probed ahead of time, so skip when its setup fails (see setupBtrfsLoopback).
 	out, err = exec.Command("mount", "-o", "loop,pquota", imgFile, mountDir).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "set up loop device") {
