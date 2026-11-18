@@ -14,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // TestIntegration_Recover_PreservesReservationForContainerlessFailedLease is the
@@ -47,7 +48,7 @@ import (
 // allowlist with "preserve every lease still tracked in b.provisions", which
 // this test locks in against the real pool + real Docker daemon.
 func TestIntegration_Recover_PreservesReservationForContainerlessFailedLease(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024 (defaultTestSKUProfiles)

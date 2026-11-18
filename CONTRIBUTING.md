@@ -64,6 +64,9 @@ internal/
 ├── util/               Shared utilities
 └── watcher/            Cross-provider credit-depletion watcher
 
+test/
+└── e2e/                Black-box suite: the built binaries as separate processes
+
 docs/
 ├── manifest-guide.md   Tenant-facing manifest schema
 ├── manifest-schema.json   Formal JSON Schema for the manifest
@@ -147,11 +150,27 @@ sudo -E env "PATH=$PATH" make test-integration-volume  # provision-path volume s
 
 Volume tests need root because they create loopback filesystems and set filesystem quotas. The full suite covers XFS project quotas, and needs every tool listed under [Prerequisites](#prerequisites); `make test-integration-volume` selects only the provision-path volume tests, which run on an XFS loopback with project quotas. Run them through `sudo -E env "PATH=$PATH"`: plain `sudo` resets `PATH` (`secure_path`) and can fail with `go: command not found`. A test whose prerequisite is missing skips rather than fails.
 
-**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the XFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
+**CI runs these suites** via [`.github/workflows/integration.yml`](.github/workflows/integration.yml) on privileged `ubuntu-24.04` runners (root, Docker, loop devices, and the XFS tools), one per image store (`overlay2` and `containerd`): the full docker package suite (`make test-integration`, which `-run Integration` sweeps — core lifecycle, stack, restart/update, reconciler, idempotency, volume/quota, and retain/restore). The workflow triggers on PRs, and on pushes to `main` or a `release/**` branch, touching runtime code (`internal/**`, `cmd/**`), the black-box suite (`test/**`), `Makefile`, `go.mod`/`go.sum`, or the integration workflow itself; markdown-only changes are excluded. It also runs nightly as a safety net. Crucially, the job **fails — it does not pass green — if the privileged environment is missing**: a guard turns any `t.Skip` into a red build, because a silently-skipped run is exactly how a volume-naming change rotted these tests undetected for ~3 months (ENG-330). The regular `ci.yml` runs build, short unit tests, the bounded race shards, lint, action-pin validation, and vulnerability scanning; it does not use the `integration` tag.
 
 Running the suites locally is still the fastest iteration loop, and required for changes outside the path filter.
 
 > **Convention:** an integration test that needs a missing prerequisite (root, the filesystem tools, a loop device, Docker) must gate via `t.Skip`/`t.Skipf` — never a bare early `return`. The CI guard detects a misprovisioned runner by looking for `--- SKIP:` in the test output; a test that silently returns instead of skipping would slip past it and reopen the ENG-330 gap.
+
+### Black-box tests
+
+`test/e2e` runs the built binaries as separate processes and asserts only through their external surfaces: the backend HTTP API, Docker, and the host filesystem. Today it covers the backend tier: each test starts its own `docker-backend`, as a non-root account holding the production capabilities, on its own XFS loopback, behind mTLS with a throwaway CA.
+
+```bash
+make test-e2e   # needs sudo, Docker, xfsprogs and capsh; set FRED_TEST_IMAGE_DATA_PATH as for the integration suite
+```
+
+Run it as yourself. The target builds the binaries and the test binary unprivileged, then runs only the test binary under `sudo`, so no root-owned file lands in the Go caches. Process logs go to `build/e2e/logs/`.
+
+- The suite uses the `integration` build tag and no `-run` filter, so every test in the package runs. A test whose prerequisite is missing skips, and CI fails on any skip.
+- Run one e2e test binary at a time per Docker daemon. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*`, and every mount under `$TMPDIR/fred-e2e`.
+- The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). A new feature adds a test, not harness code, and production code carries no hook for the suite.
+
+CI runs it in `integration.yml` as the `e2e (root, <image store>)` jobs, beside the in-process suite, and the release workflow gates on both. Changes under `test/**` trigger that workflow.
 
 ### Stress tests
 
