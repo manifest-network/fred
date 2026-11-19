@@ -37,14 +37,23 @@ const (
 	commitTimeout = 30 * time.Second
 )
 
-// Chain is one single-validator manifestd node in a temporary directory. This
-// file uses only the standard library and the manifestd command line, so it
-// depends on that command line and on its JSON output.
+// Chain is one running single-validator manifestd node in a temporary
+// directory. This file uses only the standard library and the manifestd
+// command line, so it depends on that command line and on its JSON output.
 type Chain struct {
 	// ID is the chain ID.
 	ID string
 
 	bin, home, rpc, grpc string
+}
+
+// Genesis is a chain before its first block: the only time accounts can be
+// created with a balance and the genesis document can be edited. Start hands
+// one to its prepare function and seals it when that function returns, so a
+// change that could no longer reach the running node fails the test.
+type Genesis struct {
+	chain  *Chain
+	sealed bool
 }
 
 // Key is a key in the chain's test keyring.
@@ -54,12 +63,24 @@ type Key struct {
 	Mnemonic string
 }
 
-// Start initializes a chain, lets prepare change it before its first block,
-// starts the node on free ports and waits for that block. prepare runs before
-// the node exists: it may add keys and genesis accounts and edit the genesis
-// document, but not send transactions. Start skips the test when BinaryEnv is
-// unset. Cleanup stops the node.
-func Start(t *testing.T, prepare func(c *Chain)) *Chain {
+// Receipt is a committed transaction.
+type Receipt struct {
+	events []event
+}
+
+// event is one event of a transaction, as `manifestd query tx` prints it.
+type event struct {
+	Type       string `json:"type"`
+	Attributes []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	} `json:"attributes"`
+}
+
+// Start initializes a chain, lets prepare change its genesis, starts the node
+// on free ports and waits for the first block. Start skips the test when
+// BinaryEnv is unset. Cleanup stops the node.
+func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	t.Helper()
 	bin := os.Getenv(BinaryEnv)
 	if bin == "" {
@@ -70,7 +91,9 @@ func Start(t *testing.T, prepare func(c *Chain)) *Chain {
 	c.run(t, "testnet", "init-files", "--chain-id", c.ID, "--output-dir", dir, "--v", "1",
 		"--keyring-backend", "test", "--commit-timeout", "500ms", "--minimum-gas-prices", "0umfx")
 	c.home = filepath.Join(dir, validatorKey, "manifestd")
-	prepare(c)
+	genesis := &Genesis{chain: c}
+	prepare(genesis)
+	genesis.sealed = true
 
 	logDir := dir
 	if fromEnv := os.Getenv(logDirEnv); fromEnv != "" {
@@ -121,32 +144,46 @@ func Start(t *testing.T, prepare func(c *Chain)) *Chain {
 	return c
 }
 
-// AddGenesisAccount gives an address an account and a balance in the genesis
-// document. Only valid inside Start's prepare.
-func (c *Chain) AddGenesisAccount(t *testing.T, address, coins string) {
+// AddKey creates a key in the chain's keyring.
+func (g *Genesis) AddKey(t *testing.T, name string) Key {
 	t.Helper()
-	c.run(t, "genesis", "add-genesis-account", address, coins, "--home", c.home, "--keyring-backend", "test")
+	g.requireOpen(t)
+	return g.chain.AddKey(t, name)
 }
 
-// EditGenesis applies edit to the genesis document. Only valid inside Start's
-// prepare.
-func (c *Chain) EditGenesis(t *testing.T, edit func(genesis map[string]any)) {
+// AddAccount gives an address an account and a balance.
+func (g *Genesis) AddAccount(t *testing.T, address, coins string) {
 	t.Helper()
-	path := filepath.Join(c.home, "config", "genesis.json")
+	g.requireOpen(t)
+	g.chain.run(t, "genesis", "add-genesis-account", address, coins, "--home", g.chain.home, "--keyring-backend", "test")
+}
+
+// Edit applies edit to the genesis document.
+func (g *Genesis) Edit(t *testing.T, edit func(document map[string]any)) {
+	t.Helper()
+	g.requireOpen(t)
+	path := filepath.Join(g.chain.home, "config", "genesis.json")
 	raw, err := os.ReadFile(path) //nolint:gosec // G304: a path under t.TempDir
 	if err != nil {
 		t.Fatalf("read genesis: %v", err)
 	}
-	var genesis map[string]any
-	if err := json.Unmarshal(raw, &genesis); err != nil {
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
 		t.Fatalf("decode genesis: %v", err)
 	}
-	edit(genesis)
-	if raw, err = json.Marshal(genesis); err != nil {
+	edit(document)
+	if raw, err = json.Marshal(document); err != nil {
 		t.Fatalf("encode genesis: %v", err)
 	}
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatalf("write genesis: %v", err)
+	}
+}
+
+func (g *Genesis) requireOpen(t *testing.T) {
+	t.Helper()
+	if g.sealed {
+		t.Fatal("the genesis was used after the chain started: the change would not reach the running node")
 	}
 }
 
@@ -178,9 +215,10 @@ func (c *Chain) AddKey(t *testing.T, name string) Key {
 	return key
 }
 
-// Tx signs and broadcasts a transaction with the named key and waits until it
-// is committed. A transaction the chain rejects fails the test.
-func (c *Chain) Tx(t *testing.T, from string, args ...string) {
+// Tx signs and broadcasts a transaction with the named key, waits until it is
+// committed, and returns its receipt. A transaction the chain rejects fails
+// the test.
+func (c *Chain) Tx(t *testing.T, from string, args ...string) Receipt {
 	t.Helper()
 	argv := append([]string{"tx"}, args...)
 	argv = append(argv, "--from", from, "--home", c.home, "--keyring-backend", "test",
@@ -200,21 +238,47 @@ func (c *Chain) Tx(t *testing.T, from string, args ...string) {
 	deadline := time.Now().Add(commitTimeout)
 	for {
 		var committed struct {
-			Code   int    `json:"code"`
-			RawLog string `json:"raw_log"`
+			Code   int     `json:"code"`
+			RawLog string  `json:"raw_log"`
+			Events []event `json:"events"`
 		}
 		out, err := c.output("q", "tx", sent.Hash, "--node", "tcp://"+c.rpc, "--output", "json")
-		if err == nil && json.Unmarshal([]byte(jsonObject(out)), &committed) == nil {
+		if err == nil {
+			err = json.Unmarshal([]byte(jsonObject(out)), &committed)
+		}
+		if err == nil {
 			if committed.Code != 0 {
 				t.Fatalf("tx %v failed with code %d: %s", args, committed.Code, committed.RawLog)
 			}
-			return
+			return Receipt{events: committed.Events}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("tx %v (%s) was not committed within %s: %v\n%s", args, sent.Hash, commitTimeout, err, out)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// Event returns the attributes of the one event of the given type that the
+// transaction emitted. This is how a caller learns what its own transaction
+// created, without searching the chain for it.
+func (r Receipt) Event(t *testing.T, eventType string) map[string]string {
+	t.Helper()
+	var found []map[string]string
+	for _, event := range r.events {
+		if event.Type != eventType {
+			continue
+		}
+		attributes := make(map[string]string, len(event.Attributes))
+		for _, attribute := range event.Attributes {
+			attributes[attribute.Key] = attribute.Value
+		}
+		found = append(found, attributes)
+	}
+	if len(found) != 1 {
+		t.Fatalf("the transaction emitted %d %s events, want exactly one: %+v", len(found), eventType, r.events)
+	}
+	return found[0]
 }
 
 // Query runs a query and decodes its JSON answer into out.

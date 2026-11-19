@@ -74,25 +74,19 @@ func StartProvider(t *testing.T) *Provider {
 
 	p := &Provider{t: t}
 	var key Key
-	p.Chain = Start(t, func(c *Chain) {
+	p.Chain = Start(t, func(genesis *Genesis) {
 		// A dedicated provider key, funded for fees and allowed to register a
 		// provider and SKUs without a governance proposal.
-		key = c.AddKey(t, providerKey)
-		c.AddGenesisAccount(t, key.Address, "1000000000umfx")
-		c.EditGenesis(t, func(genesis map[string]any) {
-			sku := genesis["app_state"].(map[string]any)["sku"].(map[string]any)
+		key = genesis.AddKey(t, providerKey)
+		genesis.AddAccount(t, key.Address, "1000000000umfx")
+		genesis.Edit(t, func(document map[string]any) {
+			sku := document["app_state"].(map[string]any)["sku"].(map[string]any)
 			sku["params"].(map[string]any)["allowed_list"] = []string{key.Address}
 		})
 	})
-	p.Chain.Tx(t, providerKey, "sku", "create-provider", key.Address, key.Address)
-	var providers struct {
-		Providers []struct {
-			UUID string `json:"uuid"`
-		} `json:"providers"`
-	}
-	p.Chain.Query(t, &providers, "sku", "provider-by-address", key.Address)
-	require.Len(t, providers.Providers, 1)
-	p.UUID = providers.Providers[0].UUID
+	created := p.Chain.Tx(t, providerKey, "sku", "create-provider", key.Address, key.Address).Event(t, "provider_created")
+	require.Equal(t, key.Address, created["address"])
+	p.UUID = created["provider_uuid"]
 	p.SKUs = e2e.SKUs{Stateless: p.createSKU("e2e-stateless"), Stateful: p.createSKU("e2e-stateful")}
 
 	p.Backend = e2e.StartBackendWithSKUs(t, p.SKUs)
@@ -226,21 +220,10 @@ func stderrOf(err error) string {
 func (p *Provider) createSKU(name string) string {
 	p.t.Helper()
 	// Unit 1 is per hour; an hourly price must divide by 3600.
-	p.Chain.Tx(p.t, providerKey, "sku", "create-sku", p.UUID, name, "1", "3600000"+billingDenom)
-	var skus struct {
-		SKUs []struct {
-			UUID string `json:"uuid"`
-			Name string `json:"name"`
-		} `json:"skus"`
-	}
-	p.Chain.Query(p.t, &skus, "sku", "skus-by-provider", p.UUID)
-	for _, sku := range skus.SKUs {
-		if sku.Name == name {
-			return sku.UUID
-		}
-	}
-	p.t.Fatalf("SKU %s is not on the chain after its transaction: %+v", name, skus.SKUs)
-	return ""
+	created := p.Chain.Tx(p.t, providerKey, "sku", "create-sku", p.UUID, name, "1", "3600000"+billingDenom).Event(p.t, "sku_created")
+	require.Equal(p.t, name, created["name"])
+	require.Equal(p.t, p.UUID, created["provider_uuid"])
+	return created["sku_uuid"]
 }
 
 // healthy reports whether providerd's API answers.
