@@ -40,8 +40,9 @@ const (
 	BusyboxImage = "busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
 	// RedisImage declares VOLUME /data.
 	RedisImage = "redis:7.4.12@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90"
-	// NestedVolumesImage declares VOLUME /data/b and VOLUME /data/a/c. It is
-	// built from test/e2e/images/nested-volumes.
+	// NestedVolumesImage declares VOLUME /data/b and VOLUME /data/a/c, sets no
+	// user, and owns those directories as root, so its workload runs as
+	// root. It is built from test/e2e/images/nested-volumes.
 	NestedVolumesImage = "ghcr.io/manifest-network/fred-e2e:nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00"
 )
 
