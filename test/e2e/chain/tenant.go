@@ -71,16 +71,14 @@ func (tn *Tenant) Deploy(t *testing.T, sku string, manifest map[string]any) stri
 	hash := sha256.Sum256(payload)
 	hashHex := hex.EncodeToString(hash[:])
 
-	before := tn.leases(t)
-	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "create-lease", sku+":1", "--meta-hash", hashHex)
-	var leaseUUID string
-	for uuid := range tn.leases(t) {
-		if _, existed := before[uuid]; !existed {
-			require.Empty(t, leaseUUID, "one transaction created more than one lease")
-			leaseUUID = uuid
-		}
-	}
-	require.NotEmpty(t, leaseUUID, "create-lease was committed but the tenant has no new lease")
+	// The transaction's own event names the lease it created, so no search
+	// of the tenant's leases can pick another one.
+	created := tn.provider.Chain.Tx(t, tn.key.Name, "billing", "create-lease", sku+":1", "--meta-hash", hashHex).Event(t, "lease_created")
+	require.Equal(t, tn.key.Address, created["tenant"])
+	require.Equal(t, tn.provider.UUID, created["provider_uuid"])
+	require.Equal(t, hashHex, created["meta_hash"])
+	leaseUUID := created["lease_uuid"]
+	require.NotEmpty(t, leaseUUID)
 
 	// providerd serves its API before it is ready to take payloads, so the
 	// upload is repeated until it is accepted. A token is good for one
@@ -99,23 +97,6 @@ func (tn *Tenant) Deploy(t *testing.T, sku string, manifest map[string]any) stri
 func (tn *Tenant) Close(t *testing.T, leaseUUID string) {
 	t.Helper()
 	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "close-lease", leaseUUID)
-}
-
-// leases maps the UUID of each of the tenant's leases to its state.
-func (tn *Tenant) leases(t *testing.T) map[string]string {
-	t.Helper()
-	var answer struct {
-		Leases []struct {
-			UUID  string `json:"uuid"`
-			State string `json:"state"`
-		} `json:"leases"`
-	}
-	tn.provider.Chain.Query(t, &answer, "billing", "leases-by-tenant", tn.key.Address)
-	leases := make(map[string]string, len(answer.Leases))
-	for _, lease := range answer.Leases {
-		leases[lease.UUID] = lease.State
-	}
-	return leases
 }
 
 func (tn *Tenant) post(ctx context.Context, path, token string, body []byte) (int, string, error) {
