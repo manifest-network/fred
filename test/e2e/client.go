@@ -35,9 +35,24 @@ type Spec struct {
 	Tenant    string
 	// SKU is one of the fixture's SKU UUIDs.
 	SKU string
+	// Services names the services of a stack manifest. Each gets one unit of
+	// SKU. Empty for a manifest that describes a single workload.
+	Services []string
 	// Manifest is the tenant manifest (docs/manifest-guide.md). Restore
 	// ignores it: on 0.14 a restore runs the source lease's manifest.
 	Manifest map[string]any
+}
+
+// items is what the lease buys: one unit of the SKU, or one per service.
+func (s Spec) items() []backend.LeaseItem {
+	if len(s.Services) == 0 {
+		return []backend.LeaseItem{{SKU: s.SKU, Quantity: 1}}
+	}
+	items := make([]backend.LeaseItem, len(s.Services))
+	for i, service := range s.Services {
+		items[i] = backend.LeaseItem{SKU: s.SKU, Quantity: 1, ServiceName: service}
+	}
+	return items
 }
 
 // Lease is a lease as the backend reports it.
@@ -91,7 +106,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 		LeaseUUID:            spec.LeaseUUID,
 		Tenant:               spec.Tenant,
 		ProviderUUID:         c.providerUUID,
-		Items:                []backend.LeaseItem{{SKU: spec.SKU, Quantity: 1}},
+		Items:                spec.items(),
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,
 		Payload:              payload,
@@ -148,7 +163,7 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 		FromLeaseUUID:        from,
 		Tenant:               spec.Tenant,
 		ProviderUUID:         c.providerUUID,
-		Items:                []backend.LeaseItem{{SKU: spec.SKU, Quantity: 1}},
+		Items:                spec.items(),
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,
 	}, nil)

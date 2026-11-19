@@ -216,6 +216,9 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs)
 		"container_stop_timeout":  "1s",
 		"startup_verify_duration": "1s",
 		"provision_timeout":       "2m",
+		// The periodic pass removes what a close leaves for it, such as the
+		// lease's network. The production default is five minutes.
+		"reconcile_interval": "10s",
 	}
 	// A containerd image store keeps its content outside Docker's data root,
 	// and the backend must be told where (see integration.yml).
