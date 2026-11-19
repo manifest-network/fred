@@ -3,8 +3,6 @@
 package chain
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,16 +15,16 @@ import (
 // EXPERIMENT ONLY, never to merge. These reproduce two 0.14 behaviours found
 // while writing the crash tests, and log what happens.
 
-// errorLines are the ERROR lines at the end of the backend's log.
+// errorLines are the last lines of the backend's log.
 func errorLines(backend *e2e.Backend) string {
-	var lines []string
-	for _, line := range strings.Split(backend.LogTail(), "\n") {
-		if strings.Contains(line, "level=ERROR") {
-			lines = append(lines, line)
-		}
+	lines := strings.Split(backend.LogTail(), "\n")
+	if len(lines) > 12 {
+		lines = lines[len(lines)-12:]
 	}
-	if len(lines) > 4 {
-		lines = lines[len(lines)-4:]
+	for i, line := range lines {
+		if len(line) > 900 {
+			lines[i] = line[:900]
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -104,45 +102,5 @@ func experimentInterruptDuringDispatch(t *testing.T, label string, interrupt fun
 		t.Logf("EXPERIMENT %s: pending launches %v", label, backend.Metric(t, "fred_docker_backend_volume_launches_pending"))
 		reported, err := backend.Client.Get(t.Context(), lease)
 		t.Logf("EXPERIMENT %s: the backend reports the lease %q (err %v)", label, reported.Status, err)
-	}
-}
-
-// Finding 1: after an interrupted restart, hold the put-back workload's
-// health check for two and a half minutes, longer than the two minutes a
-// running backend gives the same step.
-func TestExperiment_StartHeldBeyondTwoMinutes(t *testing.T) {
-	const hold = 150 * time.Second
-	p := StartProviderWith(t, 1, heldSettings(nil))
-	backend, tenant := p.Backends[0], p.NewTenant(t)
-	bystander := deployActive(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
-	manifest := map[string]any{
-		"image": e2e.RedisImage, "command": []string{"sleep", "3600"},
-		"health_check": map[string]any{"test": []string{"CMD", "test", "-f", "/data/gate"}, "interval": "1s", "start_period": "1h"},
-	}
-	lease := tenant.Deploy(t, p.SKUs.Stateful, manifest)
-	first := requireHeld(t, backend, lease, "provisioning")
-	gate := filepath.Join(dataDir(t, first), "gate")
-	require.NoError(t, os.WriteFile(gate, nil, 0o644))
-	requireActive(t, p.Chain, lease)
-	requireStatus(t, backend, lease, "ready")
-	describeOnFailure(t, backend, lease)
-
-	require.NoError(t, os.Remove(gate))
-	tenant.Restart(t, lease)
-	requireHeld(t, backend, lease, "restarting")
-	backend.Stop()
-
-	launched := time.Now()
-	backend.Launch()
-	served, exited, err := backend.TryAwaitServing(hold)
-	t.Logf("EXPERIMENT held: %s after launch: served=%v exited=%v exit=%v", time.Since(launched).Round(time.Millisecond), served, exited, err)
-	_, getErr := backend.Client.Get(t.Context(), bystander)
-	t.Logf("EXPERIMENT held: asking the backend for the other lease while held: %v", getErr)
-	require.NoError(t, os.WriteFile(gate, nil, 0o644))
-	opened := time.Now()
-	served, exited, err = backend.TryAwaitServing(time.Minute)
-	t.Logf("EXPERIMENT held: %s after the gate opened: served=%v exited=%v exit=%v", time.Since(opened).Round(time.Millisecond), served, exited, err)
-	if !served && !exited {
-		backend.Kill()
 	}
 }
