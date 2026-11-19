@@ -22,6 +22,11 @@ import (
 // The tests in this file are regression tests for bugs a tenant could reach.
 // Each names its ticket and pins the outcome from outside: what the tenant's
 // own container can do, and what the host shows afterwards.
+//
+// Each test was shown to fail against a docker-backend built without the
+// guard its comment names (CONTRIBUTING.md, "Proving a regression test"). If
+// you change a guard, run that proof again: a test that still passes with
+// its guard removed is testing something else.
 
 const statusFailed = "failed"
 
@@ -62,6 +67,10 @@ func ownerUID(t *testing.T, path string) uint32 {
 // service name resolves to the lease's own container only, the other lease's
 // container cannot be named at all, and a lease's network is removed after
 // its close (ENG-1516).
+//
+// Guard: the lease's own network, internal/backend/docker/lease_network.go.
+// Proof: with every lease given the same network, the test fails on the two
+// leases sharing it.
 func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 	b := StartBackend(t)
 	ctx := t.Context()
@@ -135,6 +144,10 @@ func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 // The image's probe issues the project change alone. chattr rewrites the
 // file's flags first, which the profile also refuses, so a test using it
 // passes whether or not the project change is refused.
+//
+// Guard: the FS_IOC_FSSETXATTR entry of deniedIoctlCubes,
+// internal/backend/docker/tenantseccomp/profile_linux.go. Proof: without it
+// the probe prints "changed".
 func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(ProjectProbeImage)}
@@ -159,6 +172,10 @@ func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 // backend handed the directory to root. A directory an earlier deploy left
 // owned by the backend's own account must be handed over on the next deploy
 // (ENG-2091).
+//
+// Guard: the unconditional Lchown in buildStatefulVolumeBindsContext,
+// internal/backend/docker/provision.go. Proof: skipped for root, the
+// directory stays owned by the backend's account.
 func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	b := StartBackend(t)
 	// The image sets no user and its volume directories belong to root, so
@@ -197,6 +214,10 @@ func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 // earlier data made a link. Docker follows the link when it mounts, so the
 // backend must refuse before it asks Docker, start nothing, and leave the
 // tenant's data and the link as they are (ENG-539, ENG-795).
+//
+// Guard: the leaf-symlink check in buildStatefulVolumeBindsContext,
+// internal/backend/docker/provision.go. Proof: without it the refusal
+// counter never moves.
 func TestBackend_SymlinkedVolumeDirectoryIsRefused(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
@@ -243,6 +264,10 @@ func TestBackend_SymlinkedVolumeDirectoryIsRefused(t *testing.T) {
 // that could write to the volume it is about to use. That look must not fail
 // on another lease's unresolvable path: one tenant would stop every stateful
 // launch on the backend (ENG-2181).
+//
+// Guard: volumeWriterMountEvidence, internal/backend/docker/volume_launch.go.
+// Proof: with a writer's source resolved whole, the other tenant's lease
+// fails.
 func TestBackend_LinkedVolumeDoesNotBlockOtherLeases(t *testing.T) {
 	b := StartBackend(t)
 	linked := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
@@ -281,6 +306,12 @@ func TestBackend_LinkedVolumeDoesNotBlockOtherLeases(t *testing.T) {
 // the moment the restore is requested. Whether the close lands before or
 // after the data changed hands, the data must end up held by exactly one of
 // the two leases, intact, and restorable (ENG-658).
+//
+// Guard: ensureCommittedRestoreDestinationForClose,
+// internal/backend/docker/deprovision.go. Proof: without it the test fails
+// because the close is never accepted: a later check answers that the
+// destination is not durably committed, for good. The proof therefore shows
+// that the test depends on the guard, not that data is lost without it.
 func TestBackend_CloseDuringRestoreKeepsTheData(t *testing.T) {
 	b := StartBackend(t)
 	ctx := t.Context()

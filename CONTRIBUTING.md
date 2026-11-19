@@ -183,8 +183,23 @@ The providerd tier skips unless `MANIFESTD` names a `manifestd` binary. `.manife
 
 - The suite uses the `integration` build tag and no `-run` filter, so every test in the package runs. A test whose prerequisite is missing skips, and CI fails on any skip.
 - Run one e2e test binary at a time per Docker daemon; `make test-e2e` runs them in turn. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*` on every daemon in `FRED_E2E_DOCKER_SOCKETS`, and every mount under `$TMPDIR/fred-e2e`.
-- Workload images are pinned by digest (`BusyboxImage`, `RedisImage` in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
+- Workload images are pinned by digest (the constants in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
+- A test that needs an image no public one provides gets one built from a directory under `test/e2e/images/` and published to `ghcr.io/manifest-network/fred-e2e` by `e2e-images.yml`. See `test/e2e/images/README.md`.
 - The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). The providerd tier adds `Provider`, built on that fixture, and `Tenant`. A new feature adds a test, not harness code, and production code carries no hook for the suite.
+
+#### Proving a regression test
+
+A regression test is worth keeping only if it fails without the fix it guards. The tenant regression tests in `test/e2e/tenant_test.go` were each shown to, and each names its guard. To repeat the proof after changing a guard, build a backend without it and point the one test at that binary:
+
+```bash
+cp internal/backend/docker/provision.go /tmp/provision.go    # then remove the guard in the copy
+echo "{\"Replace\": {\"$PWD/internal/backend/docker/provision.go\": \"/tmp/provision.go\"}}" > /tmp/overlay.json
+mkdir -p /tmp/unguarded && go build -overlay /tmp/overlay.json -o /tmp/unguarded/docker-backend ./cmd/docker-backend
+make build-e2e
+sudo env "PATH=$PATH" FRED_E2E_BACKEND_BIN_DIR=/tmp/unguarded build/e2e/tests/e2e.test -test.v -test.run '^TestBackend_SymlinkedVolumeDirectoryIsRefused$'
+```
+
+The test must fail, and for the reason its comment gives. `go build -overlay` replaces a whole file for one build and leaves the tree untouched. Nothing in CI repeats this, because a copied file goes stale as soon as the original changes: it is a check to make when the guard or its test changes.
 
 CI runs it in `integration.yml` as the `e2e (root, <image store>)` jobs, beside the in-process suite, and the release workflow gates on both. Changes under `test/**` or to `.manifestd-version` trigger that workflow.
 
