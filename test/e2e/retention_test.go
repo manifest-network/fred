@@ -271,7 +271,10 @@ func TestRetention_PartitionNeedsAListedTenantAndOneValidValue(t *testing.T) {
 	}
 
 	requirePartition(retire(t, b, "tenant-b", "p1"), "", "a tenant that is not on the budget list gets no partition")
-	requirePartition(retire(t, b, "tenant-a", "p1"), "p1", "a listed tenant's valid value is its partition")
+
+	// The refusals below come first, while tenant-a has no partition. Once
+	// its one partition is taken, the limit alone would turn a wrongly
+	// accepted value away, and these checks would pass without their guard.
 	requirePartition(retire(t, b, "tenant-a", ""), "", "a lease that names no partition gets none")
 	requirePartition(retire(t, b, "tenant-a", "not a valid value!"), "", "an invalid value is not a partition")
 
@@ -287,6 +290,7 @@ func TestRetention_PartitionNeedsAListedTenantAndOneValidValue(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, roots, 2, "each service of the stack keeps its volume")
 
+	requirePartition(retire(t, b, "tenant-a", "p1"), "p1", "a listed tenant's valid value is its partition")
 	requirePartition(retire(t, b, "tenant-a", "p2"), "", "a tenant at its partition limit gets no new partition")
 	requirePartition(retire(t, b, "tenant-a", "p1"), "p1", "a partition the tenant already has still takes leases")
 }
