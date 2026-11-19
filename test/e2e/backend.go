@@ -64,6 +64,9 @@ type SKUs struct {
 	// Stateful has disk: an image VOLUME becomes a quota-capped XFS directory
 	// that outlives the lease as retained data.
 	Stateful string
+	// Pinned, when set, is a second SKU without disk. A provider with several
+	// backends gives each its own, so a test can put a lease on a chosen one.
+	Pinned string
 }
 
 // Backend is one docker-backend process and everything it needs: an XFS
@@ -167,6 +170,10 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 		callbacks: callbacks,
 	}
 
+	mapping := map[string]string{skus.Stateless: "e2e-stateless", skus.Stateful: "e2e-stateful"}
+	if skus.Pinned != "" {
+		mapping[skus.Pinned] = "e2e-stateless"
+	}
 	config := map[string]any{
 		"name":                     b.Name,
 		"listen_addr":              listenAddr,
@@ -180,10 +187,7 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 		"total_disk_mb":            256,
 		// The loopback is far smaller than the production free-space floor.
 		"image_disk_min_free_mb": 1,
-		"sku_mapping": map[string]string{
-			skus.Stateless: "e2e-stateless",
-			skus.Stateful:  "e2e-stateful",
-		},
+		"sku_mapping":            mapping,
 		"sku_profiles": map[string]any{
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
 			"e2e-stateful":  map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 64},
