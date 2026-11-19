@@ -82,6 +82,13 @@ func StartProvider(t *testing.T, backends int) *Provider {
 		require.NoError(t, err, "%s must hold a %s binary", ProviderBinDirEnv, name)
 	}
 
+	// A docker-backend needs a Docker daemon to itself.
+	sockets := e2e.DockerSockets()
+	if len(sockets) < backends {
+		t.Skipf("%d backends need %d Docker daemons, and %s names %d; start more with scripts/e2e-second-dockerd.sh",
+			backends, backends, e2e.DockerSocketsEnv, len(sockets))
+	}
+
 	p := &Provider{t: t, binDir: binDir}
 	var key Key
 	p.Chain = Start(t, func(genesis *Genesis) {
@@ -103,7 +110,7 @@ func StartProvider(t *testing.T, backends int) *Provider {
 		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
 		// The backend's own client creates leases for this provider, as
 		// providerd does.
-		p.Backends = append(p.Backends, e2e.StartBackendFor(t, p.UUID, served))
+		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served))
 	}
 
 	// providerd gets its own directory and its own copy of the keyring, both

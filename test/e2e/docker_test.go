@@ -43,7 +43,7 @@ func requireImage(t *testing.T, docker *client.Client, ref string) {
 // of a backend the caller did not name. A helper it missed would outlive the
 // scratch root holding the only record that could recover it.
 func TestSweepDockerResources(t *testing.T) {
-	docker := dockerClient(t)
+	docker := dockerClient(t, DockerSockets()[0])
 	ctx := t.Context()
 	requireImage(t, docker, BusyboxImage)
 	swept := backendNamePrefix + randomHex(t, 4)
