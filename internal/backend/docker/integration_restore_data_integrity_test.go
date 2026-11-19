@@ -64,6 +64,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // retainRestoreBackend builds a real-Docker backend wired for the soft-delete +
@@ -100,7 +101,7 @@ func ownerUID(t *testing.T, path string) uint32 {
 // (not substring) on read-back from the restored lease's container AND on the
 // host volume, plus mode preservation.
 func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 
@@ -190,7 +191,7 @@ func TestIntegration_Docker_RetainRestore_DataIntegrity(t *testing.T) {
 // on the correctly-indexed new canonical volume — a single-volume sentinel test
 // can't catch a cross-index mis-mapping in retainedToNewCanonical.
 func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 
@@ -271,7 +272,7 @@ func TestIntegration_Docker_RetainRestore_MultiInstance(t *testing.T) {
 // bytes AND on-disk ownership are preserved by construction; the only thing
 // restore re-applies afterward is the top-dir chown (see OwnershipBoundary).
 func TestIntegration_Docker_RenameVolume_PreservesNestedMetadata(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	mgr, err := newVolumeManager(mountPath, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())
@@ -448,7 +449,7 @@ func TestIntegration_Docker_RetainRestore_OwnershipBoundary(t *testing.T) {
 // never starts (the writable path is detected at image-inspect time and bound
 // regardless of the command).
 func TestIntegration_Docker_Close_WritablePathOnly_Reclaimed(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := retainRestoreBackend(t, mountPath)
 	// Writable-path detection only runs under a read-only rootfs. That is the

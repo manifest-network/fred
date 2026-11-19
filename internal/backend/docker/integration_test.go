@@ -30,6 +30,7 @@ import (
 	"github.com/manifest-network/fred/internal/hmacauth"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 const (
@@ -2452,7 +2453,7 @@ func TestIntegration_Docker_UpdateUnhealthyTargetRestoresFrozenSource(t *testing
 		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, "")
 	})
 	t.Run("stateful", func(t *testing.T) {
-		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, setupXFSLoopback(t))
+		testIntegrationUpdateUnhealthyTargetRestoresFrozenSource(t, testutil.SetupXFSLoopback(t))
 	})
 }
 
@@ -2720,7 +2721,7 @@ func TestIntegration_Docker_SequentialUpdates_ReleaseAccumulation(t *testing.T) 
 }
 
 func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
@@ -2795,7 +2796,7 @@ func TestIntegration_Docker_RestartPreservesVolumes(t *testing.T) {
 }
 
 func TestIntegration_Docker_UpdatePreservesVolumes(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 
 	b := testBackendWithRealDocker(t, func(cfg *Config) {

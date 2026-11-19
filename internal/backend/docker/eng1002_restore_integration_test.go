@@ -17,13 +17,14 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // Real XFS project volumes exercise the guarded rollback's rename, descriptor
 // release and deletion boundaries. Docker is mocked only to stop the public
 // restore after volume creation, before Compose can own an uncertain launch.
 func TestIntegration_Docker_RestoreFailureRemovesCreatedVolume(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := testutil.SetupXFSLoopback(t)
 	var sourceProjID, scratchProjID uint32
 	synctest.Test(t, func(t *testing.T) {
 		var preparationComplete atomic.Bool

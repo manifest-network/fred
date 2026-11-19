@@ -24,7 +24,13 @@ sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full D
 sudo -E env "PATH=$PATH" make test-integration-volume   # provision-path subset on an XFS loopback, NOT the XFS quota tests
 ```
 
-`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + xfsprogs + capsh (libcap2-bin), and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one `TestIntegration_…`.
+`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + xfsprogs + capsh (libcap2-bin), and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one in those packages `TestIntegration_…`.
+
+```bash
+make test-e2e   # black-box suite (test/e2e): run as yourself, it calls sudo only for the test binary
+```
+
+`test/e2e` starts the real `docker-backend` as a non-root process (through `capsh`, with the unit's capabilities) on its own XFS loopback and asserts only through HTTP, Docker and the host. It has no `-run` filter, so its tests need no `TestIntegration_` prefix; they still `t.Skip` on a missing prerequisite, and CI's SKIP guard covers them. Run one e2e binary at a time per Docker daemon: its `TestMain` removes every `e2e-*` backend's containers and networks and unmounts everything under `$TMPDIR/fred-e2e`. The harness is one fixture (`Backend`) and one client (`Apply`, `Get`, `List`, `Close`, `Restore`); a new feature adds a test, not harness code.
 
 For the full suite, export `FRED_TEST_IMAGE_STORE` (`overlay2` or `containerd`) to match the local daemon's image store; unset, `TestIntegration_Docker_ImageStoreMatchesRunnerDeclaration` prints a `--- SKIP:`, which fails CI's SKIP guard. CI sets it per leg. A containerd daemon also needs `FRED_TEST_IMAGE_DATA_PATH=/var/lib/containerd`; leave that unset for overlay2.
 

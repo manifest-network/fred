@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker build-placement-preflight build-placement-repair install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker build-placement-preflight build-placement-repair install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore build-e2e test-e2e test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -137,6 +137,33 @@ test-integration-restore:
 	@echo "Running retain/restore integration tests (requires root + Docker + xfsprogs)..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_RenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
 
+# Black-box suite (test/e2e): the real binaries run as separate processes.
+E2E_DIR=$(BUILD_DIR)/e2e
+E2E_TIMEOUT ?= 15m
+
+# Build the binaries under test and the e2e test binaries as the invoking user,
+# so the privileged run never writes root-owned files into the Go caches. The
+# binaries carry coverage instrumentation; the harness gives each process a
+# GOCOVERDIR.
+build-e2e:
+	@echo "Building e2e binaries..."
+	@mkdir -p $(E2E_DIR)/bin $(E2E_DIR)/tests $(E2E_DIR)/logs
+	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(DOCKER_BINARY_NAME) ./cmd/docker-backend
+	$(GOTEST) -tags integration -c -o $(E2E_DIR)/tests/ ./test/e2e/...
+
+# Run the black-box suite (requires sudo, Docker, xfsprogs and capsh).
+# Usage: make test-e2e   (as yourself: only the test binaries run under sudo)
+# One run at a time per Docker daemon: the suite removes a killed run's leftovers.
+test-e2e: build-e2e
+	@set -e; for bin in $(E2E_DIR)/tests/*.test; do \
+		echo "Running $$bin..."; \
+		sudo env "PATH=$$PATH" \
+			"FRED_E2E_BACKEND_BIN_DIR=$(abspath $(E2E_DIR)/bin)" \
+			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
+			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
+			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT); \
+	done
+
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
 	@echo "Running tests with coverage..."
@@ -238,6 +265,7 @@ help:
 	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
 	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, xfsprogs)"
 	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, xfsprogs)"
+	@echo "  test-e2e                - Run the black-box suite in test/e2e (sudo, Docker, xfsprogs, capsh)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"
 	@echo "  lint             - Run linter"

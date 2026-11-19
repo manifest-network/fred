@@ -14,13 +14,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
+
+	fredtestutil "github.com/manifest-network/fred/internal/testutil"
 )
 
 // ENG-1118: the runtime policy cannot repair historical escapes. Use real
 // kernel attributes and the production inventory, opener, walker and getter
 // to prove that the audit reports these volumes without changing them.
 func TestIntegration_XFS_ProjectIDAuditDetectsHistoricalDrift(t *testing.T) {
-	mount := setupXFSLoopback(t)
+	mount := fredtestutil.SetupXFSLoopback(t)
 	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	require.NoError(t, mgr.Validate())

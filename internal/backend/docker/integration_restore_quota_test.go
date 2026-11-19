@@ -20,6 +20,7 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // parseXfsReportHardBlocks returns the HARD block-limit column for projID from
@@ -189,7 +190,7 @@ func seedRetainedForRestore(t *testing.T, b *Backend, mgr volumeManager, orig, o
 // name across subtests, and never assert used==dataMiB on a seed (XFS speculative
 // preallocation can transiently inflate "used"; assert on bhard instead).
 func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
-	mount := setupXFSLoopback(t) // root-gated; skips if root/mkfs.xfs/xfs_quota/loop absent
+	mount := testutil.SetupXFSLoopback(t) // root-gated; skips if root/mkfs.xfs/xfs_quota/loop absent
 	volumeMgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	mgr, ok := volumeMgr.(*xfsVolumeManager)
@@ -303,7 +304,7 @@ func TestIntegration_Restore_DemotePromote_EnforcesQuota_XFS(t *testing.T) {
 func TestIntegration_RestoreRollback_ReappliesSourceQuota(t *testing.T) {
 	const oldCapMiB, promotedCapMiB = int64(20), int64(100)
 	ctx := context.Background()
-	mount := setupXFSLoopback(t)
+	mount := testutil.SetupXFSLoopback(t)
 	mgr, err := newVolumeManager(mount, "xfs", 1024, slog.Default())
 	require.NoError(t, err)
 	orig := newIntegrationLeaseUUID()
