@@ -112,6 +112,17 @@ func (b *Backend) Containers(t *testing.T, leaseUUID string) []container.Inspect
 	return inspected
 }
 
+// LoseContainers removes the lease's containers behind the backend's back, the
+// way a host that lost them would have none.
+func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, one := range b.Containers(t, leaseUUID) {
+		require.NoError(t, b.docker.ContainerRemove(ctx, one.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}))
+	}
+}
+
 // Exec runs a command in a container on this backend's daemon and returns its
 // output. A non-zero exit fails the test.
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {

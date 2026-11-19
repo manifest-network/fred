@@ -37,13 +37,20 @@ func TestFleet_UncertainEvidenceDestroysNothing(t *testing.T) {
 
 	// A lease of this provider that the chain has never heard of, running on
 	// a backend. The chain keeps every lease it ever had, so this is not a
-	// closed lease, and providerd must leave it. The counter shows that
-	// providerd asked the chain about it and got that answer.
+	// closed lease, and providerd must leave it. The counters show that
+	// providerd asked the chain about it and did not get a closed lease
+	// back. 0.14 counts the chain's "not found" as an error, and so calls
+	// every pass over this lease partial.
 	unknown := e2e.Spec{LeaseUUID: uuid.NewString(), Tenant: tenant.Address(), SKU: p.SKUs.Stateless, Manifest: sleeper("3600")}
 	require.NoError(t, a.Client.Apply(t.Context(), unknown))
 	requireStatus(t, a, unknown.LeaseUUID, "ready")
 	containerUnknown := running(t, a, unknown.LeaseUUID)
-	p.AwaitMetric(t, 2, "fred_reconciler_cleanup_skips_total", `pass="orphan"`, `reason="chain_unknown"`)
+	asked := func() float64 {
+		return p.Metric(t, "fred_reconciler_cleanup_skips_total", `pass="orphan"`, `reason="chain_unknown"`) +
+			p.Metric(t, "fred_reconciler_cleanup_skips_total", `pass="orphan"`, `reason="chain_error"`)
+	}
+	askedBefore := asked()
+	eventually(t, "providerd asks the chain about the unknown lease twice more", func() bool { return asked() >= askedBefore+2 })
 	requireUntouched(t, a, unknown.LeaseUUID, containerUnknown)
 
 	// The chain stops answering. No call to the chain may be made until it
@@ -54,7 +61,7 @@ func TestFleet_UncertainEvidenceDestroysNothing(t *testing.T) {
 	requireUntouched(t, b, onB, containerB)
 	requireUntouched(t, a, unknown.LeaseUUID, containerUnknown)
 	p.Chain.Resume(t)
-	p.AwaitSweeps(t, 1, SweepComplete)
+	p.AwaitSweeps(t, 1, SweepPartial)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, onA).State)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, onB).State)
 	requireUntouched(t, a, onA, containerA)
@@ -79,7 +86,7 @@ func TestFleet_UncertainEvidenceDestroysNothing(t *testing.T) {
 	requireGone(t, a, onA)
 
 	// Through all of it, the lease the chain does not know kept running.
-	p.AwaitSweeps(t, 2, SweepComplete)
+	p.AwaitSweeps(t, 2, SweepPartial)
 	requireUntouched(t, a, unknown.LeaseUUID, containerUnknown)
 }
 
@@ -125,11 +132,12 @@ func TestFleet_CloseAndRestoreReachTheOwningBackend(t *testing.T) {
 	requireUntouched(t, holder, beside, containerBeside)
 }
 
-// TestFleet_LostLeaseReturnsToItsBackend removes a lease from the backend it
-// was placed on, behind providerd's back. providerd must run it again on that
-// backend. The backend is kept the busier of the two, so choosing afresh by
-// load would send the lease to the other one, where it would start without
-// the data its own backend holds.
+// TestFleet_LostLeaseReturnsToItsBackend takes a lease's containers away from
+// the backend it was placed on, as a host that lost them would, and restarts
+// that backend. providerd must run the lease again there. The backend is kept
+// the busier of the two, so choosing afresh by load would send the lease to
+// the other one, where it would start without the data its own backend
+// holds.
 func TestFleet_LostLeaseReturnsToItsBackend(t *testing.T) {
 	p := StartProvider(t, 2)
 	tenant := p.NewTenant(t)
@@ -141,11 +149,9 @@ func TestFleet_LostLeaseReturnsToItsBackend(t *testing.T) {
 	first := running(t, home, lost)
 	provisionsAway := p.Dispatched(t, away, "provision")
 
-	// A backend answers a close with a deferral while earlier work on the
-	// lease settles, and expects the same close again.
-	eventually(t, "backend "+home.Name+" accepts the close of lease "+lost, func() bool {
-		return home.Client.Close(t.Context(), lost) == nil
-	})
+	home.Stop()
+	home.LoseContainers(t, lost)
+	home.Start()
 	replaced(t, home, lost, first)
 	require.Equal(t, provisionsAway, p.Dispatched(t, away, "provision"), "the lease must not have been sent to the other backend")
 	requireAbsent(t, away, lost)

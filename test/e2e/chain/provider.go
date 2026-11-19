@@ -278,6 +278,9 @@ const (
 	// SweepComplete is a pass that read the chain and every backend and hit
 	// no error on any lease.
 	SweepComplete SweepOutcome = "success"
+	// SweepPartial is a pass that read the chain and every backend and hit
+	// an error on at least one lease.
+	SweepPartial SweepOutcome = "partial"
 	// SweepDegraded is a pass that could not see every backend.
 	SweepDegraded SweepOutcome = "degraded"
 	// SweepFailed is a pass that ended in an error, as when the chain does
