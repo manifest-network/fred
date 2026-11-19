@@ -52,10 +52,9 @@ type Provider struct {
 	// UUID is the provider's UUID on the chain.
 	UUID string
 	// SKUs are served by every backend, so providerd chooses where a lease of
-	// one goes: the least loaded backend.
+	// one goes: the least loaded backend. Each backend's own SKUs.Pinned is
+	// served by that backend alone.
 	SKUs e2e.SKUs
-	// Pinned[i] is a SKU without disk that only Backends[i] serves.
-	Pinned []string
 
 	t       *testing.T
 	binDir  string
@@ -102,8 +101,9 @@ func StartProvider(t *testing.T, backends int) *Provider {
 	for i := range backends {
 		served := p.SKUs
 		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
-		p.Pinned = append(p.Pinned, served.Pinned)
-		p.Backends = append(p.Backends, e2e.StartBackendWithSKUs(t, served))
+		// The backend's own client creates leases for this provider, as
+		// providerd does.
+		p.Backends = append(p.Backends, e2e.StartBackendFor(t, p.UUID, served))
 	}
 
 	// providerd gets its own directory and its own copy of the keyring, both
@@ -264,11 +264,36 @@ func (p *Provider) AwaitMetric(t *testing.T, growth float64, name string, labels
 	}
 }
 
-// AwaitSweeps waits until that many reconciliation passes have finished
-// since the call. Two are needed to be sure one started after the call.
-func (p *Provider) AwaitSweeps(t *testing.T, sweeps int) {
+// SweepOutcome is how providerd labels a finished reconciliation pass.
+type SweepOutcome string
+
+const (
+	// SweepComplete is a pass that read the chain and every backend and hit
+	// no error on any lease.
+	SweepComplete SweepOutcome = "success"
+	// SweepDegraded is a pass that could not see every backend.
+	SweepDegraded SweepOutcome = "degraded"
+	// SweepFailed is a pass that ended in an error, as when the chain does
+	// not answer. It looked at no backend.
+	SweepFailed SweepOutcome = "error"
+)
+
+// AwaitSweeps waits until that many reconciliation passes with the given
+// outcome have finished since the call. The outcome matters: a failed pass
+// inspects nothing, so it is no evidence that providerd left something
+// alone. Two passes are needed to be sure one started after the call.
+func (p *Provider) AwaitSweeps(t *testing.T, sweeps int, outcome SweepOutcome) {
 	t.Helper()
-	p.AwaitMetric(t, float64(sweeps), "fred_reconciler_runs_total")
+	p.AwaitMetric(t, float64(sweeps), "fred_reconciler_runs_total", `outcome="`+string(outcome)+`"`)
+}
+
+// Dispatched counts the requests of one kind that providerd has sent to a
+// backend since it started: "provision", "restore", "deprovision", "restart"
+// or "update". Unlike the backend's own state, the count also shows a
+// request the backend refused.
+func (p *Provider) Dispatched(t *testing.T, backend *e2e.Backend, operation string) float64 {
+	t.Helper()
+	return p.Metric(t, "fred_backend_requests_total", `backend="`+backend.Name+`"`, `operation="`+operation+`"`)
 }
 
 // config is providerd's configuration: the chain, the provider's identity
@@ -285,7 +310,7 @@ func (p *Provider) config(key Key, state, listenAddr string) map[string]any {
 			"hmac_secret":          backend.HMACSecret,
 			"timeout":              "30s",
 			// A backend takes only the SKUs listed for it.
-			"skus": []string{p.SKUs.Stateless, p.SKUs.Stateful, p.Pinned[i]},
+			"skus": []string{backend.SKUs.Stateless, backend.SKUs.Stateful, backend.SKUs.Pinned},
 		}
 	}
 	return map[string]any{
