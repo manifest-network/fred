@@ -128,11 +128,16 @@ func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 // TestBackend_TenantCannotChangeProjectID has a tenant try to move one of its
 // own files to another XFS project. A volume's quota counts the files of its
 // project, so a tenant that could retag a file would put its usage on another
-// volume's quota. The attempt must be refused, and the file must stay where
-// it was (ENG-1118).
+// volume's quota. The kernel lets a file's owner do it, with no capability:
+// the backend's seccomp profile is what refuses it. The attempt must fail,
+// and the file must stay where it was (ENG-1118).
+//
+// The image's probe issues the project change alone. chattr rewrites the
+// file's flags first, which the profile also refuses, so a test using it
+// passes whether or not the project change is refused.
 func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	b := StartBackend(t)
-	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(ProjectProbeImage)}
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	c := requireOneRunningContainer(t, b, lease.LeaseUUID)
@@ -142,9 +147,9 @@ func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	before := projectID(t, hostFile)
 	require.NotZero(t, before, "a file in a stateful volume is charged to the volume's project")
 
-	exitCode, out := b.TryExec(t, c.ID, "chattr", "-p", strconv.Itoa(before+1), "/data/file")
+	exitCode, out := b.TryExec(t, c.ID, "/probe", "/data/file", strconv.Itoa(before+1))
 	require.NotZero(t, exitCode, "the tenant must not be able to change the project of its file: %s", out)
-	require.Contains(t, out, "Operation not permitted", "the change must be refused, not unsupported")
+	require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
 	require.Equal(t, before, projectID(t, hostFile))
 }
 
