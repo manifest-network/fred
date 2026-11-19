@@ -161,7 +161,7 @@ Running the suites locally is still the fastest iteration loop, and required for
 `test/e2e` runs the built binaries as separate processes and asserts only through their external surfaces: the backend HTTP API, Docker, and the host filesystem. It has two tiers:
 
 - **Backend tier** (`test/e2e`): each test starts its own `docker-backend`, as a non-root account holding the production capabilities, on its own XFS loopback, behind mTLS with a throwaway CA, and drives it directly.
-- **providerd tier** (`test/e2e/chain`): each test starts a single-node chain from the real `manifestd` binary, a backend, and a `providerd` bootstrapped as an operator does it. The test acts as a tenant: transactions on the chain, the manifest to the provider's API.
+- **providerd tier** (`test/e2e/chain`): each test starts a single-node chain from the real `manifestd` binary, one or more backends, and a `providerd` bootstrapped as an operator does it. The test acts as a tenant: transactions on the chain, and the manifest, restarts, updates and restores through the provider's API with tokens from the `lease-token` binary. A test that must show providerd left something alone waits on providerd's own counters at `/metrics`.
 
 ```bash
 make test-e2e   # needs sudo, Docker, xfsprogs and capsh; set FRED_TEST_IMAGE_DATA_PATH as for the integration suite

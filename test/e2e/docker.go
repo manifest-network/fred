@@ -88,6 +88,20 @@ func LeaseContainers(t *testing.T, leaseUUID string) []container.InspectResponse
 	return inspected
 }
 
+// Containers inspects the containers this backend runs for a lease. Two
+// backends can each hold containers of one lease, which LeaseContainers
+// cannot tell apart.
+func (b *Backend) Containers(t *testing.T, leaseUUID string) []container.InspectResponse {
+	t.Helper()
+	var own []container.InspectResponse
+	for _, one := range LeaseContainers(t, leaseUUID) {
+		if one.Config.Labels[labelBackendName] == b.Name {
+			own = append(own, one)
+		}
+	}
+	return own
+}
+
 // Exec runs a command in a container and returns its output. A non-zero exit
 // fails the test.
 func Exec(t *testing.T, containerID string, cmd ...string) string {

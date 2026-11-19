@@ -45,6 +45,8 @@ type Chain struct {
 	ID string
 
 	bin, home, rpc, grpc string
+	// node is the running manifestd process.
+	node *os.Process
 	// started is set once the node is about to run, which ends genesis
 	// preparation.
 	started bool
@@ -116,9 +118,12 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	if err := node.Start(); err != nil {
 		t.Fatalf("start manifestd: %v", err)
 	}
+	c.node = node.Process
 	exited := make(chan struct{})
 	go func() { _ = node.Wait(); close(exited) }()
 	t.Cleanup(func() {
+		// A paused node does not see SIGTERM until it continues.
+		_ = node.Process.Signal(syscall.SIGCONT)
 		_ = node.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-exited:
@@ -191,6 +196,24 @@ func (g Genesis) requireOpen(t *testing.T) {
 
 // sealed reports whether the chain has started.
 func (g Genesis) sealed() bool { return g.chain.started }
+
+// Pause freezes the node: it stops answering and stops producing blocks, as
+// a chain outage looks from outside. Queries and transactions block until
+// Resume.
+func (c *Chain) Pause(t *testing.T) {
+	t.Helper()
+	if err := c.node.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("pause manifestd: %v", err)
+	}
+}
+
+// Resume lets a paused node continue from where it stopped.
+func (c *Chain) Resume(t *testing.T) {
+	t.Helper()
+	if err := c.node.Signal(syscall.SIGCONT); err != nil {
+		t.Fatalf("resume manifestd: %v", err)
+	}
+}
 
 // Home is the node's home directory. Its keyring-test subdirectory is the
 // keyring every key of this chain lives in.

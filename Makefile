@@ -151,6 +151,7 @@ build-e2e:
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(DOCKER_BINARY_NAME) ./cmd/docker-backend
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(BINARY_NAME) ./cmd/providerd
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(PLACEMENT_PREFLIGHT_BINARY_NAME) ./cmd/placement-preflight
+	$(GOBUILD) -o $(E2E_DIR)/bin/lease-token ./cmd/lease-token
 	$(GOTEST) -tags integration -c -o $(E2E_DIR)/tests/ ./test/e2e/...
 
 # Run the black-box suite (requires sudo, Docker, xfsprogs and capsh).
