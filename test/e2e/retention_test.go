@@ -4,11 +4,8 @@ package e2e
 
 import (
 	"errors"
-	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -120,7 +117,7 @@ func requireRetained(t *testing.T, b *Backend, want ...string) []Lease {
 		require.NoError(t, err)
 		require.NotEmpty(t, roots, "a retained lease keeps its volumes")
 		for _, root := range roots {
-			require.Equal(t, statefulDiskMB*1024, quotaLimitKB(t, b, root), "%s keeps its quota", root)
+			require.Equal(t, statefulDiskMB*1024, b.QuotaLimitKB(t, root), "%s keeps its quota", root)
 		}
 	}
 	return reported
@@ -137,27 +134,6 @@ func requireDestroyed(t *testing.T, b *Backend, leaseUUID string) {
 		assert.NoError(collect, err)
 		assert.Empty(collect, roots, "the lease's volumes must be gone")
 	}, 2*time.Minute, time.Second)
-}
-
-// quotaLimitKB reads the hard block limit, in KiB, of the XFS project a
-// volume directory belongs to.
-func quotaLimitKB(t *testing.T, b *Backend, root string) int {
-	t.Helper()
-	project := projectID(t, root)
-	require.NotZero(t, project, "%s belongs to no project", root)
-	out, err := exec.CommandContext(t.Context(), "xfs_quota", "-x", "-c", "report -p -b -n -N", filepath.Dir(b.VolumePath)).CombinedOutput()
-	require.NoError(t, err, "xfs_quota report: %s", out)
-	// One line per project: "#<id> <used> <soft> <hard> ...", in KiB.
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[0] == "#"+strconv.Itoa(project) {
-			limit, err := strconv.Atoi(fields[3])
-			require.NoError(t, err, "xfs_quota line: %s", line)
-			return limit
-		}
-	}
-	require.Failf(t, "project missing", "xfs_quota reports no project %d:\n%s", project, out)
-	return 0
 }
 
 // TestRetention_TenantCountCapEvictsTheOldest fills a tenant's count cap.

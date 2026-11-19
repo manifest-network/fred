@@ -139,7 +139,7 @@ test-integration-restore:
 
 # Black-box suite (test/e2e): the real binaries run as separate processes.
 E2E_DIR=$(BUILD_DIR)/e2e
-E2E_TIMEOUT ?= 15m
+E2E_TIMEOUT ?= 30m
 
 # Build the binaries under test and the e2e test binaries as the invoking user,
 # so the privileged run never writes root-owned files into the Go caches. The

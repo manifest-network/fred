@@ -5,7 +5,6 @@ package e2e
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -40,18 +39,6 @@ func volumeSource(t *testing.T, c container.InspectResponse, destination string)
 	}
 	require.Failf(t, "mount missing", "container %s has no mount at %s", c.ID, destination)
 	return ""
-}
-
-// projectID reads the XFS project a host file is charged to.
-func projectID(t *testing.T, path string) int {
-	t.Helper()
-	out, err := exec.CommandContext(t.Context(), "xfs_io", "-r", "-c", "lsproj", path).CombinedOutput()
-	require.NoError(t, err, "xfs_io lsproj %s: %s", path, out)
-	_, value, found := strings.Cut(strings.TrimSpace(string(out)), "=")
-	require.True(t, found, "unexpected xfs_io output: %s", out)
-	id, err := strconv.Atoi(strings.TrimSpace(value))
-	require.NoError(t, err, "unexpected xfs_io output: %s", out)
-	return id
 }
 
 // ownerUID is the account that owns a host path.
@@ -157,13 +144,13 @@ func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 
 	b.Exec(t, c.ID, "sh", "-c", "echo data > /data/file")
 	hostFile := filepath.Join(volumeSource(t, c, "/data"), "file")
-	before := projectID(t, hostFile)
+	before := ProjectID(t, hostFile)
 	require.NotZero(t, before, "a file in a stateful volume is charged to the volume's project")
 
 	exitCode, out := b.TryExec(t, c.ID, "/probe", "/data/file", strconv.Itoa(before+1))
 	require.NotZero(t, exitCode, "the tenant must not be able to change the project of its file: %s", out)
 	require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
-	require.Equal(t, before, projectID(t, hostFile))
+	require.Equal(t, before, ProjectID(t, hostFile))
 }
 
 // TestBackend_RootContainerWritesItsVolume runs a workload as root on a
