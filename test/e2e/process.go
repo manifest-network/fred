@@ -68,6 +68,15 @@ func (p *Process) Env() []string {
 // The command gets SIGTERM, not SIGKILL, when the process is stopped.
 func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() bool) {
 	p.t.Helper()
+	p.Launch(build)
+	p.AwaitReady(ready)
+}
+
+// Launch runs the command build returns and does not wait for it to serve.
+// A test that has something to do while the process starts follows it with
+// AwaitReady.
+func (p *Process) Launch(build func(ctx context.Context) *exec.Cmd) {
+	p.t.Helper()
 	require.Nil(p.t, p.stop, "%s is already running", p.name)
 
 	// World-readable: CI uploads the log as the unprivileged runner account.
@@ -89,15 +98,21 @@ func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() 
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 	p.cmd, p.stop, p.exited = cmd, cancel, exited
+}
 
+// AwaitReady waits until ready reports true for a launched process. The
+// process exiting first, or not serving in time, fails the test.
+func (p *Process) AwaitReady(ready func() bool) {
+	p.t.Helper()
+	require.NotNil(p.t, p.stop, "%s was not launched", p.name)
 	deadline := time.After(startTimeout)
 	poll := time.NewTicker(200 * time.Millisecond)
 	defer poll.Stop()
 	for {
 		select {
-		case err := <-exited:
+		case err := <-p.exited:
+			p.stop()
 			p.cmd, p.stop, p.exited = nil, nil, nil
-			cancel()
 			p.t.Fatalf("%s exited during startup: %v\n%s", p.name, err, tail(p.logPath))
 		case <-deadline:
 			p.t.Fatalf("%s did not serve within %s\n%s", p.name, startTimeout, tail(p.logPath))

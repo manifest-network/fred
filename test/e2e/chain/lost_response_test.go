@@ -135,7 +135,7 @@ func TestLostResponse_Update(t *testing.T) {
 	tenant.Update(t, lease, sleeper("7200"))
 	lost.Require(t)
 	done := running(t, backend, lease)
-	require.Equal(t, []string{"sleep", "7200"}, []string(done.Config.Cmd), "the lease must run the updated workload")
+	require.Equal(t, []string{"sleep", "7200"}, command(done), "the lease must run the updated workload")
 
 	requireDoneOnce(t, p, backend, lease, done)
 }
