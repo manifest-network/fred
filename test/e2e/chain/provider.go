@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -216,43 +215,14 @@ func (p *Provider) Host(t *testing.T, leaseUUID string) *e2e.Backend {
 // every given `name="value"` pair. A metric that was never written reads 0.
 func (p *Provider) Metric(t *testing.T, name string, labels ...string) float64 {
 	t.Helper()
-	var sum float64
-samples:
-	for _, line := range p.metricLines(t, name) {
-		series, value, _ := strings.Cut(line, " ")
-		for _, label := range labels {
-			if !strings.Contains(series, label) {
-				continue samples
-			}
-		}
-		sample, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-		require.NoError(t, err, "metric line %q", line)
-		sum += sample
-	}
-	return sum
+	return e2e.SumMetric(t, p.metricLines(t, name), labels...)
 }
 
 // metricLines returns the sample lines of one metric from providerd's
 // /metrics endpoint.
 func (p *Provider) metricLines(t *testing.T, name string) []string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/metrics", nil)
-	require.NoError(t, err)
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	var lines []string
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(line, name+" ") || strings.HasPrefix(line, name+"{") {
-			lines = append(lines, line)
-		}
-	}
-	return lines
+	return e2e.MetricLines(t, http.DefaultClient, p.URL+"/metrics", name)
 }
 
 // AwaitMetric waits until a counter has grown by at least growth since the

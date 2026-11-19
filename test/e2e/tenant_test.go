@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,4 +180,145 @@ func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	require.Zero(t, ownerUID(t, source), "the next deploy must hand the directory back to root")
 	b.Exec(t, second.ID, "touch", "/data/second")
 	require.FileExists(t, filepath.Join(source, "first"), "the data of the first deploy must still be there")
+}
+
+// TestBackend_SymlinkedVolumeDirectoryIsRefused replaces the directory behind
+// a lease's volume mount with a symlink to another directory of the same
+// volume, then deploys the lease again. A tenant reaches that state from
+// inside its container when a later image declares a volume at a path its
+// earlier data made a link. Docker follows the link when it mounts, so the
+// backend must refuse before it asks Docker, start nothing, and leave the
+// tenant's data and the link as they are (ENG-539, ENG-795).
+func TestBackend_SymlinkedVolumeDirectoryIsRefused(t *testing.T) {
+	b := StartBackend(t)
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), lease))
+	requireStatus(t, b, lease.LeaseUUID, statusReady)
+	c := requireOneRunningContainer(t, b, lease.LeaseUUID)
+	source := volumeSource(t, c, "/data")
+	// The healthy mount is a real directory, so the refusal below is about
+	// the link and not about every deploy.
+	info, err := os.Lstat(source)
+	require.NoError(t, err)
+	require.True(t, info.IsDir(), "the healthy volume directory must be a real directory")
+	b.Exec(t, c.ID, "sh", "-c", "echo kept > /data/sentinel")
+
+	b.KillContainers(t, lease.LeaseUUID)
+	requireStatus(t, b, lease.LeaseUUID, statusFailed)
+	moved := filepath.Join(filepath.Dir(source), "realdata")
+	require.NoError(t, os.Rename(source, moved))
+	// Relative and inside the volume. A link that leaves the volume is
+	// refused by an older, separate check.
+	require.NoError(t, os.Symlink("realdata", source))
+
+	const refusals = "fred_docker_backend_volume_bind_symlink_rejected_total"
+	refusedBefore := b.Metric(t, refusals)
+	require.NoError(t, b.Client.Apply(t.Context(), lease))
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		assert.Greater(collect, b.metricOrZero(refusals), refusedBefore, "the backend must refuse the linked directory")
+	}, 2*time.Minute, time.Second)
+
+	for _, one := range b.Containers(t, lease.LeaseUUID) {
+		require.False(t, one.State.Running, "no container may run on a refused volume: %s", one.ID)
+	}
+	kept, err := os.ReadFile(filepath.Join(moved, "sentinel"))
+	require.NoError(t, err)
+	require.Equal(t, "kept\n", string(kept), "the tenant's data must be untouched")
+	info, err = os.Lstat(source)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink, "the backend refuses the link; it does not remove it")
+}
+
+// TestBackend_LinkedVolumeDoesNotBlockOtherLeases has one tenant arrange links
+// inside its own volume so that the path Docker reports for one of its mounts
+// no longer resolves. Before a launch, the backend looks at every container
+// that could write to the volume it is about to use. That look must not fail
+// on another lease's unresolvable path: one tenant would stop every stateful
+// launch on the backend (ENG-2181).
+func TestBackend_LinkedVolumeDoesNotBlockOtherLeases(t *testing.T) {
+	b := StartBackend(t)
+	linked := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), linked))
+	requireStatus(t, b, linked.LeaseUUID, statusReady)
+	first := requireOneRunningContainer(t, b, linked.LeaseUUID)
+	// The first deploy has one volume, /data. In it the tenant makes a a link
+	// to b/l, and b/l a link back to b.
+	b.Exec(t, first.ID, "sh", "-c", "mkdir /data/b && ln -s . /data/b/l && ln -s b/l /data/a")
+
+	// The next deploy's image declares volumes at /data/b and /data/a/c. The
+	// second is created through the tenant's links.
+	b.KillContainers(t, linked.LeaseUUID)
+	requireStatus(t, b, linked.LeaseUUID, statusFailed)
+	linked.Manifest = sleeper(NestedVolumesImage)
+	require.NoError(t, b.Client.Apply(t.Context(), linked))
+	requireStatus(t, b, linked.LeaseUUID, statusReady)
+	second := requireOneRunningContainer(t, b, linked.LeaseUUID)
+	through := volumeSource(t, second, "/data/a/c")
+	_, err := filepath.EvalSymlinks(through)
+	require.NoError(t, err, "the mount's source resolves until the tenant changes its link")
+
+	// The running workload turns its link into a loop. Its mounts do not
+	// move; only the path Docker reports for one of them stops resolving.
+	b.Exec(t, second.ID, "ln", "-sfn", "l", "/data/b/l")
+	_, err = filepath.EvalSymlinks(through)
+	require.Error(t, err, "the reported source must no longer resolve, or the test shows nothing")
+
+	other := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-b", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), other))
+	requireStatus(t, b, other.LeaseUUID, statusReady)
+	requireVolumeBind(t, b, requireOneRunningContainer(t, b, other.LeaseUUID), "/data")
+}
+
+// TestBackend_CloseDuringRestoreKeepsTheData closes a restore's destination
+// the moment the restore is requested. Whether the close lands before or
+// after the data changed hands, the data must end up held by exactly one of
+// the two leases, intact, and restorable (ENG-658).
+func TestBackend_CloseDuringRestoreKeepsTheData(t *testing.T) {
+	b := StartBackend(t)
+	ctx := t.Context()
+	source := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	require.NoError(t, b.Client.Apply(ctx, source))
+	requireStatus(t, b, source.LeaseUUID, statusReady)
+	b.Exec(t, requireOneRunningContainer(t, b, source.LeaseUUID).ID, "sh", "-c", "echo kept > /data/sentinel")
+	closeLease(t, b, source.LeaseUUID)
+	requireStatus(t, b, source.LeaseUUID, statusRetained)
+
+	destination := Spec{LeaseUUID: uuid.NewString(), Tenant: source.Tenant, SKU: StatefulSKU}
+	require.NoError(t, b.Client.Restore(ctx, destination, source.LeaseUUID))
+	closeLease(t, b, destination.LeaseUUID)
+
+	// retained reports whether the backend holds retained data for a lease,
+	// and whether it could tell.
+	retained := func(leaseUUID string) (holds, known bool) {
+		lease, err := b.Client.Get(ctx, leaseUUID)
+		switch {
+		case err == nil:
+			return lease.Status == statusRetained, lease.Status == statusRetained
+		case errors.Is(err, ErrNotFound):
+			return false, true
+		default:
+			return false, false
+		}
+	}
+	var holder string
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		sourceHolds, sourceKnown := retained(source.LeaseUUID)
+		destinationHolds, destinationKnown := retained(destination.LeaseUUID)
+		if !assert.True(collect, sourceKnown && destinationKnown, "both leases must settle as retained or gone") {
+			return
+		}
+		if !assert.NotEqual(collect, sourceHolds, destinationHolds, "exactly one lease must hold the data") {
+			return
+		}
+		holder = source.LeaseUUID
+		if destinationHolds {
+			holder = destination.LeaseUUID
+		}
+	}, 3*time.Minute, time.Second)
+	require.Empty(t, b.Containers(t, destination.LeaseUUID))
+
+	final := Spec{LeaseUUID: uuid.NewString(), Tenant: source.Tenant, SKU: StatefulSKU}
+	require.NoError(t, b.Client.Restore(ctx, final, holder))
+	requireStatus(t, b, final.LeaseUUID, statusReady)
+	require.Equal(t, "kept\n", b.Exec(t, requireOneRunningContainer(t, b, final.LeaseUUID).ID, "cat", "/data/sentinel"))
 }
