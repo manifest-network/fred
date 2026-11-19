@@ -35,12 +35,14 @@ const (
 
 // heldSettings gives an operation time to be held: by default the fixture's
 // backends give up on a workload that is not healthy within a minute.
-func heldSettings(settings map[string]any) map[string]any {
-	merged := map[string]any{"provision_timeout": "10m"}
+func heldSettings(settings map[string]any) Options {
+	// TEMPORARY: debug logging while the 0.14 recovery of an interrupted
+	// restart and update is being read from CI.
+	merged := map[string]any{"provision_timeout": "10m", "log_level": "debug"}
 	for key, value := range settings {
 		merged[key] = value
 	}
-	return merged
+	return Options{BackendSettings: merged}
 }
 
 // gated makes a workload report healthy only once the test opens its gate.
@@ -276,6 +278,7 @@ func TestCrash_BackendDuringUpdate(t *testing.T) {
 	backend, tenant := p.Backends[0], p.NewTenant(t)
 	lease := deployActive(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
 	previous := running(t, backend, lease)
+	describeOnFailure(t, backend, lease)
 	tenant.Update(t, lease, gated(sleeper("7200")))
 	held := requireHeld(t, backend, lease, "updating")
 	require.NotEqual(t, previous.ID, held.ID, "an update starts a new container")
@@ -299,6 +302,7 @@ func TestCrash_BackendDuringRestart(t *testing.T) {
 	lease, first := holdCreate(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
 	openGate(t, backend, first)
 	requireSettled(t, p, backend, lease, first)
+	describeOnFailure(t, backend, lease)
 	tenant.Restart(t, lease)
 	held := requireHeld(t, backend, lease, "restarting")
 	require.NotEqual(t, first.ID, held.ID, "a restart starts a new container")
