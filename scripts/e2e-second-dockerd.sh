@@ -29,13 +29,16 @@ case "${1:-}" in
     fi
     install -d -m 0755 "$run_dir"
     install -d -m 0710 "$data_dir"
-    # Same image store and runtime settings as the system daemon. Everything
-    # that names a place or a network is set below instead, so the two
-    # daemons share none.
+    # Only the settings that decide how images are stored and fetched and how
+    # containers run are taken from the system daemon. Everything else there
+    # names a place, a network or a listener (its metrics address, for one)
+    # that the system daemon already holds.
     if [[ -s /etc/docker/daemon.json ]]; then
-      jq 'del(.hosts, ."data-root", ."exec-root", .pidfile, .bridge, .bip, .iptables, .ip6tables,
-              ."default-address-pools", .containerd, ."containerd-namespace",
-              ."containerd-plugins-namespace")' /etc/docker/daemon.json >"$run_dir/daemon.json"
+      jq 'with_entries(select(.key | IN(
+            "features", "storage-driver", "storage-opts",
+            "exec-opts", "cgroup-parent", "default-runtime", "runtimes",
+            "registry-mirrors", "insecure-registries", "dns", "proxies")))' \
+        /etc/docker/daemon.json >"$run_dir/daemon.json"
     else
       echo '{}' >"$run_dir/daemon.json"
     fi
@@ -71,7 +74,21 @@ case "${1:-}" in
     exit 1
     ;;
   stop)
-    systemctl stop "$name" 2>/dev/null || true
+    # The data is deleted only once the daemon is known to have stopped. If
+    # systemd cannot be asked, or does not stop the unit, everything stays.
+    state="$(systemctl show --property ActiveState --value "$name")"
+    if [[ $state != inactive && $state != failed ]]; then
+      systemctl stop "$name"
+      state="$(systemctl show --property ActiveState --value "$name")"
+    fi
+    if [[ $state != inactive && $state != failed ]]; then
+      echo "$name is still $state; its data was kept" >&2
+      exit 1
+    fi
+    if [[ -s $run_dir/docker.pid ]] && kill -0 "$(<"$run_dir/docker.pid")" 2>/dev/null; then
+      echo "dockerd (pid $(<"$run_dir/docker.pid")) is still running; its data was kept" >&2
+      exit 1
+    fi
     rm -rf -- "$data_dir" "$run_dir"
     ;;
   *)
