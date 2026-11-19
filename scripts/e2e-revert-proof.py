@@ -102,10 +102,11 @@ def main():
         verdict = "PROVEN" if failed and not passed else "NOT PROVEN"
         results.append((case, test, what, verdict))
         print(f"::group::{case}: {test} against a backend where {what} -> {verdict}")
-        # The test's own output, without the process logs it attaches.
+        # The test's own output, up to the process logs it attaches.
         for line in run.stdout.splitlines():
-            if re.match(r"\s+(tenant_test|smoke_test)\.go:\d+:|\s+Error|\s+Messages:|\s+expected|\s+actual|--- |=== RUN", line):
-                print(line[:400])
+            if re.match(r"\s+process\.go:\d+:", line):
+                break
+            print(line[:400])
         print("::endgroup::")
     if not build_only:
         print("\nRevert proof summary")
