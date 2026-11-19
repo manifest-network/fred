@@ -158,20 +158,26 @@ Running the suites locally is still the fastest iteration loop, and required for
 
 ### Black-box tests
 
-`test/e2e` runs the built binaries as separate processes and asserts only through their external surfaces: the backend HTTP API, Docker, and the host filesystem. Today it covers the backend tier: each test starts its own `docker-backend`, as a non-root account holding the production capabilities, on its own XFS loopback, behind mTLS with a throwaway CA.
+`test/e2e` runs the built binaries as separate processes and asserts only through their external surfaces: the backend HTTP API, Docker, and the host filesystem. It has two tiers:
+
+- **Backend tier** (`test/e2e`): each test starts its own `docker-backend`, as a non-root account holding the production capabilities, on its own XFS loopback, behind mTLS with a throwaway CA, and drives it directly.
+- **providerd tier** (`test/e2e/chain`): each test starts a single-node chain from the real `manifestd` binary, a backend, and a `providerd` bootstrapped as an operator does it. The test acts as a tenant: transactions on the chain, the manifest to the provider's API.
 
 ```bash
 make test-e2e   # needs sudo, Docker, xfsprogs and capsh; set FRED_TEST_IMAGE_DATA_PATH as for the integration suite
+MANIFESTD=/path/to/manifestd make test-e2e   # also runs the providerd tier
 ```
 
-Run it as yourself. The target builds the binaries and the test binary unprivileged, then runs only the test binary under `sudo`, so no root-owned file lands in the Go caches. Process logs go to `build/e2e/logs/`.
+Run it as yourself. The target builds the binaries and the test binaries unprivileged, then runs only the test binaries under `sudo`, so no root-owned file lands in the Go caches. Process logs go to `build/e2e/logs/`.
+
+The providerd tier skips unless `MANIFESTD` names a `manifestd` binary. `.manifestd-version` pins what CI installs, one artifact per line as `<name> <release tag> <sha256>`: the manifest-ledger release tarball, and the `libwasmvm` shared library its binary links against and does not ship. Use the same release locally, with that library on the loader path.
 
 - The suite uses the `integration` build tag and no `-run` filter, so every test in the package runs. A test whose prerequisite is missing skips, and CI fails on any skip.
-- Run one e2e test binary at a time per Docker daemon. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*`, and every mount under `$TMPDIR/fred-e2e`.
+- Run one e2e test binary at a time per Docker daemon; `make test-e2e` runs them in turn. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*`, and every mount under `$TMPDIR/fred-e2e`.
 - Workload images are pinned by digest (`BusyboxImage`, `RedisImage` in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
-- The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). A new feature adds a test, not harness code, and production code carries no hook for the suite.
+- The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). The providerd tier adds `Provider`, built on that fixture, and `Tenant`. A new feature adds a test, not harness code, and production code carries no hook for the suite.
 
-CI runs it in `integration.yml` as the `e2e (root, <image store>)` jobs, beside the in-process suite, and the release workflow gates on both. Changes under `test/**` trigger that workflow.
+CI runs it in `integration.yml` as the `e2e (root, <image store>)` jobs, beside the in-process suite, and the release workflow gates on both. Changes under `test/**` or to `.manifestd-version` trigger that workflow.
 
 ### Stress tests
 
