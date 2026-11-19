@@ -25,6 +25,7 @@ const (
 	labelManaged     = "fred.managed"
 	labelLeaseUUID   = "fred.lease_uuid"
 	labelBackendName = "fred.backend_name"
+	labelServiceName = "fred.service_name"
 	// An image-inspection helper carries none of the labels above. The backend
 	// removes it when admission ends, so one is left behind only when the
 	// process dies during admission.
@@ -127,6 +128,15 @@ func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
 // output. A non-zero exit fails the test.
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	t.Helper()
+	exitCode, output := b.TryExec(t, containerID, cmd...)
+	require.Zero(t, exitCode, "exec %v: %s", cmd, output)
+	return output
+}
+
+// TryExec runs a command in a container on this backend's daemon and returns
+// its exit code and output, for a command a test expects to fail.
+func (b *Backend) TryExec(t *testing.T, containerID string, cmd ...string) (exitCode int, output string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	created, err := b.docker.ContainerExecCreate(ctx, containerID, container.ExecOptions{
@@ -136,13 +146,42 @@ func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	attached, err := b.docker.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
 	require.NoError(t, err)
 	defer attached.Close()
-	var output bytes.Buffer
-	_, err = stdcopy.StdCopy(&output, &output, attached.Reader)
+	var collected bytes.Buffer
+	_, err = stdcopy.StdCopy(&collected, &collected, attached.Reader)
 	require.NoError(t, err)
 	result, err := b.docker.ContainerExecInspect(ctx, created.ID)
 	require.NoError(t, err)
-	require.Zero(t, result.ExitCode, "exec %v: %s", cmd, output.String())
-	return output.String()
+	return result.ExitCode, collected.String()
+}
+
+// KillContainers kills the lease's containers, as a crashed workload would
+// leave them: present, and no longer running.
+func (b *Backend) KillContainers(t *testing.T, leaseUUID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, one := range b.Containers(t, leaseUUID) {
+		require.NoError(t, b.docker.ContainerKill(ctx, one.ID, "SIGKILL"))
+	}
+}
+
+// networkNames lists the networks this backend's daemon holds for a lease. A
+// failed listing reads as one unnamed network, so a caller waiting for none
+// keeps waiting.
+func (b *Backend) networkNames(leaseUUID string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	listed, err := b.docker.NetworkList(ctx, network.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
+	})
+	if err != nil {
+		return []string{""}
+	}
+	names := make([]string, len(listed))
+	for i, one := range listed {
+		names[i] = one.Name
+	}
+	return names
 }
 
 // removeDockerResources removes the containers, image-inspection helpers and
