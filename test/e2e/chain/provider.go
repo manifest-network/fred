@@ -5,6 +5,7 @@ package chain
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -113,6 +114,13 @@ func StartProvider(t *testing.T) *Provider {
 		owned = append(owned, filepath.Join(keyring, entry.Name()))
 		require.NoError(t, os.WriteFile(owned[len(owned)-1], data, 0o600))
 	}
+	// Without a capability the service account cannot reach the build
+	// directory either, which sits under the invoking user's home: it runs
+	// copies of the binaries.
+	for _, name := range []string{"providerd", "placement-preflight"} {
+		owned = append(owned, filepath.Join(state, name))
+		copyExecutable(t, filepath.Join(binDir, name), owned[len(owned)-1])
+	}
 	listenAddr := e2e.FreeLoopbackAddr(t)
 	p.URL = "http://" + listenAddr
 	encoded, err := yaml.Marshal(p.config(key, state, listenAddr))
@@ -123,7 +131,7 @@ func StartProvider(t *testing.T) *Provider {
 
 	process := e2e.NewProcess(t, "providerd-"+p.Backend.Name)
 	command := func(ctx context.Context, binary string, args ...string) *exec.Cmd {
-		cmd := exec.CommandContext(ctx, filepath.Join(binDir, binary), args...) //nolint:gosec // G204: a binary under test and fixture-built arguments
+		cmd := exec.CommandContext(ctx, filepath.Join(state, binary), args...) //nolint:gosec // G204: a binary under test and fixture-built arguments
 		cmd.Env = process.Env()
 		e2e.AsServiceAccount(cmd)
 		return cmd
@@ -191,6 +199,18 @@ func (p *Provider) config(key Key, state, listenAddr string) map[string]any {
 		"gas_price": 0,
 		"fee_denom": "umfx",
 	}
+}
+
+// copyExecutable copies a binary to a path the service account can reach.
+func copyExecutable(t *testing.T, from, to string) {
+	t.Helper()
+	source, err := os.Open(from) //nolint:gosec // G304: a binary under test
+	require.NoError(t, err)
+	defer func() { _ = source.Close() }()
+	target, err := os.OpenFile(to, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700) //nolint:gosec // G302, G304: an executable under t.TempDir
+	require.NoError(t, err)
+	_, err = io.Copy(target, source)
+	require.NoError(t, errors.Join(err, target.Close()))
 }
 
 // stderrOf is what a failed command wrote to its standard error.
