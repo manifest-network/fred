@@ -200,7 +200,9 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs)
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
 			"e2e-stateful":  map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 64},
 		},
-		"allowed_registries":  []string{"docker.io"},
+		// Docker Hub for the public images, and GHCR for the ones built from
+		// test/e2e/images.
+		"allowed_registries":  []string{"docker.io", "ghcr.io"},
 		"callback_secret":     secret,
 		"callback_db_path":    filepath.Join(state, "callbacks.db"),
 		"diagnostics_db_path": filepath.Join(state, "diagnostics.db"),
