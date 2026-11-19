@@ -300,6 +300,15 @@ func (b *Backend) Stop() {
 	b.process.Stop()
 }
 
+// TryAwaitServing reports whether a launched backend served within timeout,
+// or exited first. EXPERIMENT ONLY.
+func (b *Backend) TryAwaitServing(timeout time.Duration) (served, exited bool, err error) {
+	return b.process.TryAwait(b.Serving, timeout)
+}
+
+// LogTail is the end of the backend's log. EXPERIMENT ONLY.
+func (b *Backend) LogTail() string { return b.process.LogTail() }
+
 // Kill ends docker-backend with SIGKILL, as a crash does. Containers keep
 // running. A no-op when the process is not running.
 func (b *Backend) Kill() {

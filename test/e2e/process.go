@@ -124,6 +124,31 @@ func (p *Process) AwaitReady(ready func() bool) {
 	}
 }
 
+// TryAwait is AwaitReady that reports instead of failing: whether the process
+// served, or exited first and with what. EXPERIMENT ONLY.
+func (p *Process) TryAwait(ready func() bool, timeout time.Duration) (served, exited bool, err error) {
+	deadline := time.After(timeout)
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case err := <-p.exited:
+			p.stop()
+			p.cmd, p.stop, p.exited = nil, nil, nil
+			return false, true, err
+		case <-deadline:
+			return false, false, nil
+		case <-poll.C:
+			if ready() {
+				return true, false, nil
+			}
+		}
+	}
+}
+
+// LogTail is the end of the process's log. EXPERIMENT ONLY.
+func (p *Process) LogTail() string { return tail(p.logPath) }
+
 // Stop sends SIGTERM and waits for the process to exit. A no-op when the
 // process is not running.
 func (p *Process) Stop() {

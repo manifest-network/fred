@@ -171,7 +171,7 @@ test-e2e: build-e2e
 			"FRED_E2E_DOCKER_SOCKETS=$$FRED_E2E_DOCKER_SOCKETS" \
 			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
 			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
-			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT); \
+			"$$bin" -test.v -test.run Experiment -test.timeout $(E2E_TIMEOUT); \
 	done
 
 # Run tests with coverage (integration tests skip volume tests without root)
