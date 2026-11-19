@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,37 @@ func (b *Backend) networkNames(leaseUUID string) []string {
 		names[i] = one.Name
 	}
 	return names
+}
+
+// Leftovers names what the host still holds of a lease: its containers and
+// networks on this backend's daemon, and its volume directories under either
+// name. A failed listing reads as a leftover, so a caller waiting for none
+// keeps waiting.
+func (b *Backend) Leftovers(leaseUUID string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var left []string
+	containers, err := b.docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
+	})
+	if err != nil {
+		left = append(left, "containers: "+err.Error())
+	}
+	for _, one := range containers {
+		left = append(left, "container "+strings.Join(one.Names, ","))
+	}
+	for _, name := range b.networkNames(leaseUUID) {
+		left = append(left, "network "+name)
+	}
+	volumes, err := filepath.Glob(filepath.Join(b.VolumePath, "*"+leaseUUID+"*"))
+	if err != nil {
+		left = append(left, "volumes: "+err.Error())
+	}
+	for _, path := range volumes {
+		left = append(left, "volume "+path)
+	}
+	return left
 }
 
 // removeDockerResources removes the containers, image-inspection helpers and

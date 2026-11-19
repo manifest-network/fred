@@ -69,6 +69,13 @@ type Provider struct {
 // suite. Cleanup stops providerd first, then the backends, then the chain.
 func StartProvider(t *testing.T, backends int) *Provider {
 	t.Helper()
+	return StartProviderWith(t, backends, nil)
+}
+
+// StartProviderWith is StartProvider with docker-backend settings of the
+// test's own, given to every backend (see e2e.StartBackendFor).
+func StartProviderWith(t *testing.T, backends int, backendSettings map[string]any) *Provider {
+	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and runs the binaries as a service account")
 	}
@@ -109,7 +116,7 @@ func StartProvider(t *testing.T, backends int) *Provider {
 		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
 		// The backend's own client creates leases for this provider, as
 		// providerd does.
-		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served))
+		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served, backendSettings))
 	}
 
 	// providerd gets its own directory and its own copy of the keyring, both
@@ -192,6 +199,13 @@ func (p *Provider) Start() {
 func (p *Provider) Stop() {
 	p.t.Helper()
 	p.process.Stop()
+}
+
+// Kill ends providerd with SIGKILL, as a crash does. A no-op when it is not
+// running.
+func (p *Provider) Kill() {
+	p.t.Helper()
+	p.process.Kill()
 }
 
 // Host returns the backend that reports the lease, and fails the test unless

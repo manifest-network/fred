@@ -37,7 +37,8 @@ type Process struct {
 	logPath  string
 	coverDir string
 
-	// stop and exited are nil while the process is not running.
+	// cmd, stop and exited are nil while the process is not running.
+	cmd    *exec.Cmd
 	stop   context.CancelFunc
 	exited chan error
 }
@@ -87,7 +88,7 @@ func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() 
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
-	p.stop, p.exited = cancel, exited
+	p.cmd, p.stop, p.exited = cmd, cancel, exited
 
 	deadline := time.After(startTimeout)
 	poll := time.NewTicker(200 * time.Millisecond)
@@ -95,7 +96,7 @@ func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() 
 	for {
 		select {
 		case err := <-exited:
-			p.stop, p.exited = nil, nil
+			p.cmd, p.stop, p.exited = nil, nil, nil
 			cancel()
 			p.t.Fatalf("%s exited during startup: %v\n%s", p.name, err, tail(p.logPath))
 		case <-deadline:
@@ -117,10 +118,24 @@ func (p *Process) Stop() {
 	}
 	p.stop()
 	err := <-p.exited
-	p.stop, p.exited = nil, nil
+	p.cmd, p.stop, p.exited = nil, nil, nil
 	// exec reports a zero exit after the cancel signal as the context's
 	// error. Anything else is the process's own failure.
 	assert.ErrorIs(p.t, err, context.Canceled, "%s did not shut down cleanly", p.name)
+}
+
+// Kill ends the process with SIGKILL, as a crash does: it gets no chance to
+// finish, record or release anything. A no-op when the process is not
+// running.
+func (p *Process) Kill() {
+	p.t.Helper()
+	if p.stop == nil {
+		return
+	}
+	require.NoError(p.t, p.cmd.Process.Kill(), "kill %s", p.name)
+	<-p.exited
+	p.stop()
+	p.cmd, p.stop, p.exited = nil, nil, nil
 }
 
 // LogOnFailure attaches the end of the process's log to a failed test.
