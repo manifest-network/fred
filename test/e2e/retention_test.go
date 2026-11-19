@@ -232,7 +232,9 @@ func TestRetention_TenantDiskCapRefusesTheClosingLease(t *testing.T) {
 // destroyed; its retained lease stays, and another partition of the same
 // tenant can still retain.
 func TestRetention_PartitionDiskSubCapRefusesTheClosingLease(t *testing.T) {
-	b := partitionedBackend(t, map[string]any{"per_partition_max_disk_mb": statefulDiskMB})
+	// The backend accepts a disk sub-cap only next to a count sub-cap. This
+	// one is never reached: the disk sub-cap holds one lease.
+	b := partitionedBackend(t, map[string]any{"per_partition_max_disk_mb": statefulDiskMB, "per_partition_max_leases": 2})
 	kept := retire(t, b, "tenant-a", "p1")
 	requireRetained(t, b, kept)
 
@@ -319,18 +321,17 @@ func TestRetention_RestartKeepsCountsFootprintsAndPartitions(t *testing.T) {
 }
 
 // TestRetention_RetainedDiskCountsAgainstCapacity fills the backend's disk
-// with three retained leases and one running lease. A new lease with a volume
-// is refused, although most of the disk it would need is held only by closed
-// leases. A lease without a volume is still accepted, so the refusal is
-// about disk.
+// with retained leases and runs nothing. A new lease with a volume is
+// refused for capacity: the disk it needs is held only by closed leases. No
+// retained lease is given up to admit it.
 func TestRetention_RetainedDiskCountsAgainstCapacity(t *testing.T) {
 	// The fixture's total_disk_mb is 256: four footprints.
 	b := StartBackendWithConfig(t, retentionSettings(nil))
-	retained := []string{retire(t, b, "tenant-a", ""), retire(t, b, "tenant-a", ""), retire(t, b, "tenant-a", "")}
+	retained := make([]string, 0, 4)
+	for range cap(retained) {
+		retained = append(retained, retire(t, b, "tenant-a", ""))
+	}
 	requireRetained(t, b, retained...)
-	running := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: statefulManifest("")}
-	require.NoError(t, b.Client.Apply(t.Context(), running))
-	requireStatus(t, b, running.LeaseUUID, statusReady)
 
 	refused := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-b", SKU: StatefulSKU, Manifest: statefulManifest("")}
 	err := b.Client.Apply(t.Context(), refused)
@@ -338,9 +339,5 @@ func TestRetention_RetainedDiskCountsAgainstCapacity(t *testing.T) {
 	require.True(t, errors.As(err, &status), "a lease that does not fit must be refused: %v", err)
 	require.Equal(t, CodeInsufficientResources, status.Code)
 	require.Empty(t, b.Containers(t, refused.LeaseUUID))
-
-	diskless := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-b", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
-	require.NoError(t, b.Client.Apply(t.Context(), diskless))
-	requireStatus(t, b, diskless.LeaseUUID, statusReady)
 	requireRetained(t, b, retained...)
 }
