@@ -24,7 +24,19 @@ const (
 	labelManaged     = "fred.managed"
 	labelLeaseUUID   = "fred.lease_uuid"
 	labelBackendName = "fred.backend_name"
+	// An image-inspection helper carries none of the labels above. The backend
+	// removes it when admission ends, so one is left behind only when the
+	// process dies during admission.
+	labelInspectionSchema  = "fred.inspection.schema"
+	labelInspectionBackend = "fred.inspection.backend"
 )
+
+// containerKinds lists the kinds of container docker-backend creates: the
+// label filter that selects a kind, and the label that names its backend.
+var containerKinds = []struct{ selector, backendLabel string }{
+	{labelManaged + "=true", labelBackendName},
+	{labelInspectionSchema, labelInspectionBackend},
+}
 
 // newDockerClient connects to the daemon the backends use.
 func newDockerClient() (*client.Client, error) {
@@ -89,8 +101,9 @@ func Exec(t *testing.T, containerID string, cmd ...string) string {
 	return output.String()
 }
 
-// removeDockerResources removes the containers and networks of every backend
-// whose name match accepts, with the containers' anonymous volumes.
+// removeDockerResources removes the containers, image-inspection helpers and
+// networks of every backend whose name match accepts, with the containers'
+// anonymous volumes.
 func removeDockerResources(t *testing.T, docker *client.Client, match func(backendName string) bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -101,21 +114,26 @@ func removeDockerResources(t *testing.T, docker *client.Client, match func(backe
 }
 
 func sweepDockerResources(ctx context.Context, docker *client.Client, match func(backendName string) bool) error {
-	managed := filters.NewArgs(filters.Arg("label", labelManaged+"=true"))
 	var failures []error
-	containers, err := docker.ContainerList(ctx, container.ListOptions{All: true, Filters: managed})
-	if err != nil {
-		return err
-	}
-	for _, one := range containers {
-		if !match(one.Labels[labelBackendName]) {
-			continue
-		}
-		err := docker.ContainerRemove(ctx, one.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	for _, kind := range containerKinds {
+		containers, err := docker.ContainerList(ctx, container.ListOptions{
+			All:     true,
+			Filters: filters.NewArgs(filters.Arg("label", kind.selector)),
+		})
 		if err != nil {
-			failures = append(failures, err)
+			return errors.Join(append(failures, err)...)
+		}
+		for _, one := range containers {
+			if !match(one.Labels[kind.backendLabel]) {
+				continue
+			}
+			err := docker.ContainerRemove(ctx, one.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+			if err != nil {
+				failures = append(failures, err)
+			}
 		}
 	}
+	managed := filters.NewArgs(filters.Arg("label", labelManaged+"=true"))
 	networks, err := docker.NetworkList(ctx, network.ListOptions{Filters: managed})
 	if err != nil {
 		return errors.Join(append(failures, err)...)
