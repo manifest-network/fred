@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -50,23 +49,22 @@ const (
 	// backend labels its containers and networks with its configured name.
 	backendNamePrefix = "e2e-"
 
-	// The account docker-backend runs as, standing in for the service account
-	// of the production unit, and the ambient capabilities that unit grants
+	// The ambient capabilities the production unit grants docker-backend
 	// (DEPLOYMENT.md).
-	backendUID     = 65534
-	backendGID     = 65534
 	productionCaps = "cap_chown,cap_dac_override,cap_fowner,cap_sys_admin"
 
 	clientCertName = "providerd"
 	dockerSocket   = "/var/run/docker.sock"
-
-	// startTimeout covers recovery before the listener binds; the backend's
-	// own startup budget is 30 seconds.
-	startTimeout = 90 * time.Second
-	// shutdownGrace is how long a SIGTERM'd backend gets before SIGKILL. Its
-	// own shutdown budget is 75 seconds.
-	shutdownGrace = 100 * time.Second
 )
+
+// SKUs are the SKU UUIDs a backend serves, one per profile.
+type SKUs struct {
+	// Stateless has no disk: its leases own no volume.
+	Stateless string
+	// Stateful has disk: an image VOLUME becomes a quota-capped XFS directory
+	// that outlives the lease as retained data.
+	Stateful string
+}
 
 // Backend is one docker-backend process and everything it needs: an XFS
 // loopback, a storage identity, a listen port, a throwaway CA and a sink for
@@ -81,23 +79,36 @@ type Backend struct {
 	// VolumePath is the backend's volume_data_path on the XFS loopback.
 	VolumePath string
 
+	// What a providerd needs to reach this backend: its base URL, the CA that
+	// signed its server certificate, a client certificate it accepts, and the
+	// key that signs requests and callbacks. The service account can read the
+	// files.
+	URL            string
+	CAFile         string
+	ClientCertFile string
+	ClientKeyFile  string
+	HMACSecret     string
+
 	t         *testing.T
+	process   *Process
 	binary    string
 	config    string
-	logPath   string
-	coverDir  string
 	dockerGID uint32
 	healthURL string
-
-	// stop and exited are nil while the process is not running.
-	stop   context.CancelFunc
-	exited chan error
 }
 
-// StartBackend seals a fresh storage identity and starts docker-backend on it.
-// It skips the test when the host cannot run the suite. Cleanup stops the
-// process, removes its Docker resources and unmounts its storage.
+// StartBackend starts a backend serving StatelessSKU and StatefulSKU, for
+// tests that drive the backend themselves.
 func StartBackend(t *testing.T) *Backend {
+	t.Helper()
+	return StartBackendWithSKUs(t, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
+}
+
+// StartBackendWithSKUs seals a fresh storage identity and starts
+// docker-backend on it, serving the given SKUs. It skips the test when the
+// host cannot run the suite. Cleanup stops the process, removes its Docker
+// resources and unmounts its storage.
+func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -128,32 +139,30 @@ func StartBackend(t *testing.T) *Backend {
 	b.VolumePath = filepath.Join(mount, "volumes")
 	state := t.TempDir()
 	b.config = filepath.Join(state, "docker-backend.yaml")
-	b.logPath = filepath.Join(dirFromEnv(t, LogDirEnv), b.Name+".log")
-	b.coverDir = filepath.Join(dirFromEnv(t, CoverDirEnv), b.Name)
-	for _, dir := range []string{b.VolumePath, b.coverDir} {
-		require.NoError(t, os.MkdirAll(dir, 0o700))
-	}
-	// The backend creates its stores, volumes and coverage data as its own
-	// account.
-	for _, dir := range []string{state, b.VolumePath, b.coverDir} {
-		require.NoError(t, os.Chown(dir, backendUID, backendGID))
-	}
+	b.process = NewProcess(t, b.Name)
+	require.NoError(t, os.MkdirAll(b.VolumePath, 0o700))
+	// The backend creates its stores and volumes as its own account.
+	GiveToServiceAccount(t, state, b.VolumePath)
 
 	ca := newCertAuthority(t)
 	serverCert, serverKey := ca.issue(t, state, "server", "docker-backend", true)
-	listenAddr := freeLoopbackAddr(t)
-	b.healthURL = "https://" + listenAddr + "/health"
+	b.CAFile = ca.certFile
+	b.ClientCertFile, b.ClientKeyFile = ca.issue(t, state, "client", clientCertName, false)
+	listenAddr := FreeLoopbackAddr(t)
+	b.URL = "https://" + listenAddr
+	b.healthURL = b.URL + "/health"
 
 	// One key signs requests in both directions, as callback_secret does in
 	// production.
 	secret := randomHex(t, 32)
+	b.HMACSecret = secret
 	sink := httptest.NewServer(acknowledgeCallbacks(secret))
 	t.Cleanup(sink.Close)
 	callbacks, err := placement.NewCallbackRouteFactory(sink.URL)
 	require.NoError(t, err)
 	b.Client = &Client{
 		http:      &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},
-		baseURL:   "https://" + listenAddr,
+		baseURL:   b.URL,
 		secret:    secret,
 		callbacks: callbacks,
 	}
@@ -172,8 +181,8 @@ func StartBackend(t *testing.T) *Backend {
 		// The loopback is far smaller than the production free-space floor.
 		"image_disk_min_free_mb": 1,
 		"sku_mapping": map[string]string{
-			StatelessSKU: "e2e-stateless",
-			StatefulSKU:  "e2e-stateful",
+			skus.Stateless: "e2e-stateless",
+			skus.Stateful:  "e2e-stateful",
 		},
 		"sku_profiles": map[string]any{
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
@@ -204,14 +213,12 @@ func StartBackend(t *testing.T) *Backend {
 	encoded, err := yaml.Marshal(config)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(b.config, encoded, 0o600))
-	require.NoError(t, os.Chown(b.config, backendUID, backendGID))
+	GiveToServiceAccount(t, b.config)
 
 	t.Cleanup(func() {
 		b.Stop()
 		removeDockerResources(t, docker, func(name string) bool { return name == b.Name })
-		if t.Failed() {
-			t.Logf("docker-backend log (%s):\n%s", b.logPath, tail(b.logPath))
-		}
+		b.process.LogOnFailure()
 	})
 
 	// Normal startup only verifies a storage identity: a new backend is sealed
@@ -228,46 +235,16 @@ func StartBackend(t *testing.T) *Backend {
 // serves. StartBackend calls it; a test calls it again after Stop.
 func (b *Backend) Start() {
 	b.t.Helper()
-	require.Nil(b.t, b.stop, "docker-backend is already running")
-
-	// World-readable: CI uploads the log as the unprivileged runner account.
-	logFile, err := os.OpenFile(b.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644) //nolint:gosec // G302, G304: a test log at a fixture-built path
-	require.NoError(b.t, err)
-	defer func() { _ = logFile.Close() }()
-
-	// Not the test's context: that one is canceled before cleanup runs, and
-	// the process must outlive the test body until Stop.
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := b.command(ctx, "-config", b.config)
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = shutdownGrace
-	if err := cmd.Start(); err != nil {
-		cancel()
-		require.NoError(b.t, err)
-	}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-	b.stop, b.exited = cancel, exited
-
-	deadline := time.After(startTimeout)
-	poll := time.NewTicker(200 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		select {
-		case err := <-exited:
-			b.stop, b.exited = nil, nil
-			cancel()
-			b.t.Fatalf("docker-backend exited during startup: %v\n%s", err, tail(b.logPath))
-		case <-deadline:
-			b.t.Fatalf("docker-backend did not serve %s within %s\n%s", b.healthURL, startTimeout, tail(b.logPath))
-		case <-poll.C:
-			if id, ok := b.servingIdentity(); ok {
+	b.process.Start(
+		func(ctx context.Context) *exec.Cmd { return b.command(ctx, "-config", b.config) },
+		func() bool {
+			id, ok := b.servingIdentity()
+			if ok {
 				b.Client.storageID = id
-				return
 			}
-		}
-	}
+			return ok
+		},
+	)
 }
 
 // Stop sends SIGTERM and waits for docker-backend to exit. Containers keep
@@ -275,15 +252,7 @@ func (b *Backend) Start() {
 // is not running.
 func (b *Backend) Stop() {
 	b.t.Helper()
-	if b.stop == nil {
-		return
-	}
-	b.stop()
-	err := <-b.exited
-	b.stop, b.exited = nil, nil
-	// exec reports a zero exit after the cancel signal as the context's
-	// error. Anything else is the process's own failure.
-	assert.ErrorIs(b.t, err, context.Canceled, "docker-backend did not shut down cleanly")
+	b.process.Stop()
 }
 
 // command runs the binary as the backend account with the production
@@ -295,17 +264,15 @@ func (b *Backend) command(ctx context.Context, args ...string) *exec.Cmd {
 	argv := []string{
 		"--caps=" + productionCaps + "+eip cap_setpcap,cap_setuid,cap_setgid+ep",
 		"--keep=1",
-		fmt.Sprintf("--gid=%d", backendGID),
+		fmt.Sprintf("--gid=%d", serviceGID),
 		// The Docker socket's group, as SupplementaryGroups=docker grants.
 		fmt.Sprintf("--groups=%d", b.dockerGID),
-		fmt.Sprintf("--uid=%d", backendUID),
+		fmt.Sprintf("--uid=%d", serviceUID),
 		"--addamb=" + productionCaps,
 		"--", "-c", `exec "$0" "$@"`, b.binary,
 	}
 	cmd := exec.CommandContext(ctx, "capsh", append(argv, args...)...) //nolint:gosec // G204: the binary under test and fixture-built arguments
-	// Nothing inherited may override the config file (DOCKER_BACKEND_*,
-	// DOCKER_HOST). The backend finds xfs_quota through PATH.
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GOCOVERDIR=" + b.coverDir}
+	cmd.Env = b.process.Env()
 	return cmd
 }
 
@@ -349,12 +316,12 @@ func acknowledgeCallbacks(secret string) http.HandlerFunc {
 	}
 }
 
-// freeLoopbackAddr picks a free loopback port for a process to listen on. The
+// FreeLoopbackAddr picks a free loopback port for a process to listen on. The
 // harness chooses the port because docker-backend cannot report one it chose:
 // it probes its listen address, releases it, binds again after recovery, and
 // logs only the configured value. The port is free when picked, not reserved;
-// a backend that loses it exits at startup and fails the test with its log.
-func freeLoopbackAddr(t *testing.T) string {
+// a process that loses it exits at startup and fails the test with its log.
+func FreeLoopbackAddr(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

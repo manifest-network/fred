@@ -17,6 +17,7 @@ on:
       - "internal/**"
       - "cmd/**"
       - "test/**"
+      - ".manifestd-version"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -33,6 +34,7 @@ on:
       - "internal/**"
       - "cmd/**"
       - "test/**"
+      - ".manifestd-version"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -320,6 +322,35 @@ jobs:
         run: |
           set -o pipefail
           sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m 2>&1 | tee integration.log
+
+      - name: Install the pinned manifestd
+        if: matrix.suite == 'e2e'
+        # The providerd tier runs a real single-node chain. .manifestd-version
+        # pins two artifacts, one per line, as "<name> <release tag> <sha256>":
+        # the manifest-ledger release tarball, and the libwasmvm shared library
+        # that release's binary links against and does not ship.
+        run: |
+          set -euo pipefail
+          pin() {
+            awk -v name="$1" '$1 == name { print $2, $3 }' .manifestd-version
+          }
+          read -r manifestd_version manifestd_sha256 <<<"$(pin manifestd)"
+          read -r libwasmvm_version libwasmvm_sha256 <<<"$(pin libwasmvm)"
+          if [ -z "${manifestd_sha256:-}" ] || [ -z "${libwasmvm_sha256:-}" ]; then
+            echo "::error::.manifestd-version must pin manifestd and libwasmvm, each with a release tag and a SHA-256."
+            exit 1
+          fi
+          cd "$RUNNER_TEMP"
+          tarball="manifest-ledger-${manifestd_version}-linux-amd64.tar.gz"
+          curl -sSfL "https://github.com/manifest-network/manifest-ledger/releases/download/${manifestd_version}/${tarball}" -o "$tarball"
+          curl -sSfL "https://github.com/CosmWasm/wasmvm/releases/download/${libwasmvm_version}/libwasmvm.x86_64.so" -o libwasmvm.x86_64.so
+          printf '%s  %s\n' "$manifestd_sha256" "$tarball" "$libwasmvm_sha256" libwasmvm.x86_64.so | sha256sum -c -
+          mkdir -p manifestd
+          tar -xzf "$tarball" -C manifestd manifestd
+          sudo install -m 0644 libwasmvm.x86_64.so /usr/local/lib/libwasmvm.x86_64.so
+          sudo ldconfig
+          "$RUNNER_TEMP/manifestd/manifestd" version
+          echo "MANIFESTD=$RUNNER_TEMP/manifestd/manifestd" >> "$GITHUB_ENV"
 
       - name: Run e2e suite (built unprivileged, run as root)
         if: matrix.suite == 'e2e'

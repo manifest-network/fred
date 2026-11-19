@@ -50,7 +50,7 @@ func newCertAuthority(t *testing.T) *certAuthority {
 	return ca
 }
 
-// issue writes a leaf certificate and its key into dir, owned by the backend
+// issue writes a leaf certificate and its key into dir, owned by the service
 // account, and returns their paths. A server leaf is valid for 127.0.0.1; a
 // client leaf is identified by its common name.
 func (ca *certAuthority) issue(t *testing.T, dir, file, commonName string, server bool) (certFile, keyFile string) {
@@ -60,9 +60,7 @@ func (ca *certAuthority) issue(t *testing.T, dir, file, commonName string, serve
 	keyFile = filepath.Join(dir, file+"-key.pem")
 	writePEM(t, certFile, "CERTIFICATE", certDER, 0o600)
 	writePEM(t, keyFile, "EC PRIVATE KEY", keyDER, 0o600)
-	for _, path := range []string{certFile, keyFile} {
-		require.NoError(t, os.Chown(path, backendUID, backendGID))
-	}
+	GiveToServiceAccount(t, certFile, keyFile)
 	return certFile, keyFile
 }
 
