@@ -156,14 +156,17 @@ func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 // (ENG-2091).
 func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	b := StartBackend(t)
-	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	// The image sets no user and its volume directories belong to root, so
+	// the backend runs it as root. The redis image would run as its own
+	// account.
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(NestedVolumesImage)}
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	first := requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.Equal(t, "0\n", b.Exec(t, first.ID, "id", "-u"), "the workload must be running as root")
-	source := volumeSource(t, first, "/data")
+	source := volumeSource(t, first, "/data/b")
 	require.Zero(t, ownerUID(t, source), "the volume directory must belong to the container's user")
-	b.Exec(t, first.ID, "touch", "/data/first")
+	b.Exec(t, first.ID, "touch", "/data/b/first")
 	require.FileExists(t, filepath.Join(source, "first"))
 
 	// The workload dies, and the directory is found owned by the backend's
@@ -176,9 +179,9 @@ func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	second := requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.NotEqual(t, first.ID, second.ID)
-	require.Equal(t, source, volumeSource(t, second, "/data"))
+	require.Equal(t, source, volumeSource(t, second, "/data/b"))
 	require.Zero(t, ownerUID(t, source), "the next deploy must hand the directory back to root")
-	b.Exec(t, second.ID, "touch", "/data/second")
+	b.Exec(t, second.ID, "touch", "/data/b/second")
 	require.FileExists(t, filepath.Join(source, "first"), "the data of the first deploy must still be there")
 }
 
