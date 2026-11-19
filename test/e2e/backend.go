@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -54,7 +55,6 @@ const (
 	productionCaps = "cap_chown,cap_dac_override,cap_fowner,cap_sys_admin"
 
 	clientCertName = "providerd"
-	dockerSocket   = "/var/run/docker.sock"
 )
 
 // SKUs are the SKU UUIDs a backend serves, one per profile.
@@ -64,6 +64,9 @@ type SKUs struct {
 	// Stateful has disk: an image VOLUME becomes a quota-capped XFS directory
 	// that outlives the lease as retained data.
 	Stateful string
+	// Pinned, when set, is a second SKU without disk. A provider with several
+	// backends gives each its own, so a test can put a lease on a chosen one.
+	Pinned string
 }
 
 // Backend is one docker-backend process and everything it needs: an XFS
@@ -78,6 +81,8 @@ type Backend struct {
 	Name string
 	// VolumePath is the backend's volume_data_path on the XFS loopback.
 	VolumePath string
+	// SKUs are the SKUs this backend serves.
+	SKUs SKUs
 
 	// What a providerd needs to reach this backend: its base URL, the CA that
 	// signed its server certificate, a client certificate it accepts, and the
@@ -93,22 +98,25 @@ type Backend struct {
 	process   *Process
 	binary    string
 	config    string
+	docker    *client.Client
 	dockerGID uint32
 	healthURL string
 }
 
-// StartBackend starts a backend serving StatelessSKU and StatefulSKU, for
-// tests that drive the backend themselves.
+// StartBackend starts a backend on the first Docker daemon, serving
+// StatelessSKU and StatefulSKU, for tests that drive the backend themselves.
 func StartBackend(t *testing.T) *Backend {
 	t.Helper()
-	return StartBackendWithSKUs(t, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
+	return StartBackendFor(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
 }
 
-// StartBackendWithSKUs seals a fresh storage identity and starts
-// docker-backend on it, serving the given SKUs. It skips the test when the
-// host cannot run the suite. Cleanup stops the process, removes its Docker
-// resources and unmounts its storage.
-func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
+// StartBackendFor seals a fresh storage identity and starts docker-backend
+// on it, on the Docker daemon behind dockerSocket, serving the given SKUs.
+// No other backend may use that daemon. Leases created through the backend's
+// Client belong to the given provider. It skips the test when the host cannot
+// run the suite. Cleanup stops the process, removes its Docker resources and
+// unmounts its storage.
+func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -120,14 +128,16 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 	if _, err := exec.LookPath("capsh"); err != nil {
 		t.Skip("capsh (libcap2-bin) not found:", err)
 	}
-	docker := dockerClient(t)
+	docker := dockerClient(t, dockerSocket)
 	socket, err := os.Stat(dockerSocket)
 	require.NoError(t, err)
 
 	b := &Backend{
 		Name:      backendNamePrefix + randomHex(t, 4),
+		SKUs:      skus,
 		t:         t,
 		binary:    filepath.Join(binDir, "docker-backend"),
+		docker:    docker,
 		dockerGID: socket.Sys().(*syscall.Stat_t).Gid,
 	}
 	_, err = os.Stat(b.binary)
@@ -161,12 +171,17 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 	callbacks, err := placement.NewCallbackRouteFactory(sink.URL)
 	require.NoError(t, err)
 	b.Client = &Client{
-		http:      &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},
-		baseURL:   b.URL,
-		secret:    secret,
-		callbacks: callbacks,
+		http:         &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},
+		baseURL:      b.URL,
+		secret:       secret,
+		providerUUID: providerUUID,
+		callbacks:    callbacks,
 	}
 
+	mapping := map[string]string{skus.Stateless: "e2e-stateless", skus.Stateful: "e2e-stateful"}
+	if skus.Pinned != "" {
+		mapping[skus.Pinned] = "e2e-stateless"
+	}
 	config := map[string]any{
 		"name":                     b.Name,
 		"listen_addr":              listenAddr,
@@ -180,10 +195,7 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 		"total_disk_mb":            256,
 		// The loopback is far smaller than the production free-space floor.
 		"image_disk_min_free_mb": 1,
-		"sku_mapping": map[string]string{
-			skus.Stateless: "e2e-stateless",
-			skus.Stateful:  "e2e-stateful",
-		},
+		"sku_mapping":            mapping,
 		"sku_profiles": map[string]any{
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
 			"e2e-stateful":  map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 64},

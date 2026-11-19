@@ -18,6 +18,7 @@ on:
       - "cmd/**"
       - "test/**"
       - ".manifestd-version"
+      - "scripts/e2e-second-dockerd.sh"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -35,6 +36,7 @@ on:
       - "cmd/**"
       - "test/**"
       - ".manifestd-version"
+      - "scripts/e2e-second-dockerd.sh"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -261,6 +263,17 @@ jobs:
           username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ env.DOCKERHUB_TOKEN }}
 
+      - name: Start a second Docker daemon
+        if: matrix.suite == 'e2e'
+        # A docker-backend needs a Docker daemon to itself, so the two-backend
+        # tests need two. The script gives the second the system daemon's
+        # image store settings and nothing else of it.
+        run: |
+          set -euo pipefail
+          second="$(sudo scripts/e2e-second-dockerd.sh start)"
+          docker --host "unix://$second" info --format 'second daemon: driver={{.Driver}} root={{.DockerRootDir}} version={{.ServerVersion}}'
+          echo "FRED_E2E_DOCKER_SOCKETS=/var/run/docker.sock,$second" >> "$GITHUB_ENV"
+
       - name: Pre-pull workload images
         # Warm the shared daemon cache and surface any pull/rate-limit failure
         # clearly here rather than mid-suite. (The negative-path test image — a
@@ -279,14 +292,18 @@ jobs:
               images="busybox:latest alpine:latest redis:7 redis:7-alpine"
               ;;
           esac
-          for img in $images; do
-            ok=0
-            for attempt in 1 2 3; do
-              if docker pull "$img"; then ok=1; break; fi
-              echo "pull $img failed (attempt $attempt/3), retrying in 10s..."
-              sleep 10
+          # Every daemon the suite uses has its own image store.
+          sockets="${FRED_E2E_DOCKER_SOCKETS:-/var/run/docker.sock}"
+          for socket in ${sockets//,/ }; do
+            for img in $images; do
+              ok=0
+              for attempt in 1 2 3; do
+                if docker --host "unix://$socket" pull "$img"; then ok=1; break; fi
+                echo "pull $img at $socket failed (attempt $attempt/3), retrying in 10s..."
+                sleep 10
+              done
+              if [ "$ok" -ne 1 ]; then echo "::error::failed to pull $img at $socket after 3 attempts"; exit 1; fi
             done
-            if [ "$ok" -ne 1 ]; then echo "::error::failed to pull $img after 3 attempts"; exit 1; fi
           done
 
       - name: Declare the image data path
@@ -380,6 +397,12 @@ jobs:
             echo "::error::No integration tests executed (0 PASS lines) — check the build tag / -run pattern."
             exit 1
           fi
+
+      - name: Collect the second Docker daemon's log
+        if: failure() && matrix.suite == 'e2e'
+        run: |
+          mkdir -p build/e2e/logs
+          sudo journalctl --no-pager -u fred-e2e-docker-2 > build/e2e/logs/dockerd-2.log 2>&1 || true
 
       - name: Upload e2e process logs
         if: failure() && matrix.suite == 'e2e'
