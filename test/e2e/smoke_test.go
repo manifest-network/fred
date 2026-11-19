@@ -70,7 +70,7 @@ func requireOneRunningContainer(t *testing.T, leaseUUID string) container.Inspec
 func TestBackend_Lifecycle(t *testing.T) {
 	b := StartBackend(t)
 	ctx := t.Context()
-	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper("busybox:latest")}
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
 
 	require.NoError(t, b.Client.Apply(ctx, lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
@@ -94,9 +94,9 @@ func TestBackend_Lifecycle(t *testing.T) {
 func TestBackend_RetainAndRestore(t *testing.T) {
 	b := StartBackend(t)
 	ctx := t.Context()
-	// redis:7 declares VOLUME /data, which a stateful SKU backs with a
+	// The image declares VOLUME /data, which a stateful SKU backs with a
 	// quota-capped directory on the backend's XFS volume path.
-	source := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper("redis:7")}
+	source := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
 
 	require.NoError(t, b.Client.Apply(ctx, source))
 	requireStatus(t, b, source.LeaseUUID, statusReady)
@@ -126,7 +126,7 @@ func TestBackend_RetainAndRestore(t *testing.T) {
 func TestBackend_GracefulRestartKeepsLease(t *testing.T) {
 	b := StartBackend(t)
 	ctx := t.Context()
-	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper("busybox:latest")}
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
 
 	require.NoError(t, b.Client.Apply(ctx, lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)

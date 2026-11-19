@@ -168,6 +168,7 @@ Run it as yourself. The target builds the binaries and the test binary unprivile
 
 - The suite uses the `integration` build tag and no `-run` filter, so every test in the package runs. A test whose prerequisite is missing skips, and CI fails on any skip.
 - Run one e2e test binary at a time per Docker daemon. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*`, and every mount under `$TMPDIR/fred-e2e`.
+- Workload images are pinned by digest (`BusyboxImage`, `RedisImage` in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
 - The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). A new feature adds a test, not harness code, and production code carries no hook for the suite.
 
 CI runs it in `integration.yml` as the `e2e (root, <image store>)` jobs, beside the in-process suite, and the release workflow gates on both. Changes under `test/**` trigger that workflow.
