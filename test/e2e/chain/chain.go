@@ -45,15 +45,18 @@ type Chain struct {
 	ID string
 
 	bin, home, rpc, grpc string
+	// started is set once the node is about to run, which ends genesis
+	// preparation.
+	started bool
 }
 
 // Genesis is a chain before its first block: the only time accounts can be
 // created with a balance and the genesis document can be edited. Start hands
 // one to its prepare function and seals it when that function returns, so a
-// change that could no longer reach the running node fails the test.
+// change that could no longer reach the running node fails the test. The
+// seal is the chain's own state, so a copy of the handle is sealed with it.
 type Genesis struct {
-	chain  *Chain
-	sealed bool
+	chain *Chain
 }
 
 // Key is a key in the chain's test keyring.
@@ -91,9 +94,8 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	c.run(t, "testnet", "init-files", "--chain-id", c.ID, "--output-dir", dir, "--v", "1",
 		"--keyring-backend", "test", "--commit-timeout", "500ms", "--minimum-gas-prices", "0umfx")
 	c.home = filepath.Join(dir, validatorKey, "manifestd")
-	genesis := &Genesis{chain: c}
-	prepare(genesis)
-	genesis.sealed = true
+	prepare(&Genesis{chain: c})
+	c.started = true
 
 	logDir := dir
 	if fromEnv := os.Getenv(logDirEnv); fromEnv != "" {
@@ -145,21 +147,21 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 }
 
 // AddKey creates a key in the chain's keyring.
-func (g *Genesis) AddKey(t *testing.T, name string) Key {
+func (g Genesis) AddKey(t *testing.T, name string) Key {
 	t.Helper()
 	g.requireOpen(t)
 	return g.chain.AddKey(t, name)
 }
 
 // AddAccount gives an address an account and a balance.
-func (g *Genesis) AddAccount(t *testing.T, address, coins string) {
+func (g Genesis) AddAccount(t *testing.T, address, coins string) {
 	t.Helper()
 	g.requireOpen(t)
 	g.chain.run(t, "genesis", "add-genesis-account", address, coins, "--home", g.chain.home, "--keyring-backend", "test")
 }
 
 // Edit applies edit to the genesis document.
-func (g *Genesis) Edit(t *testing.T, edit func(document map[string]any)) {
+func (g Genesis) Edit(t *testing.T, edit func(document map[string]any)) {
 	t.Helper()
 	g.requireOpen(t)
 	path := filepath.Join(g.chain.home, "config", "genesis.json")
@@ -180,12 +182,15 @@ func (g *Genesis) Edit(t *testing.T, edit func(document map[string]any)) {
 	}
 }
 
-func (g *Genesis) requireOpen(t *testing.T) {
+func (g Genesis) requireOpen(t *testing.T) {
 	t.Helper()
-	if g.sealed {
+	if g.sealed() {
 		t.Fatal("the genesis was used after the chain started: the change would not reach the running node")
 	}
 }
+
+// sealed reports whether the chain has started.
+func (g Genesis) sealed() bool { return g.chain.started }
 
 // Home is the node's home directory. Its keyring-test subdirectory is the
 // keyring every key of this chain lives in.
