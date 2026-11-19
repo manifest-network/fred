@@ -80,3 +80,55 @@ func TestStaleCommand_NeverStartsTheOlderWorkload(t *testing.T) {
 	require.Equal(t, []string{"sleep", "10800"}, command(restored), "the lease must return on the newer workload")
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 }
+
+// TestReplayedCommand_AcrossABackendRestartChangesNothing delivers a restart
+// to the backend a second time, after the restart was carried out and the
+// backend itself was restarted. The command was already done: nothing may be
+// started for it, and the lease keeps its container, its data and its quota.
+func TestReplayedCommand_AcrossABackendRestartChangesNothing(t *testing.T) {
+	p, backend, link, tenant := lossy(t)
+	stateful := map[string]any{"image": e2e.RedisImage, "command": []string{"sleep", "3600"}}
+	lease := deployActive(t, p, tenant, p.SKUs.Stateful, stateful)
+	first := running(t, backend, lease)
+	backend.Exec(t, first.ID, "sh", "-c", "echo kept > /data/sentinel")
+
+	tenant.Restart(t, lease)
+	restarted := replaced(t, backend, lease, first)
+	data := dataDir(t, restarted)
+	directory, project := inode(t, data), e2e.ProjectID(t, data)
+	command := link.Sent(t, "restart")
+
+	backend.Stop()
+	backend.Start()
+	resent := time.Now()
+	status := command.Resend(t)
+	requireNoStart(t, backend, lease, resent, "the backend answered the replayed restart "+strconv.Itoa(status)+" and started a container")
+
+	requireStatus(t, backend, lease, "ready")
+	requireUntouched(t, backend, lease, restarted)
+	require.Equal(t, "kept\n", backend.Exec(t, restarted.ID, "cat", "/data/sentinel"))
+	require.Equal(t, directory, inode(t, data), "the volume must be the same directory")
+	require.Equal(t, project, e2e.ProjectID(t, data), "the volume must keep its project")
+	require.Equal(t, 1, backend.QuotaEntries(t), "one volume, one quota entry")
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
+}
+
+// TestRestart_AfterABackendRestart restarts a lease after its backend was
+// restarted: what the backend keeps about a lease across its own restart
+// must be enough to restart the lease.
+func TestRestart_AfterABackendRestart(t *testing.T) {
+	p := StartProvider(t, 1)
+	backend, tenant := p.Backends[0], p.NewTenant(t)
+	lease := deployActive(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
+	first := running(t, backend, lease)
+
+	backend.Stop()
+	backend.Start()
+	requireStatus(t, backend, lease, "ready")
+	requireUntouched(t, backend, lease, first)
+
+	tenant.Restart(t, lease)
+	restarted := replaced(t, backend, lease, first)
+	require.Equal(t, command(first), command(restarted))
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
+}
