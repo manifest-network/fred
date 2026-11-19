@@ -3,9 +3,12 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -33,8 +36,21 @@ type Link struct {
 	// CAFile is the authority the caller must trust for URL.
 	CAFile string
 
+	target    *url.URL
+	transport http.RoundTripper
+
 	mu   sync.Mutex
 	lose *LostResponse
+	sent map[string]Command
+}
+
+// Command is one request a caller sent through a Link, kept as it was sent.
+type Command struct {
+	link   *Link
+	method string
+	uri    string
+	header http.Header
+	body   []byte
 }
 
 // LostResponse is one response a Link was asked to lose.
@@ -65,14 +81,14 @@ func StartLink(t *testing.T, b *Backend) *Link {
 	clientCert, err := tls.LoadX509KeyPair(b.ClientCertFile, b.ClientKeyFile)
 	require.NoError(t, err)
 
-	link := &Link{}
+	link := &Link{target: target, sent: map[string]Command{}, transport: &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		RootCAs:      roots,
+		Certificates: []tls.Certificate{clientCert},
+	}}}
 	proxy := &httputil.ReverseProxy{
-		Rewrite: func(r *httputil.ProxyRequest) { r.SetURL(target) },
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS13,
-			RootCAs:      roots,
-			Certificates: []tls.Certificate{clientCert},
-		}},
+		Rewrite:        func(r *httputil.ProxyRequest) { r.SetURL(target) },
+		Transport:      link.transport,
 		ModifyResponse: link.intercept,
 		ErrorHandler: func(_ http.ResponseWriter, _ *http.Request, _ error) {
 			// A lost response, or a backend that cannot be reached: either
@@ -85,7 +101,12 @@ func StartLink(t *testing.T, b *Backend) *Link {
 	certDER, keyDER := ca.sign(t, "docker-backend", true)
 	key, err := x509.ParseECPrivateKey(keyDER)
 	require.NoError(t, err)
-	server := httptest.NewUnstartedServer(proxy)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !link.record(r) {
+			panic(http.ErrAbortHandler)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
 	server.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{{Certificate: [][]byte{certDER}, PrivateKey: key}},
@@ -141,4 +162,50 @@ func (r *LostResponse) Require(t *testing.T) {
 		t.Fatalf("the backend never answered a %s for the link to lose", r.operation)
 	}
 	require.True(t, r.reached, "the %s had not settled on the backend when its response was lost", r.operation)
+}
+
+// record keeps a copy of a command on its way to the backend, under the last
+// element of its path. It reports false when the command cannot be read.
+func (l *Link) record(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return true
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	operation := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sent[operation] = Command{link: l, method: r.Method, uri: r.URL.RequestURI(), header: r.Header.Clone(), body: body}
+	return true
+}
+
+// Sent returns the last command of an operation that went through the link,
+// named as in LoseResponse.
+func (l *Link) Sent(t *testing.T, operation string) Command {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	command, sent := l.sent[operation]
+	require.True(t, sent, "no %s went through the link", operation)
+	return command
+}
+
+// Resend delivers the command to the backend once more, byte for byte, as a
+// network that duplicates or delays a request would. It returns the status
+// the backend answers with.
+func (c Command) Resend(t *testing.T) int {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, c.method, c.link.target.String()+c.uri, bytes.NewReader(c.body))
+	require.NoError(t, err)
+	request.Header = c.header.Clone()
+	response, err := c.link.transport.RoundTrip(request)
+	require.NoError(t, err)
+	defer func() { _ = response.Body.Close() }()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return response.StatusCode
 }

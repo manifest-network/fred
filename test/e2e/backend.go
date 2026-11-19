@@ -263,16 +263,32 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 // serves. StartBackend calls it; a test calls it again after Stop.
 func (b *Backend) Start() {
 	b.t.Helper()
-	b.process.Start(
-		func(ctx context.Context) *exec.Cmd { return b.command(ctx, "-config", b.config) },
-		func() bool {
-			id, ok := b.servingIdentity()
-			if ok {
-				b.Client.storageID = id
-			}
-			return ok
-		},
-	)
+	b.Launch()
+	b.AwaitServing()
+}
+
+// Launch runs docker-backend and does not wait for it to serve. A test that
+// has something to do while the backend recovers follows it with
+// AwaitServing.
+func (b *Backend) Launch() {
+	b.t.Helper()
+	b.process.Launch(func(ctx context.Context) *exec.Cmd { return b.command(ctx, "-config", b.config) })
+}
+
+// AwaitServing waits until a launched docker-backend serves.
+func (b *Backend) AwaitServing() {
+	b.t.Helper()
+	b.process.AwaitReady(b.Serving)
+}
+
+// Serving reports whether docker-backend answers its health check. It never
+// fails the test.
+func (b *Backend) Serving() bool {
+	id, ok := b.servingIdentity()
+	if ok {
+		b.Client.storageID = id
+	}
+	return ok
 }
 
 // Stop sends SIGTERM and waits for docker-backend to exit. Containers keep

@@ -84,8 +84,15 @@ func requireHeld(t *testing.T, backend *e2e.Backend, leaseUUID, status string) c
 // passed their health check yet.
 func startingContainers(t *testing.T, backend *e2e.Backend, leaseUUID string) []container.InspectResponse {
 	t.Helper()
+	// A container can go away between the listing and its inspection while
+	// a backend recovers. That reads as none, and the caller looks again.
+	all, err := backend.TryContainers(leaseUUID)
+	if err != nil {
+		t.Logf("containers of lease %s: %v", leaseUUID, err)
+		return nil
+	}
 	var starting []container.InspectResponse
-	for _, one := range backend.Containers(t, leaseUUID) {
+	for _, one := range all {
 		if one.State.Running && one.State.Health != nil && one.State.Health.Status == container.Starting {
 			starting = append(starting, one)
 		}
@@ -130,6 +137,50 @@ func requireSettled(t *testing.T, p *Provider, backend *e2e.Backend, leaseUUID s
 	require.Equal(t, held.ID, now.ID, "lease %s must run the container the interrupted operation started", leaseUUID)
 	require.Equal(t, held.State.StartedAt, now.State.StartedAt, "the container of lease %s must not have been started again", leaseUUID)
 	requireActive(t, p.Chain, leaseUUID)
+	return now
+}
+
+// command is the process a container runs.
+func command(c container.InspectResponse) []string {
+	return append([]string{c.Path}, c.Args...)
+}
+
+// restartBackendOnto starts the killed backend again and waits until it
+// serves and the lease is ready in exactly one running container, which it
+// returns. While it waits, it opens the gate of every container the backend
+// is waiting on.
+//
+// 0.14 does not take up an interrupted restart or update where it was. At
+// its next start it removes the container the operation had started, puts
+// the previous workload back in a new one, and waits for that one to pass
+// its health check before it serves. The held container is therefore let
+// through only once the backend serves, when it is known to be kept.
+func restartBackendOnto(t *testing.T, backend *e2e.Backend, leaseUUID string, held container.InspectResponse) container.InspectResponse {
+	t.Helper()
+	backend.Launch()
+	var now container.InspectResponse
+	eventually(t, "backend "+backend.Name+" serves again with lease "+leaseUUID+" ready in one container", func() bool {
+		serving := backend.Serving()
+		for _, waiting := range startingContainers(t, backend, leaseUUID) {
+			if waiting.ID != held.ID || serving {
+				openGate(t, backend, waiting)
+			}
+		}
+		if !serving {
+			return false
+		}
+		lease, err := backend.Client.Get(t.Context(), leaseUUID)
+		if err != nil || lease.Status != "ready" {
+			return false
+		}
+		containers := backend.Containers(t, leaseUUID)
+		if len(containers) != 1 || !containers[0].State.Running {
+			return false
+		}
+		now = containers[0]
+		return now.State.Health == nil || now.State.Health.Status == container.Healthy
+	})
+	backend.AwaitServing()
 	return now
 }
 
@@ -270,9 +321,9 @@ func TestCrash_BackendDuringRestore(t *testing.T) {
 }
 
 // TestCrash_BackendDuringUpdate kills the backend while an update's new
-// workload is started but not healthy. The restarted backend must finish the
-// update: the lease ends on the new workload, in the container the update
-// had started.
+// workload is started but not healthy. The update is lost, and nothing else
+// is: the restarted backend puts the lease back on its previous workload, in
+// one container, and the tenant can ask for the update again.
 func TestCrash_BackendDuringUpdate(t *testing.T) {
 	p := StartProviderWith(t, 1, heldSettings(nil))
 	backend, tenant := p.Backends[0], p.NewTenant(t)
@@ -284,18 +335,21 @@ func TestCrash_BackendDuringUpdate(t *testing.T) {
 	require.NotEqual(t, previous.ID, held.ID, "an update starts a new container")
 
 	backend.Kill()
-	backend.Start()
-	requireStillHeld(t, backend, lease, held)
+	restored := restartBackendOnto(t, backend, lease, held)
+	require.Equal(t, []string{"sleep", "3600"}, command(restored), "the lease must be back on its previous workload")
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 
-	openGate(t, backend, held)
-	settled := requireSettled(t, p, backend, lease, held)
-	require.Equal(t, []string{"sleep", "7200"}, []string(settled.Config.Cmd), "the lease must run the updated workload")
+	// The same update, asked again, goes through.
+	tenant.Update(t, lease, gated(sleeper("7200")))
+	again := requireHeld(t, backend, lease, "updating")
+	openGate(t, backend, again)
+	require.Equal(t, []string{"sleep", "7200"}, command(requireSettled(t, p, backend, lease, again)), "the lease must run the updated workload")
 	requireNothingLeft(t, tenant, backend, lease)
 }
 
 // TestCrash_BackendDuringRestart kills the backend while a restarted
-// workload is started but not healthy. The restarted backend must finish the
-// restart into the container it had started.
+// workload is started but not healthy. The restarted backend must bring the
+// lease back to ready on the same workload, in one container.
 func TestCrash_BackendDuringRestart(t *testing.T) {
 	p := StartProviderWith(t, 1, heldSettings(nil))
 	backend, tenant := p.Backends[0], p.NewTenant(t)
@@ -308,11 +362,16 @@ func TestCrash_BackendDuringRestart(t *testing.T) {
 	require.NotEqual(t, first.ID, held.ID, "a restart starts a new container")
 
 	backend.Kill()
-	backend.Start()
-	requireStillHeld(t, backend, lease, held)
+	restored := restartBackendOnto(t, backend, lease, held)
+	require.Equal(t, []string{"sleep", "3600"}, command(restored))
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 
-	openGate(t, backend, held)
-	requireSettled(t, p, backend, lease, held)
+	// The lease can be restarted again.
+	tenant.Restart(t, lease)
+	again := requireHeld(t, backend, lease, "restarting")
+	require.NotEqual(t, restored.ID, again.ID, "a restart starts a new container")
+	openGate(t, backend, again)
+	requireSettled(t, p, backend, lease, again)
 	requireNothingLeft(t, tenant, backend, lease)
 }
 

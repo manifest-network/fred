@@ -138,7 +138,7 @@ func describeOnFailure(t *testing.T, backend *e2e.Backend, leaseUUID string) {
 				health = one.State.Health.Status
 			}
 			t.Logf("  %s %s: %s, health %s, started %s, command %v",
-				one.ID[:12], one.Name, one.State.Status, health, one.State.StartedAt, one.Config.Cmd)
+				one.ID[:12], one.Name, one.State.Status, health, one.State.StartedAt, append([]string{one.Path}, one.Args...))
 		}
 	})
 }
