@@ -81,6 +81,8 @@ type Backend struct {
 	Name string
 	// VolumePath is the backend's volume_data_path on the XFS loopback.
 	VolumePath string
+	// SKUs are the SKUs this backend serves.
+	SKUs SKUs
 
 	// What a providerd needs to reach this backend: its base URL, the CA that
 	// signed its server certificate, a client certificate it accepts, and the
@@ -104,14 +106,15 @@ type Backend struct {
 // tests that drive the backend themselves.
 func StartBackend(t *testing.T) *Backend {
 	t.Helper()
-	return StartBackendWithSKUs(t, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
+	return StartBackendFor(t, StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
 }
 
-// StartBackendWithSKUs seals a fresh storage identity and starts
-// docker-backend on it, serving the given SKUs. It skips the test when the
-// host cannot run the suite. Cleanup stops the process, removes its Docker
-// resources and unmounts its storage.
-func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
+// StartBackendFor seals a fresh storage identity and starts docker-backend
+// on it, serving the given SKUs. Leases created through the backend's Client
+// belong to the given provider. It skips the test when the host cannot run
+// the suite. Cleanup stops the process, removes its Docker resources and
+// unmounts its storage.
+func StartBackendFor(t *testing.T, providerUUID string, skus SKUs) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -129,6 +132,7 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 
 	b := &Backend{
 		Name:      backendNamePrefix + randomHex(t, 4),
+		SKUs:      skus,
 		t:         t,
 		binary:    filepath.Join(binDir, "docker-backend"),
 		dockerGID: socket.Sys().(*syscall.Stat_t).Gid,
@@ -164,10 +168,11 @@ func StartBackendWithSKUs(t *testing.T, skus SKUs) *Backend {
 	callbacks, err := placement.NewCallbackRouteFactory(sink.URL)
 	require.NoError(t, err)
 	b.Client = &Client{
-		http:      &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},
-		baseURL:   b.URL,
-		secret:    secret,
-		callbacks: callbacks,
+		http:         &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},
+		baseURL:      b.URL,
+		secret:       secret,
+		providerUUID: providerUUID,
+		callbacks:    callbacks,
 	}
 
 	mapping := map[string]string{skus.Stateless: "e2e-stateless", skus.Stateful: "e2e-stateful"}
