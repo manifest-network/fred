@@ -117,3 +117,29 @@ func replaced(t *testing.T, backend *e2e.Backend, leaseUUID string, before conta
 	})
 	return now
 }
+
+// describeOnFailure attaches the state of a lease's containers to a failed
+// test, read before the fixtures remove them.
+func describeOnFailure(t *testing.T, backend *e2e.Backend, leaseUUID string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		containers, err := backend.TryContainers(leaseUUID)
+		if err != nil {
+			t.Logf("containers of lease %s: %v", leaseUUID, err)
+			return
+		}
+		t.Logf("lease %s has %d containers on backend %s", leaseUUID, len(containers), backend.Name)
+		for _, one := range containers {
+			health := "none"
+			if one.State.Health != nil {
+				health = one.State.Health.Status
+			}
+			t.Logf("  %s %s: %s, health %s, started %s, command %v",
+				one.ID[:12], one.Name, one.State.Status, health, one.State.StartedAt, one.Config.Cmd)
+		}
+	})
+}
+

@@ -105,20 +105,32 @@ func dockerClient(t *testing.T, socket string) *client.Client {
 // running or not.
 func (b *Backend) Containers(t *testing.T, leaseUUID string) []container.InspectResponse {
 	t.Helper()
+	inspected, err := b.TryContainers(leaseUUID)
+	require.NoError(t, err)
+	return inspected
+}
+
+// TryContainers is Containers for use off the test's goroutine, where a
+// failure must not end the test: it returns the error.
+func (b *Backend) TryContainers(leaseUUID string) ([]container.InspectResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	listed, err := b.docker.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
 	})
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	inspected := make([]container.InspectResponse, 0, len(listed))
 	for _, summary := range listed {
 		one, err := b.docker.ContainerInspect(ctx, summary.ID)
-		require.NoError(t, err)
+		if err != nil {
+			return nil, err
+		}
 		inspected = append(inspected, one)
 	}
-	return inspected
+	return inspected, nil
 }
 
 // LoseContainers removes the lease's containers behind the backend's back, the
