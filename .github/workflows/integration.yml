@@ -398,6 +398,10 @@ jobs:
             exit 1
           fi
 
+      - name: TEMPORARY revert proof (dropped before merge)
+        if: matrix.suite == 'e2e' && matrix.image_store == 'overlay2'
+        run: python3 scripts/e2e-revert-proof.py
+
       - name: Collect the second Docker daemon's log
         if: failure() && matrix.suite == 'e2e'
         run: |
