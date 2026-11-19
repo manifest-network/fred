@@ -1,0 +1,78 @@
+name: E2E test images
+
+# Builds the images under test/e2e/images and pushes them to
+# ghcr.io/manifest-network/fred-e2e. See test/e2e/images/README.md.
+#
+# It runs on pull requests because the black-box suite needs an image before
+# the change that adds it can pass. A pull request from a fork gets a
+# read-only token and is skipped.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "test/e2e/images/**"
+      - ".github/workflows/e2e-images.yml"
+  push:
+    branches: [main, "release/**"]
+    paths:
+      - "test/e2e/images/**"
+      - ".github/workflows/e2e-images.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-images
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: build and push
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push the test images to ghcr.io
+    env:
+      REPOSITORY: ghcr.io/manifest-network/fred-e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the images that are not published yet
+        # A tag names the image's source: the directory and a hash of its
+        # files. An existing tag is left alone, so the digest a test pins
+        # never moves under it.
+        run: |
+          set -euo pipefail
+          {
+            echo "## Test images"
+            echo
+            echo "Pin these references in \`test/e2e/docker.go\`:"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          for dir in test/e2e/images/*/; do
+            name="$(basename "$dir")"
+            hash="$(cd "$dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)"
+            ref="${REPOSITORY}:${name}-${hash}"
+            if docker manifest inspect "$ref" >/dev/null 2>&1; then
+              echo "$ref is already published"
+            else
+              docker build --tag "$ref" "$dir"
+              docker push "$ref"
+            fi
+            docker pull --quiet "$ref" >/dev/null
+            digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" | grep -F "${REPOSITORY}@" | head -n1 | cut -d@ -f2)"
+            if [ -z "$digest" ]; then
+              echo "::error::no registry digest for $ref"
+              exit 1
+            fi
+            echo "${ref}@${digest}"
+            echo "- \`${ref}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"
+          done

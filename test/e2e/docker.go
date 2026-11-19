@@ -25,6 +25,7 @@ const (
 	labelManaged     = "fred.managed"
 	labelLeaseUUID   = "fred.lease_uuid"
 	labelBackendName = "fred.backend_name"
+	labelServiceName = "fred.service_name"
 	// An image-inspection helper carries none of the labels above. The backend
 	// removes it when admission ends, so one is left behind only when the
 	// process dies during admission.
@@ -34,12 +35,19 @@ const (
 
 // The workload images, pinned by digest so that a run never depends on what a
 // floating tag points at that day. The tag is for the reader: Docker pulls by
-// the digest, which names the multi-platform index. integration.yml pre-pulls
-// the same two references.
+// the digest. integration.yml pre-pulls the same references.
 const (
 	BusyboxImage = "busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
 	// RedisImage declares VOLUME /data.
 	RedisImage = "redis:7.4.12@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90"
+	// NestedVolumesImage declares VOLUME /data/b and VOLUME /data/a/c, sets no
+	// user, and owns those directories as root, so its workload runs as
+	// root. It is built from test/e2e/images/nested-volumes.
+	NestedVolumesImage = "ghcr.io/manifest-network/fred-e2e:nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00"
+	// ProjectProbeImage declares VOLUME /data, runs as root, and carries
+	// /probe, which tries to move a file to another XFS project. It is built
+	// from test/e2e/images/projid-probe.
+	ProjectProbeImage = "ghcr.io/manifest-network/fred-e2e:projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
 )
 
 // containerKinds lists the kinds of container docker-backend creates: the
@@ -127,6 +135,15 @@ func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
 // output. A non-zero exit fails the test.
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	t.Helper()
+	exitCode, output := b.TryExec(t, containerID, cmd...)
+	require.Zero(t, exitCode, "exec %v: %s", cmd, output)
+	return output
+}
+
+// TryExec runs a command in a container on this backend's daemon and returns
+// its exit code and output, for a command a test expects to fail.
+func (b *Backend) TryExec(t *testing.T, containerID string, cmd ...string) (exitCode int, output string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	created, err := b.docker.ContainerExecCreate(ctx, containerID, container.ExecOptions{
@@ -136,13 +153,42 @@ func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	attached, err := b.docker.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
 	require.NoError(t, err)
 	defer attached.Close()
-	var output bytes.Buffer
-	_, err = stdcopy.StdCopy(&output, &output, attached.Reader)
+	var collected bytes.Buffer
+	_, err = stdcopy.StdCopy(&collected, &collected, attached.Reader)
 	require.NoError(t, err)
 	result, err := b.docker.ContainerExecInspect(ctx, created.ID)
 	require.NoError(t, err)
-	require.Zero(t, result.ExitCode, "exec %v: %s", cmd, output.String())
-	return output.String()
+	return result.ExitCode, collected.String()
+}
+
+// KillContainers kills the lease's containers, as a crashed workload would
+// leave them: present, and no longer running.
+func (b *Backend) KillContainers(t *testing.T, leaseUUID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, one := range b.Containers(t, leaseUUID) {
+		require.NoError(t, b.docker.ContainerKill(ctx, one.ID, "SIGKILL"))
+	}
+}
+
+// networkNames lists the networks this backend's daemon holds for a lease. A
+// failed listing reads as one unnamed network, so a caller waiting for none
+// keeps waiting.
+func (b *Backend) networkNames(leaseUUID string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	listed, err := b.docker.NetworkList(ctx, network.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
+	})
+	if err != nil {
+		return []string{""}
+	}
+	names := make([]string, len(listed))
+	for i, one := range listed {
+		names[i] = one.Name
+	}
+	return names
 }
 
 // removeDockerResources removes the containers, image-inspection helpers and
