@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
@@ -54,7 +55,6 @@ const (
 	productionCaps = "cap_chown,cap_dac_override,cap_fowner,cap_sys_admin"
 
 	clientCertName = "providerd"
-	dockerSocket   = "/var/run/docker.sock"
 )
 
 // SKUs are the SKU UUIDs a backend serves, one per profile.
@@ -98,23 +98,25 @@ type Backend struct {
 	process   *Process
 	binary    string
 	config    string
+	docker    *client.Client
 	dockerGID uint32
 	healthURL string
 }
 
-// StartBackend starts a backend serving StatelessSKU and StatefulSKU, for
-// tests that drive the backend themselves.
+// StartBackend starts a backend on the first Docker daemon, serving
+// StatelessSKU and StatefulSKU, for tests that drive the backend themselves.
 func StartBackend(t *testing.T) *Backend {
 	t.Helper()
-	return StartBackendFor(t, StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
+	return StartBackendFor(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
 }
 
 // StartBackendFor seals a fresh storage identity and starts docker-backend
-// on it, serving the given SKUs. Leases created through the backend's Client
-// belong to the given provider. It skips the test when the host cannot run
-// the suite. Cleanup stops the process, removes its Docker resources and
+// on it, on the Docker daemon behind dockerSocket, serving the given SKUs.
+// No other backend may use that daemon. Leases created through the backend's
+// Client belong to the given provider. It skips the test when the host cannot
+// run the suite. Cleanup stops the process, removes its Docker resources and
 // unmounts its storage.
-func StartBackendFor(t *testing.T, providerUUID string, skus SKUs) *Backend {
+func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -126,7 +128,7 @@ func StartBackendFor(t *testing.T, providerUUID string, skus SKUs) *Backend {
 	if _, err := exec.LookPath("capsh"); err != nil {
 		t.Skip("capsh (libcap2-bin) not found:", err)
 	}
-	docker := dockerClient(t)
+	docker := dockerClient(t, dockerSocket)
 	socket, err := os.Stat(dockerSocket)
 	require.NoError(t, err)
 
@@ -135,6 +137,7 @@ func StartBackendFor(t *testing.T, providerUUID string, skus SKUs) *Backend {
 		SKUs:      skus,
 		t:         t,
 		binary:    filepath.Join(binDir, "docker-backend"),
+		docker:    docker,
 		dockerGID: socket.Sys().(*syscall.Stat_t).Gid,
 	}
 	_, err = os.Stat(b.binary)

@@ -57,9 +57,9 @@ func closeLease(t *testing.T, b *Backend, leaseUUID string) {
 
 // requireOneRunningContainer returns the lease's only container, which must
 // be running.
-func requireOneRunningContainer(t *testing.T, leaseUUID string) container.InspectResponse {
+func requireOneRunningContainer(t *testing.T, b *Backend, leaseUUID string) container.InspectResponse {
 	t.Helper()
-	containers := LeaseContainers(t, leaseUUID)
+	containers := b.Containers(t, leaseUUID)
 	require.Len(t, containers, 1)
 	require.True(t, containers[0].State.Running, "container state: %s", containers[0].State.Status)
 	return containers[0]
@@ -74,7 +74,7 @@ func TestBackend_Lifecycle(t *testing.T) {
 
 	require.NoError(t, b.Client.Apply(ctx, lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
-	requireOneRunningContainer(t, lease.LeaseUUID)
+	requireOneRunningContainer(t, b, lease.LeaseUUID)
 
 	leases, err := b.Client.List(ctx)
 	require.NoError(t, err)
@@ -82,7 +82,7 @@ func TestBackend_Lifecycle(t *testing.T) {
 
 	closeLease(t, b, lease.LeaseUUID)
 	requireGone(t, b, lease.LeaseUUID)
-	require.Empty(t, LeaseContainers(t, lease.LeaseUUID))
+	require.Empty(t, b.Containers(t, lease.LeaseUUID))
 	leases, err = b.Client.List(ctx)
 	require.NoError(t, err)
 	require.Empty(t, leases)
@@ -100,20 +100,20 @@ func TestBackend_RetainAndRestore(t *testing.T) {
 
 	require.NoError(t, b.Client.Apply(ctx, source))
 	requireStatus(t, b, source.LeaseUUID, statusReady)
-	sourceContainer := requireOneRunningContainer(t, source.LeaseUUID)
+	sourceContainer := requireOneRunningContainer(t, b, source.LeaseUUID)
 	requireVolumeBind(t, b, sourceContainer, "/data")
-	Exec(t, sourceContainer.ID, "sh", "-c", "echo kept > /data/sentinel")
+	b.Exec(t, sourceContainer.ID, "sh", "-c", "echo kept > /data/sentinel")
 
 	closeLease(t, b, source.LeaseUUID)
 	requireStatus(t, b, source.LeaseUUID, statusRetained)
-	require.Empty(t, LeaseContainers(t, source.LeaseUUID))
+	require.Empty(t, b.Containers(t, source.LeaseUUID))
 
 	target := Spec{LeaseUUID: uuid.NewString(), Tenant: source.Tenant, SKU: StatefulSKU}
 	require.NoError(t, b.Client.Restore(ctx, target, source.LeaseUUID))
 	requireStatus(t, b, target.LeaseUUID, statusReady)
-	targetContainer := requireOneRunningContainer(t, target.LeaseUUID)
+	targetContainer := requireOneRunningContainer(t, b, target.LeaseUUID)
 	requireVolumeBind(t, b, targetContainer, "/data")
-	require.Equal(t, "kept\n", Exec(t, targetContainer.ID, "cat", "/data/sentinel"))
+	require.Equal(t, "kept\n", b.Exec(t, targetContainer.ID, "cat", "/data/sentinel"))
 	requireGone(t, b, source.LeaseUUID)
 
 	closeLease(t, b, target.LeaseUUID)
@@ -130,20 +130,20 @@ func TestBackend_GracefulRestartKeepsLease(t *testing.T) {
 
 	require.NoError(t, b.Client.Apply(ctx, lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
-	before := requireOneRunningContainer(t, lease.LeaseUUID)
+	before := requireOneRunningContainer(t, b, lease.LeaseUUID)
 
 	b.Stop()
-	require.Equal(t, before.ID, requireOneRunningContainer(t, lease.LeaseUUID).ID)
+	require.Equal(t, before.ID, requireOneRunningContainer(t, b, lease.LeaseUUID).ID)
 
 	b.Start()
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
-	after := requireOneRunningContainer(t, lease.LeaseUUID)
+	after := requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.Equal(t, before.ID, after.ID)
 	require.Equal(t, before.State.StartedAt, after.State.StartedAt, "the container must not have been restarted")
 
 	closeLease(t, b, lease.LeaseUUID)
 	requireGone(t, b, lease.LeaseUUID)
-	require.Empty(t, LeaseContainers(t, lease.LeaseUUID))
+	require.Empty(t, b.Containers(t, lease.LeaseUUID))
 }
 
 // requireVolumeBind asserts the container mounts destination from a directory

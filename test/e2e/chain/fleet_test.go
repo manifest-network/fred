@@ -12,15 +12,14 @@ import (
 	"github.com/manifest-network/fred/test/e2e"
 )
 
-// The tests in this file run a provider with two backends. They pin what
-// providerd must not do when it cannot be sure: destroy a lease on missing
-// evidence, or act on a backend that does not hold the lease.
+// The tests in this file run a provider with two backends, each on its own
+// Docker daemon. They pin what providerd must not do when it cannot be sure:
+// destroy a lease on missing evidence, or act on a backend that does not hold
+// the lease.
 //
-// Both backends use the one Docker daemon, and a lease's network is named
-// after the lease alone. A backend therefore refuses a lease the other one
-// already runs, so "the other backend runs nothing for the lease" is weak
-// evidence that providerd sent it nothing. Where that matters, the tests
-// also read providerd's own count of the requests it sent to each backend.
+// "The other backend runs nothing for the lease" shows only what the backend
+// did. Where it matters that providerd sent nothing, the tests also read
+// providerd's own count of the requests it sent to each backend.
 
 // TestFleet_UncertainEvidenceDestroysNothing covers the ways providerd can
 // lack evidence about a lease: the chain does not know it, the chain does not
@@ -95,7 +94,7 @@ func TestFleet_CloseAndRestoreReachTheOwningBackend(t *testing.T) {
 	source := deployActive(t, p, tenant, p.SKUs.Stateful, stateful)
 	holder := p.Host(t, source)
 	other := p.Backends[1-slices.Index(p.Backends, holder)]
-	e2e.Exec(t, running(t, holder, source).ID, "sh", "-c", "echo kept > /data/sentinel")
+	holder.Exec(t, running(t, holder, source).ID, "sh", "-c", "echo kept > /data/sentinel")
 
 	// One more lease on each backend, to witness that a close touches only
 	// its own lease.
@@ -105,7 +104,7 @@ func TestFleet_CloseAndRestoreReachTheOwningBackend(t *testing.T) {
 
 	tenant.Close(t, source)
 	requireStatus(t, holder, source, "retained")
-	require.Empty(t, e2e.LeaseContainers(t, source))
+	require.Empty(t, holder.Containers(t, source))
 	requireUntouched(t, holder, beside, containerBeside)
 	requireUntouched(t, other, elsewhere, containerElsewhere)
 	require.Zero(t, p.Dispatched(t, other, "deprovision"), "the close must not have been sent to the other backend")
@@ -119,7 +118,7 @@ func TestFleet_CloseAndRestoreReachTheOwningBackend(t *testing.T) {
 	target := tenant.Restore(t, p.SKUs.Stateful, source, stateful)
 	requireActive(t, p.Chain, target)
 	require.Same(t, holder, p.Host(t, target), "the restore must run on the backend that held the data")
-	require.Equal(t, "kept\n", e2e.Exec(t, running(t, holder, target).ID, "cat", "/data/sentinel"))
+	require.Equal(t, "kept\n", holder.Exec(t, running(t, holder, target).ID, "cat", "/data/sentinel"))
 	requireAbsent(t, other, target)
 	require.Zero(t, p.Dispatched(t, other, "restore"), "the restore must not have been sent to the other backend")
 	require.Equal(t, provisionsElsewhere, p.Dispatched(t, other, "provision"), "the target must not have been provisioned on the other backend")
@@ -151,6 +150,33 @@ func TestFleet_LostLeaseReturnsToItsBackend(t *testing.T) {
 	require.Equal(t, provisionsAway, p.Dispatched(t, away, "provision"), "the lease must not have been sent to the other backend")
 	requireAbsent(t, away, lost)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, lost).State)
+}
+
+// TestFleet_LeaseOnTwoBackendsIsLeftAlone makes a second backend report a
+// lease that providerd placed on the first. providerd cannot tell which copy
+// is the lease, so it must leave both running and keep the lease active.
+func TestFleet_LeaseOnTwoBackendsIsLeftAlone(t *testing.T) {
+	p := StartProvider(t, 2)
+	a, b := p.Backends[0], p.Backends[1]
+	tenant := p.NewTenant(t)
+	lease := deployActive(t, p, tenant, a.SKUs.Pinned, sleeper("3600"))
+	original := running(t, a, lease)
+
+	require.NoError(t, b.Client.Apply(t.Context(), e2e.Spec{
+		LeaseUUID: lease, Tenant: tenant.Address(), SKU: p.SKUs.Stateless, Manifest: sleeper("3600"),
+	}))
+	requireStatus(t, b, lease, "ready")
+	duplicate := running(t, b, lease)
+
+	// Two more passes that each deferred a lease: providerd saw the
+	// disagreement and stepped back.
+	p.AwaitMetric(t, 2, "fred_provisioner_reconciler_deferred_leases_total")
+	requireUntouched(t, a, lease, original)
+	requireUntouched(t, b, lease, duplicate)
+	for _, backend := range p.Backends {
+		require.Zero(t, p.Dispatched(t, backend, "deprovision"), "nothing may be removed from %s", backend.Name)
+	}
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 }
 
 // TestFleet_BackendOutageLeavesTheOtherServing stops one backend. The lease

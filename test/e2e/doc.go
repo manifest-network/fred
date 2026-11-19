@@ -17,4 +17,6 @@
 // builds the binaries unprivileged and runs the test binary under sudo. Run
 // one e2e test binary at a time per Docker daemon: TestMain removes whatever a
 // killed run left behind, which would include a concurrent run's resources.
+// A backend needs a daemon to itself, so a test with two backends uses two
+// daemons (DockerSocketsEnv).
 package e2e
