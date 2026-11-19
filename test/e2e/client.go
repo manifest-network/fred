@@ -29,6 +29,10 @@ const StandInProviderUUID = "11111111-1111-4111-8111-111111111111"
 // ErrNotFound is what Get returns for a lease the backend does not know.
 var ErrNotFound = errors.New("lease not found")
 
+// CodeInsufficientResources is the code of the refusal a backend gives a
+// lease it has no capacity for.
+const CodeInsufficientResources = backend.CodeInsufficientResources
+
 // Spec is what a lease should run.
 type Spec struct {
 	LeaseUUID string
@@ -59,6 +63,9 @@ func (s Spec) items() []backend.LeaseItem {
 type Lease struct {
 	UUID   string
 	Status string
+	// Partition is the retention partition of a retained lease, as Get
+	// reports it. Empty is the tenant's default partition.
+	Partition string
 }
 
 // StatusError is a response outside 2xx.
@@ -122,25 +129,46 @@ func (c *Client) Get(ctx context.Context, leaseUUID string) (Lease, error) {
 	return leaseOf(info), nil
 }
 
-// List reports every lease the backend runs, following its pagination.
+// List reports every lease the backend holds, following its pagination: the
+// leases it runs, then the retained ones with status "retained". 0.14 lists
+// retained leases on an endpoint of their own, and keeps one listed until its
+// data is gone, so a lease that lost its place to a cap stays listed for the
+// moment its removal takes.
 func (c *Client) List(ctx context.Context) ([]Lease, error) {
 	var leases []Lease
 	for cursor := ""; ; {
-		query := url.Values{"limit": {"1000"}}
-		if cursor != "" {
-			query.Set("continue", cursor)
-		}
 		var page backend.ListProvisionsResponse
-		if err := c.do(ctx, http.MethodGet, "/provisions?"+query.Encode(), false, nil, &page); err != nil {
+		if err := c.do(ctx, http.MethodGet, "/provisions?"+pageQuery(cursor), false, nil, &page); err != nil {
 			return nil, err
 		}
 		for _, info := range page.Provisions {
 			leases = append(leases, leaseOf(info))
 		}
 		if cursor = page.Continue; cursor == "" {
+			break
+		}
+	}
+	for cursor := ""; ; {
+		var page backend.ListRetentionsResponse
+		if err := c.do(ctx, http.MethodGet, "/retentions?"+pageQuery(cursor), false, nil, &page); err != nil {
+			return nil, err
+		}
+		for _, retained := range page.Retentions {
+			leases = append(leases, Lease{UUID: retained.LeaseUUID, Status: string(backend.ProvisionStatusRetained)})
+		}
+		if cursor = page.Continue; cursor == "" {
 			return leases, nil
 		}
 	}
+}
+
+// pageQuery asks for the page after cursor.
+func pageQuery(cursor string) string {
+	query := url.Values{"limit": {"1000"}}
+	if cursor != "" {
+		query.Set("continue", cursor)
+	}
+	return query.Encode()
 }
 
 // Close asks the backend to stop the lease and release or retain its data.
@@ -170,7 +198,7 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 }
 
 func leaseOf(info backend.ProvisionInfo) Lease {
-	return Lease{UUID: info.LeaseUUID, Status: string(info.Status)}
+	return Lease{UUID: info.LeaseUUID, Status: string(info.Status), Partition: info.Partition}
 }
 
 // callbackURLs mints the callback pair of one operation with providerd's own
