@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -159,4 +160,32 @@ func requireVolumeBind(t *testing.T, b *Backend, c container.InspectResponse, de
 		}
 	}
 	require.Failf(t, "mount missing", "container %s has no mount at %s", c.ID, destination)
+}
+
+// TestBackend_SecondApplyChangesNothing sends a lease's command a second
+// time, as a caller that never saw the first answer would. Whether the
+// backend refuses it or accepts it, the lease must keep running in its one
+// container, never restarted.
+func TestBackend_SecondApplyChangesNothing(t *testing.T) {
+	b := StartBackend(t)
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), lease))
+	requireStatus(t, b, lease.LeaseUUID, statusReady)
+	first := requireOneRunningContainer(t, b, lease.LeaseUUID)
+
+	applied := time.Now()
+	if err := b.Client.Apply(t.Context(), lease); err != nil {
+		// 0.14 refuses a lease it already runs.
+		var refused *StatusError
+		require.ErrorAs(t, err, &refused)
+		require.Equal(t, http.StatusConflict, refused.Status, "second apply: %v", err)
+	}
+	// Two of the backend's periodic passes, in case it acts on the command
+	// after answering it.
+	time.Sleep(20 * time.Second)
+	require.Empty(t, b.Started(t, lease.LeaseUUID, applied), "the second apply must not start a container")
+	requireStatus(t, b, lease.LeaseUUID, statusReady)
+	now := requireOneRunningContainer(t, b, lease.LeaseUUID)
+	require.Equal(t, first.ID, now.ID)
+	require.Equal(t, first.State.StartedAt, now.State.StartedAt)
 }

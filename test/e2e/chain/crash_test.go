@@ -36,9 +36,7 @@ const (
 // heldSettings gives an operation time to be held: by default the fixture's
 // backends give up on a workload that is not healthy within a minute.
 func heldSettings(settings map[string]any) Options {
-	// TEMPORARY: debug logging while the 0.14 recovery of an interrupted
-	// restart and update is being read from CI.
-	merged := map[string]any{"provision_timeout": "10m", "log_level": "debug"}
+	merged := map[string]any{"provision_timeout": "10m"}
 	for key, value := range settings {
 		merged[key] = value
 	}
@@ -77,7 +75,22 @@ func requireHeld(t *testing.T, backend *e2e.Backend, leaseUUID, status string) c
 		held = starting[0]
 		return true
 	})
+	requireLaunchesRecorded(t, backend)
 	return held
+}
+
+// requireLaunchesRecorded waits until the backend has recorded the outcome
+// of every container launch it asked Docker for. Until then the backend
+// cannot know, after a crash, what Docker did with the request, and 0.14
+// refuses to start until an operator settles it offline (OPERATIONS.md,
+// "Unsettled Docker effects"). These tests crash a backend that knows what
+// it started.
+func requireLaunchesRecorded(t *testing.T, backend *e2e.Backend) {
+	t.Helper()
+	eventually(t, "backend "+backend.Name+" has recorded its container launches", func() bool {
+		// The backend samples the gauge when its health is inspected.
+		return backend.Serving() && backend.Metric(t, "fred_docker_backend_volume_launches_pending") == 0
+	})
 }
 
 // startingContainers lists the lease's running containers that have not
@@ -184,22 +197,33 @@ func restartBackendOnto(t *testing.T, backend *e2e.Backend, leaseUUID string, he
 	return now
 }
 
-// requireNothingLeft closes the lease and waits until the host holds nothing
-// of it: no container, no network and no volume directory.
+// requireNothingLeft closes the lease and waits until the backend no longer
+// lists it and the host holds nothing of it: no container, no network and no
+// volume directory. Asking the backend for the lease by name proves less: a
+// lease that once failed keeps answering with that failure's diagnostics.
 func requireNothingLeft(t *testing.T, tenant *Tenant, backend *e2e.Backend, leaseUUID string) {
 	t.Helper()
 	if tenant.provider.Chain.Lease(t, leaseUUID).State != LeaseClosed {
 		tenant.Close(t, leaseUUID)
 	}
-	requireGone(t, backend, leaseUUID)
 	var left []string
-	eventually(t, "the host holds nothing of lease "+leaseUUID, func() bool {
+	eventually(t, "nothing is left of lease "+leaseUUID, func() bool {
+		leases, err := backend.Client.List(t.Context())
+		if err != nil {
+			return false
+		}
 		left = backend.Leftovers(leaseUUID)
+		for _, lease := range leases {
+			if lease.UUID == leaseUUID {
+				left = append(left, "listed as "+lease.Status)
+			}
+		}
 		if len(left) != 0 {
 			t.Logf("still held of lease %s: %s", leaseUUID, strings.Join(left, "; "))
 		}
 		return len(left) == 0
 	})
+	require.Equal(t, LeaseClosed, tenant.provider.Chain.Lease(t, leaseUUID).State)
 }
 
 // dataDir is the host directory behind a container's /data volume.
