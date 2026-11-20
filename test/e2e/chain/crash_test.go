@@ -81,10 +81,10 @@ func requireHeld(t *testing.T, backend *e2e.Backend, leaseUUID, status string) c
 
 // requireLaunchesRecorded waits until the backend has recorded the outcome
 // of every container launch it asked Docker for. Until then the backend
-// cannot know, after a crash, what Docker did with the request, and 0.14
-// refuses to start until an operator settles it offline (OPERATIONS.md,
-// "Unsettled Docker effects"). These tests crash a backend that knows what
-// it started.
+// cannot know, after a crash, what Docker did with the request. For a restart
+// or an update, 0.14 then refuses to start until an operator settles it
+// offline (ENG-2194; OPERATIONS.md, "Unsettled Docker effects"). These tests
+// crash a backend that knows what it started.
 func requireLaunchesRecorded(t *testing.T, backend *e2e.Backend) {
 	t.Helper()
 	eventually(t, "backend "+backend.Name+" has recorded its container launches", func() bool {
@@ -166,8 +166,9 @@ func command(c container.InspectResponse) []string {
 // 0.14 does not take up an interrupted restart or update where it was. At
 // its next start it removes the container the operation had started, puts
 // the previous workload back in a new one, and waits for that one to pass
-// its health check before it serves. The held container is therefore let
-// through only once the backend serves, when it is known to be kept.
+// its health check before it serves anything (ENG-2193). The held container
+// is therefore let through only once the backend serves, when it is known to
+// be kept.
 func restartBackendOnto(t *testing.T, backend *e2e.Backend, leaseUUID string, held container.InspectResponse) container.InspectResponse {
 	t.Helper()
 	backend.Launch()
