@@ -171,8 +171,8 @@ func requireVolumeBind(t *testing.T, b *Backend, c container.InspectResponse, de
 // 0.14 refuses the second command, and at its next periodic pass reports the
 // lease failed although its container runs untouched: the refused command
 // became the lease's last operation, and a lease whose last operation failed
-// is left out of the pass's inventory. The status assertion belongs here once
-// that is fixed.
+// is left out of the pass's inventory (ENG-2195). The status assertion belongs
+// here once that is fixed.
 func TestBackend_SecondApplyChangesNothing(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
