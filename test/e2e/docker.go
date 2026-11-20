@@ -45,6 +45,9 @@ const (
 	BusyboxImage = "busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
 	// RedisImage declares VOLUME /data.
 	RedisImage = "redis:7.4.12@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90"
+	// RedisAlpineImage declares the same volume as RedisImage, so a lease can
+	// be updated from one to the other and keep its data.
+	RedisAlpineImage = "redis:7.4.12-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe"
 	// NestedVolumesImage declares VOLUME /data/b and VOLUME /data/a/c, sets no
 	// user, and owns those directories as root, so its workload runs as
 	// root. It is built from test/e2e/images/nested-volumes.
@@ -207,11 +210,17 @@ func (b *Backend) TryExec(t *testing.T, containerID string, cmd ...string) (exit
 // leave them: present, and no longer running.
 func (b *Backend) KillContainers(t *testing.T, leaseUUID string) {
 	t.Helper()
+	for _, one := range b.Containers(t, leaseUUID) {
+		b.KillContainer(t, one.ID)
+	}
+}
+
+// KillContainer kills one container, as KillContainers kills a lease's.
+func (b *Backend) KillContainer(t *testing.T, containerID string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	for _, one := range b.Containers(t, leaseUUID) {
-		require.NoError(t, b.docker.ContainerKill(ctx, one.ID, "SIGKILL"))
-	}
+	require.NoError(t, b.docker.ContainerKill(ctx, containerID, "SIGKILL"))
 }
 
 // networkNames lists the networks this backend's daemon holds for a lease. A
