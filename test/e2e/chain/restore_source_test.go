@@ -29,7 +29,9 @@ import (
 //
 // It has to be the request that is lost. Once the backend reports the lease
 // being restored, providerd has nothing to take up: it waits for the backend
-// to finish.
+// to finish. And it has to be every request until providerd is dead: a
+// running providerd sends a restore it got no answer to again on its next
+// pass, a few seconds later, which would leave nothing for the restarted one.
 
 // retainUnacknowledged runs a gated workload with a volume, writes to the
 // volume, and lets end finish the lease on the chain while it is still
@@ -53,22 +55,22 @@ func retainUnacknowledged(t *testing.T, p *Provider, tenant *Tenant, end func(le
 }
 
 // requireRestoredAcrossAnInterruption restores the source into a new lease,
-// loses providerd's request to the backend, and kills providerd. The
+// loses every restore providerd sends the backend, and kills providerd. The
 // restarted providerd must send the restore again, and the new lease must
 // become active on the source's data in one container, started once.
 func requireRestoredAcrossAnInterruption(t *testing.T, p *Provider, tenant *Tenant, source restoreSource) {
 	t.Helper()
 	backend, link := p.Backends[0], p.Links[0]
-	lost := link.LoseRequest("restore")
+	lost := link.LoseRequests("restore")
 	asked := time.Now()
-	target := tenant.RestoreUnanswered(t, p.SKUs.Stateful, source.leaseUUID, source.manifest)
-	lost.Require(t)
+	target := tenant.RestoreUnanswered(t, p.SKUs.Stateful, source.leaseUUID, source.manifest, lost)
 	_, err := backend.Client.Get(t.Context(), target)
 	require.ErrorIs(t, err, e2e.ErrNotFound, "the backend must not have received the restore")
 	requireStatus(t, backend, source.leaseUUID, "retained")
 	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State)
 
 	p.Kill()
+	lost.Deliver()
 	p.Start()
 	held := requireHeld(t, backend, target, "restarting")
 	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State, "a lease whose workload is not healthy is not acknowledged")

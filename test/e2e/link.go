@@ -24,7 +24,7 @@ import (
 
 // Link is the connection from providerd to one backend, with the test in the
 // middle of it. It forwards every request and response unchanged, until a
-// test asks it to lose one. A lost response: the backend receives the request
+// test asks it to lose some. A lost response: the backend receives the request
 // and does the work, and its caller never hears back. A lost request: the
 // backend never receives it, and its caller cannot tell the two apart.
 //
@@ -40,10 +40,10 @@ type Link struct {
 	target    *url.URL
 	transport http.RoundTripper
 
-	mu          sync.Mutex
-	lose        *LostResponse
-	loseRequest *LostRequest
-	sent        map[string]Command
+	mu           sync.Mutex
+	lose         *LostResponse
+	loseRequests *LostRequests
+	sent         map[string]Command
 }
 
 // Command is one request a caller sent through a Link, kept as it was sent.
@@ -64,10 +64,12 @@ type LostResponse struct {
 	reached bool
 }
 
-// LostRequest is one request a Link was asked to lose.
-type LostRequest struct {
+// LostRequests is the requests for one operation that a Link loses until it
+// is told to deliver them again.
+type LostRequests struct {
+	link      *Link
 	operation string
-	done      chan struct{}
+	lost      bool
 }
 
 // errLost marks a response the link discards.
@@ -138,37 +140,44 @@ func (l *Link) LoseResponse(operation string, settled func() bool) *LostResponse
 	return lost
 }
 
-// LoseRequest makes the link lose the caller's next request for an operation,
-// named as in LoseResponse. The backend never receives it, and the caller's
-// connection ends without an answer.
-func (l *Link) LoseRequest(operation string) *LostRequest {
-	lost := &LostRequest{operation: operation, done: make(chan struct{})}
+// LoseRequests makes the link lose every request the caller sends for an
+// operation, named as in LoseResponse, until Deliver. The backend receives
+// none of them, and each time the caller's connection ends without an answer.
+// It is every request and not one, because a caller that got no answer sends
+// the request again when it likes.
+func (l *Link) LoseRequests(operation string) *LostRequests {
+	lost := &LostRequests{link: l, operation: operation}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loseRequest = lost
+	l.loseRequests = lost
 	return lost
 }
 
-// drops reports whether the request is the one the link was asked to lose.
+// drops reports whether the request is one the link was asked to lose.
 func (l *Link) drops(r *http.Request) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	lost := l.loseRequest
+	lost := l.loseRequests
 	if lost == nil || r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/"+lost.operation) {
 		return false
 	}
-	l.loseRequest = nil
-	close(lost.done)
+	lost.lost = true
 	return true
 }
 
-// Require waits until the request was lost.
-func (r *LostRequest) Require(t *testing.T) {
-	t.Helper()
-	select {
-	case <-r.done:
-	case <-time.After(lostResponseBudget):
-		t.Fatalf("no %s was sent for the link to lose", r.operation)
+// Lost reports whether the link has lost at least one request.
+func (r *LostRequests) Lost() bool {
+	r.link.mu.Lock()
+	defer r.link.mu.Unlock()
+	return r.lost
+}
+
+// Deliver makes the link forward the operation's requests again.
+func (r *LostRequests) Deliver() {
+	r.link.mu.Lock()
+	defer r.link.mu.Unlock()
+	if r.link.loseRequests == r {
+		r.link.loseRequests = nil
 	}
 }
 

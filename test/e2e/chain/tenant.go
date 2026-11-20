@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/testutil"
+	"github.com/manifest-network/fred/test/e2e"
 )
 
 // Lease states as the chain's JSON output spells them.
@@ -132,14 +133,16 @@ func (tn *Tenant) Restore(t *testing.T, sku, fromLeaseUUID string, manifest map[
 	})
 }
 
-// RestoreUnanswered is Restore for a restore whose answer from the backend
-// the test loses. The provider then cannot tell the tenant that the restore
-// is under way, and answers with an error although it is. The request ends
-// at the first answer that is not a conflict.
-func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any) string {
+// RestoreUnanswered is Restore for a restore the test keeps from the backend:
+// lost is the link losing the provider's restore requests. The provider then
+// cannot tell the tenant that the restore is under way, and answers with an
+// error. The request is repeated until the link has lost one, because the
+// provider can also turn a restore away for a moment before it sends anything,
+// as while it takes stock of its backends.
+func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, lost *e2e.LostRequests) string {
 	t.Helper()
 	return tn.restore(t, sku, fromLeaseUUID, manifest, func(collect *assert.CollectT, status int, answer string) {
-		assert.NotEqual(collect, http.StatusConflict, status, "restore answered: %s", answer)
+		assert.True(collect, lost.Lost(), "the provider sent no restore; it answered %d: %s", status, answer)
 	})
 }
 

@@ -167,7 +167,9 @@ func (b *Backend) OccupyContainerName(t *testing.T, name, image string) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cancel()
-		_ = b.docker.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true})
+		// With its volumes: Docker gives a container the anonymous volumes
+		// its image declares when it creates it, started or not.
+		_ = b.docker.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	})
 }
 
