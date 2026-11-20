@@ -122,7 +122,7 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 }
 
 // launch starts the node on the chain's ports, with the given addresses for
-// its peer and profiling listeners, and waits for its first block and for
+// its peer and profiling listeners, and waits for its second block and for
 // its gRPC server, which the node starts on its own schedule and exits
 // without. It returns what went wrong when the node did not get that far,
 // after stopping it, and registers the node's cleanup when it did.
@@ -155,8 +155,12 @@ func (c *Chain) launch(t *testing.T, logPath, p2p, pprof string) (problem string
 		}
 	}
 
+	// The second block, not the first: the node reports a block before the
+	// application has committed it, and until the first block is committed
+	// every transaction is turned away with "please wait for first block".
+	// A second block exists only once the first is committed.
 	deadline := time.Now().Add(commitTimeout)
-	for c.height() < 1 || !listening(c.grpc) {
+	for c.height() < 2 || !listening(c.grpc) {
 		select {
 		case <-exited:
 			return "manifestd exited during startup"
@@ -164,7 +168,7 @@ func (c *Chain) launch(t *testing.T, logPath, p2p, pprof string) (problem string
 		}
 		if time.Now().After(deadline) {
 			stop()
-			return fmt.Sprintf("manifestd produced no block within %s", commitTimeout)
+			return fmt.Sprintf("manifestd committed no block within %s", commitTimeout)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
