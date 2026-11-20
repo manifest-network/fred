@@ -107,10 +107,11 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	// them a moment later. A node that lost one to another process is started
 	// again on fresh ports; nothing else has used it yet.
 	for attempt := 1; ; attempt++ {
-		c.rpc, c.grpc = freeAddr(t), freeAddr(t)
+		addrs := freeAddrs(t, 4)
+		c.rpc, c.grpc = addrs[0], addrs[1]
 		_, port, _ := net.SplitHostPort(c.rpc)
 		logPath := filepath.Join(logDir, "manifestd-"+port+".log")
-		problem := c.launch(t, logPath)
+		problem := c.launch(t, logPath, addrs[2], addrs[3])
 		if problem == "" {
 			return c
 		}
@@ -120,10 +121,12 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	}
 }
 
-// launch starts the node on the chain's ports and waits for its first block.
-// It returns what went wrong when the node did not get that far, after
-// stopping it, and registers the node's cleanup when it did.
-func (c *Chain) launch(t *testing.T, logPath string) (problem string) {
+// launch starts the node on the chain's ports, with the given addresses for
+// its peer and profiling listeners, and waits for its first block and for
+// its gRPC server, which the node starts on its own schedule and exits
+// without. It returns what went wrong when the node did not get that far,
+// after stopping it, and registers the node's cleanup when it did.
+func (c *Chain) launch(t *testing.T, logPath, p2p, pprof string) (problem string) {
 	t.Helper()
 	logFile, err := os.Create(logPath) //nolint:gosec // G304: a path under t.TempDir or the suite's log directory
 	if err != nil {
@@ -132,7 +135,7 @@ func (c *Chain) launch(t *testing.T, logPath string) (problem string) {
 	defer func() { _ = logFile.Close() }()
 	node := exec.Command(c.bin, "start", "--home", c.home, //nolint:gosec // G204: the pinned chain binary and fixture-built arguments
 		"--rpc.laddr", "tcp://"+c.rpc, "--grpc.address", c.grpc,
-		"--p2p.laddr", "tcp://"+freeAddr(t), "--rpc.pprof_laddr", freeAddr(t),
+		"--p2p.laddr", "tcp://"+p2p, "--rpc.pprof_laddr", pprof,
 		"--api.enable=false", "--minimum-gas-prices", "0umfx")
 	node.Stdout, node.Stderr = logFile, logFile
 	if err := node.Start(); err != nil {
@@ -153,7 +156,7 @@ func (c *Chain) launch(t *testing.T, logPath string) (problem string) {
 	}
 
 	deadline := time.Now().Add(commitTimeout)
-	for c.height() < 1 {
+	for c.height() < 1 || !listening(c.grpc) {
 		select {
 		case <-exited:
 			return "manifestd exited during startup"
@@ -164,6 +167,12 @@ func (c *Chain) launch(t *testing.T, logPath string) (problem string) {
 			return fmt.Sprintf("manifestd produced no block within %s", commitTimeout)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	// Something else can be listening where the node meant to.
+	select {
+	case <-exited:
+		return "manifestd exited during startup"
+	default:
 	}
 	c.node = node.Process
 	t.Cleanup(func() {
@@ -396,17 +405,39 @@ func jsonObject(out string) string {
 	return out
 }
 
-// freeAddr picks a free loopback port for the node to listen on. The port is
-// free when picked, not reserved; a node that loses it exits at startup and
-// fails the test with its log.
-func freeAddr(t *testing.T) string {
+// freeAddrs picks that many free loopback ports for the node to listen on.
+// They are picked together, so they differ from each other: a port picked
+// and released alone can be handed out again by the very next pick. The
+// ports are free when picked, not reserved; a node that loses one exits at
+// startup and is started again on fresh ports.
+func freeAddrs(t *testing.T, count int) []string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick a free port: %v", err)
+	addrs := make([]string, count)
+	listeners := make([]net.Listener, 0, count)
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
+	for i := range addrs {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("pick a free port: %v", err)
+		}
+		listeners = append(listeners, listener)
+		addrs[i] = listener.Addr().String()
 	}
-	defer func() { _ = listener.Close() }()
-	return listener.Addr().String()
+	return addrs
+}
+
+// listening reports whether something accepts connections on the address.
+func listening(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // tail returns the end of a log file.

@@ -3,7 +3,6 @@
 package chain
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -21,15 +20,16 @@ import (
 // does for a closed lease, and the tenant must be able to restore it
 // (ENG-2130). The other tests of this suite restore from closed leases.
 //
-// Each test also interrupts the restore: the backend's answer to it is lost,
-// and providerd is killed while the restored workload is not yet healthy. The
-// restarted providerd finds a restore it never heard back about, and reads
-// the source lease again before it sends the restore a second time. So the
-// tests cover both places where a source that was never active used to be
-// turned away: when the restore is asked for, and when it is taken up again.
+// Each test also interrupts the restore: providerd's request to the backend
+// is lost on the way, and providerd is killed. The restarted providerd finds
+// a restore it recorded and cannot know the fate of, and reads the source
+// lease again before it sends the restore a second time. So the tests cover
+// both places where a source that was never active used to be turned away:
+// when the restore is asked for, and when it is taken up again.
 //
-// The restart is needed. A providerd that stays up waits for the backend to
-// report on the restore it asked for, and sends nothing again.
+// It has to be the request that is lost. Once the backend reports the lease
+// being restored, providerd has nothing to take up: it waits for the backend
+// to finish.
 
 // retainUnacknowledged runs a gated workload with a volume, writes to the
 // volume, and lets end finish the lease on the chain while it is still
@@ -52,58 +52,26 @@ func retainUnacknowledged(t *testing.T, p *Provider, tenant *Tenant, end func(le
 	return source
 }
 
-// oneHeld reports whether exactly one lease on the backend is in the given
-// status with one container that has started and not passed its health check,
-// and records that container in held. It never fails the test. A test uses it
-// for a lease that does not exist when the response to lose is named.
-func oneHeld(backend *e2e.Backend, status string, held *container.InspectResponse) bool {
-	leases, err := backend.Client.List(context.Background())
-	if err != nil {
-		return false
-	}
-	var found []string
-	for _, lease := range leases {
-		if lease.Status == status {
-			found = append(found, lease.UUID)
-		}
-	}
-	if len(found) != 1 {
-		return false
-	}
-	containers, err := backend.TryContainers(found[0])
-	if err != nil || len(containers) != 1 {
-		return false
-	}
-	one := containers[0]
-	if !one.State.Running || one.State.Health == nil || one.State.Health.Status != container.Starting {
-		return false
-	}
-	*held = one
-	return true
-}
-
 // requireRestoredAcrossAnInterruption restores the source into a new lease,
-// loses the backend's answer while the restored workload is started and not
-// yet healthy, and then kills providerd. The restarted providerd must send
-// the restore again, the backend must not run it twice, and the new lease
-// must become active on the source's data.
+// loses providerd's request to the backend, and kills providerd. The
+// restarted providerd must send the restore again, and the new lease must
+// become active on the source's data in one container, started once.
 func requireRestoredAcrossAnInterruption(t *testing.T, p *Provider, tenant *Tenant, source restoreSource) {
 	t.Helper()
 	backend, link := p.Backends[0], p.Links[0]
-	var held container.InspectResponse
-	lost := link.LoseResponse("restore", func() bool { return oneHeld(backend, "restarting", &held) })
+	lost := link.LoseRequest("restore")
 	asked := time.Now()
 	target := tenant.RestoreUnanswered(t, p.SKUs.Stateful, source.leaseUUID, source.manifest)
 	lost.Require(t)
-	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State, "a lease whose workload is not healthy is not acknowledged")
+	_, err := backend.Client.Get(t.Context(), target)
+	require.ErrorIs(t, err, e2e.ErrNotFound, "the backend must not have received the restore")
+	requireStatus(t, backend, source.leaseUUID, "retained")
+	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State)
 
 	p.Kill()
 	p.Start()
-	eventually(t, "the restarted providerd sends the restore of lease "+target+" again", func() bool {
-		// The count starts with the process.
-		return p.Dispatched(t, backend, "restore") >= 1
-	})
-	requireStillHeld(t, backend, target, held)
+	held := requireHeld(t, backend, target, "restarting")
+	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State, "a lease whose workload is not healthy is not acknowledged")
 	openGate(t, backend, held)
 	requireRestored(t, backend, source, requireSettled(t, p, backend, target, held))
 	require.Equal(t, []string{held.ID}, backend.Started(t, target, asked), "the restore must have started one container, once")
