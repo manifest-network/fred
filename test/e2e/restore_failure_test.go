@@ -125,6 +125,10 @@ func volumeFile(t *testing.T, root, name string) string {
 // nothing of the target is left, and checks that it is the same volume: the
 // same directory, in the same project, under the source's quota, and the only
 // one. It returns the volume's root.
+//
+// A restore that has been accepted and has not moved the volume yet looks
+// the same from outside. The caller first waits for a sign that the restore
+// took the volume.
 func requireHandedBack(t *testing.T, b *Backend, source retainedVolume, target string) string {
 	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -238,6 +242,14 @@ func TestBackend_RestoreFailingAfterAWriteKeepsTheVolume(t *testing.T) {
 
 	failing := Spec{LeaseUUID: uuid.NewString(), Tenant: source.tenant, SKU: StatefulSKU}
 	require.NoError(t, b.Client.Restore(t.Context(), failing, source.lease))
+
+	// The restored workload ran on the volume: its file is there, whichever
+	// lease's name the directory carries at this moment.
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		written, err := filepath.Glob(filepath.Join(b.VolumePath, "*", "*", "written-by-target"))
+		assert.NoError(collect, err)
+		assert.Len(collect, written, 1, "the file the restored workload writes")
+	}, time.Minute, 500*time.Millisecond)
 
 	// On 0.14 the lease that holds the volume afterwards is the source.
 	root := requireHandedBack(t, b, source, failing.LeaseUUID)
