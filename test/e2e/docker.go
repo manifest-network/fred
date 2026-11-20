@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -128,6 +129,11 @@ func (b *Backend) TryContainers(leaseUUID string) ([]container.InspectResponse, 
 	inspected := make([]container.InspectResponse, 0, len(listed))
 	for _, summary := range listed {
 		one, err := b.docker.ContainerInspect(ctx, summary.ID)
+		if errdefs.IsNotFound(err) {
+			// Removed since it was listed, as when a backend replaces a
+			// lease's container: it is not one of the lease's containers.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
