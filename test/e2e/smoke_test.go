@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -159,4 +160,41 @@ func requireVolumeBind(t *testing.T, b *Backend, c container.InspectResponse, de
 		}
 	}
 	require.Failf(t, "mount missing", "container %s has no mount at %s", c.ID, destination)
+}
+
+// TestBackend_SecondApplyChangesNothing sends a lease's command a second
+// time under a new operation, as a caller that lost track of the first would.
+// Whether the backend refuses it or accepts it, the lease must keep running
+// in its one container, never restarted.
+//
+// The test does not yet assert what the backend then reports for the lease.
+// 0.14 refuses the second command, and at its next periodic pass reports the
+// lease failed although its container runs untouched: the refused command
+// became the lease's last operation, and a lease whose last operation failed
+// is left out of the pass's inventory (ENG-2195). The status assertion belongs
+// here once that is fixed.
+func TestBackend_SecondApplyChangesNothing(t *testing.T) {
+	b := StartBackend(t)
+	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), lease))
+	requireStatus(t, b, lease.LeaseUUID, statusReady)
+	first := requireOneRunningContainer(t, b, lease.LeaseUUID)
+
+	applied := time.Now()
+	if err := b.Client.Apply(t.Context(), lease); err != nil {
+		// 0.14 refuses a lease it already runs.
+		var refused *StatusError
+		require.ErrorAs(t, err, &refused)
+		require.Equal(t, http.StatusConflict, refused.Status, "second apply: %v", err)
+	}
+	// Two of the backend's periodic passes, in case it acts on the command
+	// after answering it.
+	time.Sleep(20 * time.Second)
+	require.Empty(t, b.Started(t, lease.LeaseUUID, applied), "the second apply must not start a container")
+	now := requireOneRunningContainer(t, b, lease.LeaseUUID)
+	require.Equal(t, first.ID, now.ID)
+	require.Equal(t, first.State.StartedAt, now.State.StartedAt)
+	reported, err := b.Client.Get(t.Context(), lease.LeaseUUID)
+	require.NoError(t, err)
+	t.Logf("after the second apply the backend reports the lease %q", reported.Status)
 }

@@ -46,6 +46,10 @@ type Provider struct {
 	// Backends are the provider's backends, each on its own loopback with its
 	// own storage identity.
 	Backends []*e2e.Backend
+	// Links are the connections from providerd to each backend, in the order
+	// of Backends, when the test asked for them (see Options). Nil otherwise:
+	// providerd then calls the backends directly.
+	Links []*e2e.Link
 	// URL is the base URL of providerd's API.
 	URL string
 	// UUID is the provider's UUID on the chain.
@@ -68,6 +72,22 @@ type Provider struct {
 // then start the daemon. It skips the test when the host cannot run the
 // suite. Cleanup stops providerd first, then the backends, then the chain.
 func StartProvider(t *testing.T, backends int) *Provider {
+	t.Helper()
+	return StartProviderWith(t, backends, Options{})
+}
+
+// Options are what a test changes about the fixture StartProvider builds.
+type Options struct {
+	// BackendSettings are docker-backend settings given to every backend
+	// (see e2e.StartBackendFor).
+	BackendSettings map[string]any
+	// Links makes providerd reach each backend through an e2e.Link, so the
+	// test can lose a backend's response.
+	Links bool
+}
+
+// StartProviderWith is StartProvider with options.
+func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and runs the binaries as a service account")
@@ -109,7 +129,10 @@ func StartProvider(t *testing.T, backends int) *Provider {
 		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
 		// The backend's own client creates leases for this provider, as
 		// providerd does.
-		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served))
+		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served, options.BackendSettings))
+		if options.Links {
+			p.Links = append(p.Links, e2e.StartLink(t, p.Backends[i]))
+		}
 	}
 
 	// providerd gets its own directory and its own copy of the keyring, both
@@ -192,6 +215,13 @@ func (p *Provider) Start() {
 func (p *Provider) Stop() {
 	p.t.Helper()
 	p.process.Stop()
+}
+
+// Kill ends providerd with SIGKILL, as a crash does. A no-op when it is not
+// running.
+func (p *Provider) Kill() {
+	p.t.Helper()
+	p.process.Kill()
 }
 
 // Host returns the backend that reports the lease, and fails the test unless
@@ -281,10 +311,14 @@ func (p *Provider) Dispatched(t *testing.T, backend *e2e.Backend, operation stri
 func (p *Provider) config(key Key, state, listenAddr string) map[string]any {
 	backends := make([]map[string]any, len(p.Backends))
 	for i, backend := range p.Backends {
+		url, caFile := backend.URL, backend.CAFile
+		if p.Links != nil {
+			url, caFile = p.Links[i].URL, p.Links[i].CAFile
+		}
 		backends[i] = map[string]any{
 			"name":                 backend.Name,
-			"url":                  backend.URL,
-			"tls_ca_file":          backend.CAFile,
+			"url":                  url,
+			"tls_ca_file":          caFile,
 			"tls_client_cert_file": backend.ClientCertFile,
 			"tls_client_key_file":  backend.ClientKeyFile,
 			"hmac_secret":          backend.HMACSecret,
