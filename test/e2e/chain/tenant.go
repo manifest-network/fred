@@ -30,9 +30,11 @@ import (
 
 // Lease states as the chain's JSON output spells them.
 const (
-	LeasePending = "LEASE_STATE_PENDING"
-	LeaseActive  = "LEASE_STATE_ACTIVE"
-	LeaseClosed  = "LEASE_STATE_CLOSED"
+	LeasePending  = "LEASE_STATE_PENDING"
+	LeaseActive   = "LEASE_STATE_ACTIVE"
+	LeaseClosed   = "LEASE_STATE_CLOSED"
+	LeaseRejected = "LEASE_STATE_REJECTED"
+	LeaseExpired  = "LEASE_STATE_EXPIRED"
 )
 
 // Tenant is a funded account that leases from a Provider, the way a tenant
@@ -94,6 +96,13 @@ func (tn *Tenant) Deploy(t *testing.T, sku string, manifest map[string]any) stri
 func (tn *Tenant) Close(t *testing.T, leaseUUID string) {
 	t.Helper()
 	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "close-lease", leaseUUID)
+}
+
+// Cancel withdraws a lease the provider has not acknowledged yet. The chain
+// records it as rejected.
+func (tn *Tenant) Cancel(t *testing.T, leaseUUID string) {
+	t.Helper()
+	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "cancel-lease", leaseUUID)
 }
 
 // Restart asks the provider to replace an active lease's containers, keeping

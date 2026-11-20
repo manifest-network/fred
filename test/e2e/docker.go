@@ -159,6 +159,24 @@ func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
 	}
 }
 
+// OccupyContainerName creates a container on this backend's daemon under the
+// given name, from an image the daemon already has, and never starts it. The
+// container carries none of the backend's labels, so the backend does not see
+// it; Docker refuses to create another container of that name. It is removed
+// when the test ends.
+func (b *Backend) OccupyContainerName(t *testing.T, name, image string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	created, err := b.docker.ContainerCreate(ctx, &container.Config{Image: image}, nil, nil, nil, name)
+	require.NoError(t, err, "create a container named %s", name)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = b.docker.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true})
+	})
+}
+
 // Exec runs a command in a container on this backend's daemon and returns its
 // output. A non-zero exit fails the test.
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
