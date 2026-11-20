@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -128,6 +129,11 @@ func (b *Backend) TryContainers(leaseUUID string) ([]container.InspectResponse, 
 	inspected := make([]container.InspectResponse, 0, len(listed))
 	for _, summary := range listed {
 		one, err := b.docker.ContainerInspect(ctx, summary.ID)
+		if errdefs.IsNotFound(err) {
+			// Removed since it was listed, as when a backend replaces a
+			// lease's container: it is not one of the lease's containers.
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -145,6 +151,26 @@ func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
 	for _, one := range b.Containers(t, leaseUUID) {
 		require.NoError(t, b.docker.ContainerRemove(ctx, one.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}))
 	}
+}
+
+// OccupyContainerName creates a container on this backend's daemon under the
+// given name, from an image the daemon already has, and never starts it. The
+// container carries none of the backend's labels, so the backend does not see
+// it; Docker refuses to create another container of that name. It is removed
+// when the test ends.
+func (b *Backend) OccupyContainerName(t *testing.T, name, image string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	created, err := b.docker.ContainerCreate(ctx, &container.Config{Image: image}, nil, nil, nil, name)
+	require.NoError(t, err, "create a container named %s", name)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		// With its volumes: Docker gives a container the anonymous volumes
+		// its image declares when it creates it, started or not.
+		_ = b.docker.ContainerRemove(ctx, created.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	})
 }
 
 // Exec runs a command in a container on this backend's daemon and returns its

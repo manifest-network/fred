@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,10 @@ type Options struct {
 	// Links makes providerd reach each backend through an e2e.Link, so the
 	// test can lose a backend's response.
 	Links bool
+	// PendingTimeout, when set, is how long the chain keeps a lease the
+	// provider has not acknowledged before it expires it. The chain's default
+	// is half an hour and its minimum a minute.
+	PendingTimeout time.Duration
 }
 
 // StartProviderWith is StartProvider with options.
@@ -116,8 +121,13 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 		key = genesis.AddKey(t, providerKey)
 		genesis.AddAccount(t, key.Address, "1000000000umfx")
 		genesis.Edit(t, func(document map[string]any) {
-			sku := document["app_state"].(map[string]any)["sku"].(map[string]any)
+			state := document["app_state"].(map[string]any)
+			sku := state["sku"].(map[string]any)
 			sku["params"].(map[string]any)["allowed_list"] = []string{key.Address}
+			if options.PendingTimeout > 0 {
+				billing := state["billing"].(map[string]any)
+				billing["params"].(map[string]any)["pending_timeout"] = strconv.Itoa(int(options.PendingTimeout.Seconds()))
+			}
 		})
 	})
 	created := p.Chain.Tx(t, providerKey, "sku", "create-provider", key.Address, key.Address).Event(t, "provider_created")

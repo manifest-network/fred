@@ -26,13 +26,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/testutil"
+	"github.com/manifest-network/fred/test/e2e"
 )
 
 // Lease states as the chain's JSON output spells them.
 const (
-	LeasePending = "LEASE_STATE_PENDING"
-	LeaseActive  = "LEASE_STATE_ACTIVE"
-	LeaseClosed  = "LEASE_STATE_CLOSED"
+	LeasePending  = "LEASE_STATE_PENDING"
+	LeaseActive   = "LEASE_STATE_ACTIVE"
+	LeaseClosed   = "LEASE_STATE_CLOSED"
+	LeaseRejected = "LEASE_STATE_REJECTED"
+	LeaseExpired  = "LEASE_STATE_EXPIRED"
 )
 
 // Tenant is a funded account that leases from a Provider, the way a tenant
@@ -96,6 +99,13 @@ func (tn *Tenant) Close(t *testing.T, leaseUUID string) {
 	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "close-lease", leaseUUID)
 }
 
+// Cancel withdraws a lease the provider has not acknowledged yet. The chain
+// records it as rejected.
+func (tn *Tenant) Cancel(t *testing.T, leaseUUID string) {
+	t.Helper()
+	tn.provider.Chain.Tx(t, tn.key.Name, "billing", "cancel-lease", leaseUUID)
+}
+
 // Restart asks the provider to replace an active lease's containers, keeping
 // its manifest.
 func (tn *Tenant) Restart(t *testing.T, leaseUUID string) {
@@ -118,12 +128,34 @@ func (tn *Tenant) Update(t *testing.T, leaseUUID string, manifest map[string]any
 // empty before the restore arrives. It returns the new lease's UUID.
 func (tn *Tenant) Restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any) string {
 	t.Helper()
+	return tn.restore(t, sku, fromLeaseUUID, manifest, func(collect *assert.CollectT, status int, answer string) {
+		assert.Equal(collect, http.StatusAccepted, status, "restore answered: %s", answer)
+	})
+}
+
+// RestoreUnanswered is Restore for a restore the test keeps from the backend:
+// lost is the link losing the provider's restore requests. The provider then
+// cannot tell the tenant that the restore is under way, and answers with an
+// error. The request is repeated until the link has lost one, because the
+// provider can also turn a restore away for a moment before it sends anything,
+// as while it takes stock of its backends.
+func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, lost *e2e.LostRequests) string {
+	t.Helper()
+	return tn.restore(t, sku, fromLeaseUUID, manifest, func(collect *assert.CollectT, status int, answer string) {
+		assert.True(collect, lost.Lost(), "the provider sent no restore; it answered %d: %s", status, answer)
+	})
+}
+
+// restore creates the lease to restore into and sends the restore until
+// done accepts the provider's answer. The source can still be owned by its
+// close, which the provider answers with a conflict, before it sends anything
+// to a backend, and expects to be retried.
+func (tn *Tenant) restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, done func(collect *assert.CollectT, status int, answer string)) string {
+	t.Helper()
 	_, hashHex := encodeManifest(t, manifest)
 	leaseUUID := tn.createLease(t, sku, hashHex)
 	body, err := json.Marshal(map[string]string{"from_lease_uuid": fromLeaseUUID})
 	require.NoError(t, err)
-	// The source can still be owned by its close, which the provider answers
-	// with a conflict and expects to be retried.
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		token, err := tn.accessToken(t.Context(), leaseUUID)
 		if !assert.NoError(collect, err) {
@@ -131,7 +163,7 @@ func (tn *Tenant) Restore(t *testing.T, sku, fromLeaseUUID string, manifest map[
 		}
 		status, answer, err := tn.post(t.Context(), "/v1/leases/"+leaseUUID+"/restore", token, nil, body)
 		if assert.NoError(collect, err) {
-			assert.Equal(collect, http.StatusAccepted, status, "restore answered: %s", answer)
+			done(collect, status, answer)
 		}
 	}, time.Minute, 2*time.Second)
 	return leaseUUID
