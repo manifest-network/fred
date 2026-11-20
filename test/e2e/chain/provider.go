@@ -82,6 +82,8 @@ type Options struct {
 	// BackendSettings are docker-backend settings given to every backend
 	// (see e2e.StartBackendFor).
 	BackendSettings map[string]any
+	// ProviderSettings are providerd settings that replace the fixture's.
+	ProviderSettings map[string]any
 	// Links makes providerd reach each backend through an e2e.Link, so the
 	// test can lose a backend's response.
 	Links bool
@@ -171,7 +173,11 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	}
 	listenAddr := e2e.FreeLoopbackAddr(t)
 	p.URL = "http://" + listenAddr
-	encoded, err := yaml.Marshal(p.config(key, state, listenAddr))
+	config := p.config(key, state, listenAddr)
+	for name, value := range options.ProviderSettings {
+		config[name] = value
+	}
+	encoded, err := yaml.Marshal(config)
 	require.NoError(t, err)
 	configPath := filepath.Join(state, "providerd.yaml")
 	require.NoError(t, os.WriteFile(configPath, encoded, 0o600))

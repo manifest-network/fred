@@ -76,15 +76,22 @@ func (tn *Tenant) Address() string { return tn.key.Address }
 // only a manifest with that hash. It returns the lease's UUID.
 func (tn *Tenant) Deploy(t *testing.T, sku string, manifest map[string]any) string {
 	t.Helper()
+	return tn.DeployItems(t, manifest, sku+":1")
+}
+
+// DeployItems is Deploy for a lease of anything but one unit of one SKU. An
+// item is "sku:quantity", or "sku:quantity:service" for a service of a stack.
+func (tn *Tenant) DeployItems(t *testing.T, manifest map[string]any, items ...string) string {
+	t.Helper()
 	payload, hashHex := encodeManifest(t, manifest)
-	leaseUUID := tn.createLease(t, sku, hashHex)
+	leaseUUID := tn.createLease(t, hashHex, items...)
 
 	// providerd serves its API before it is ready to take payloads, so the
 	// upload is repeated until it is accepted. A token is good for one
 	// request.
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		token := testutil.CreateTestPayloadToken(tn.signer, leaseUUID, hashHex, time.Now())
-		status, body, err := tn.post(t.Context(), "/v1/leases/"+leaseUUID+"/data", token,
+		status, body, err := tn.request(t.Context(), http.MethodPost, "/v1/leases/"+leaseUUID+"/data", token,
 			map[string]string{"Content-Type": "application/octet-stream"}, payload)
 		if assert.NoError(collect, err) {
 			assert.Equal(collect, http.StatusAccepted, status, "upload answered: %s", body)
@@ -153,7 +160,7 @@ func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, man
 func (tn *Tenant) restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, done func(collect *assert.CollectT, status int, answer string)) string {
 	t.Helper()
 	_, hashHex := encodeManifest(t, manifest)
-	leaseUUID := tn.createLease(t, sku, hashHex)
+	leaseUUID := tn.createLease(t, hashHex, sku+":1")
 	body, err := json.Marshal(map[string]string{"from_lease_uuid": fromLeaseUUID})
 	require.NoError(t, err)
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
@@ -161,7 +168,7 @@ func (tn *Tenant) restore(t *testing.T, sku, fromLeaseUUID string, manifest map[
 		if !assert.NoError(collect, err) {
 			return
 		}
-		status, answer, err := tn.post(t.Context(), "/v1/leases/"+leaseUUID+"/restore", token, nil, body)
+		status, answer, err := tn.request(t.Context(), http.MethodPost, "/v1/leases/"+leaseUUID+"/restore", token, nil, body)
 		if assert.NoError(collect, err) {
 			done(collect, status, answer)
 		}
@@ -180,20 +187,37 @@ func (tn *Tenant) maintain(t *testing.T, leaseUUID, kind string, body []byte) {
 		if !assert.NoError(collect, err) {
 			return
 		}
-		status, answer, err := tn.post(t.Context(), "/v1/leases/"+leaseUUID+"/"+kind, token, headers, body)
+		status, answer, err := tn.request(t.Context(), http.MethodPost, "/v1/leases/"+leaseUUID+"/"+kind, token, headers, body)
 		if assert.NoError(collect, err) {
 			assert.Equal(collect, http.StatusAccepted, status, "%s answered: %s", kind, answer)
 		}
 	}, time.Minute, 2*time.Second)
 }
 
-// createLease creates a lease for one unit of a SKU, recording a manifest
+// Read reads one of a lease's resources from the provider's API as its
+// tenant: "status", "provision", "connection", "logs" or "releases". It
+// returns the status the provider answered with, and decodes the body of a
+// 200 into out.
+func (tn *Tenant) Read(t *testing.T, leaseUUID, resource string, out any) int {
+	t.Helper()
+	token, err := tn.accessToken(t.Context(), leaseUUID)
+	require.NoError(t, err)
+	status, answer, err := tn.request(t.Context(), http.MethodGet, "/v1/leases/"+leaseUUID+"/"+resource, token, nil, nil)
+	require.NoError(t, err, "read %s of lease %s", resource, leaseUUID)
+	if status == http.StatusOK && out != nil {
+		require.NoError(t, json.Unmarshal([]byte(answer), out), "%s of lease %s: %s", resource, leaseUUID, answer)
+	}
+	return status
+}
+
+// createLease creates a lease for the given items, recording a manifest
 // hash, and returns its UUID.
-func (tn *Tenant) createLease(t *testing.T, sku, hashHex string) string {
+func (tn *Tenant) createLease(t *testing.T, hashHex string, items ...string) string {
 	t.Helper()
 	// The transaction's own event names the lease it created, so no search
 	// of the tenant's leases can pick another one.
-	created := tn.provider.Chain.Tx(t, tn.key.Name, "billing", "create-lease", sku+":1", "--meta-hash", hashHex).Event(t, "lease_created")
+	args := append([]string{"billing", "create-lease"}, items...)
+	created := tn.provider.Chain.Tx(t, tn.key.Name, append(args, "--meta-hash", hashHex)...).Event(t, "lease_created")
 	require.Equal(t, tn.key.Address, created["tenant"])
 	require.Equal(t, tn.provider.UUID, created["provider_uuid"])
 	require.Equal(t, hashHex, created["meta_hash"])
@@ -216,10 +240,11 @@ func (tn *Tenant) accessToken(ctx context.Context, leaseUUID string) (string, er
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (tn *Tenant) post(ctx context.Context, path, token string, headers map[string]string, body []byte) (int, string, error) {
+// request sends one request to the provider's API with a tenant token.
+func (tn *Tenant) request(ctx context.Context, method, path, token string, headers map[string]string, body []byte) (int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tn.provider.URL+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, tn.provider.URL+path, bytes.NewReader(body))
 	if err != nil {
 		return 0, "", err
 	}
