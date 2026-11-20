@@ -400,24 +400,32 @@ func TestCrash_BackendDuringRestart(t *testing.T) {
 }
 
 // holdClose closes a lease whose workload ignores SIGTERM, and waits until
-// the backend is in the middle of stopping it.
-func holdClose(t *testing.T, p *Provider, tenant *Tenant) (leaseUUID string) {
+// the backend is in the middle of stopping it. It returns the lease and the
+// workload being stopped.
+func holdClose(t *testing.T, p *Provider, tenant *Tenant) (leaseUUID string, workload container.InspectResponse) {
 	t.Helper()
 	backend := p.Backends[0]
 	// sleep runs as the container's first process, which gets no default
 	// signal handling: SIGTERM does nothing, and the stop lasts its grace.
 	leaseUUID = deployActive(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
-	workload := running(t, backend, leaseUUID)
+	workload = running(t, backend, leaseUUID)
 	tenant.Close(t, leaseUUID)
 	eventually(t, "the close of lease "+leaseUUID+" is held while its workload stops", func() bool {
 		lease, err := backend.Client.Get(t.Context(), leaseUUID)
 		return err == nil && lease.Status == "deprovisioning"
 	})
+	requireCloseHeld(t, backend, leaseUUID, workload)
+	return leaseUUID, workload
+}
+
+// requireCloseHeld checks that the lease's workload is still being stopped:
+// the close has started and has not finished.
+func requireCloseHeld(t *testing.T, backend *e2e.Backend, leaseUUID string, workload container.InspectResponse) {
+	t.Helper()
 	containers := backend.Containers(t, leaseUUID)
 	require.Len(t, containers, 1)
 	require.Equal(t, workload.ID, containers[0].ID)
 	require.True(t, containers[0].State.Running, "the workload must still be stopping: %s", containers[0].State.Status)
-	return leaseUUID
 }
 
 // TestCrash_BackendDuringClose kills the backend while it stops a closed
@@ -425,13 +433,21 @@ func holdClose(t *testing.T, p *Provider, tenant *Tenant) (leaseUUID string) {
 func TestCrash_BackendDuringClose(t *testing.T) {
 	p := StartProviderWith(t, 1, heldSettings(map[string]any{"container_stop_timeout": stopGrace}))
 	backend, tenant := p.Backends[0], p.NewTenant(t)
-	lease := holdClose(t, p, tenant)
+	lease, workload := holdClose(t, p, tenant)
 
+	// providerd asks a backend again to close every closed lease it still
+	// finds there, which would finish this close whatever the backend does.
+	// It is down until the backend has finished alone. It is killed, not
+	// stopped: a stop could outlast the workload's stop grace.
+	p.Kill()
+	requireCloseHeld(t, backend, lease, workload)
 	backend.Kill()
 	backend.Start()
-
 	requireNothingLeft(t, tenant, backend, lease)
+
+	p.Start()
 	p.AwaitSweeps(t, 2, SweepComplete)
+	require.Empty(t, backend.Leftovers(lease))
 }
 
 // TestCrash_ProviderdDuringCreate kills providerd while a new lease's
@@ -479,7 +495,7 @@ func TestCrash_ProviderdDuringRestore(t *testing.T) {
 func TestCrash_ProviderdDuringClose(t *testing.T) {
 	p := StartProviderWith(t, 1, heldSettings(map[string]any{"container_stop_timeout": stopGrace}))
 	backend, tenant := p.Backends[0], p.NewTenant(t)
-	lease := holdClose(t, p, tenant)
+	lease, _ := holdClose(t, p, tenant)
 
 	p.Kill()
 	requireNothingLeft(t, tenant, backend, lease)
