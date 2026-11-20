@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,6 +155,25 @@ func requireHandedBack(t *testing.T, b *Backend, source retainedVolume, target s
 	return root
 }
 
+// requireQuotaEnforced writes into a volume from the host until XFS refuses,
+// and checks that it refuses within the given limit. A limit that is only
+// reported proves less: the volume just had a larger one. The file is removed
+// again.
+func requireQuotaEnforced(t *testing.T, root string, limitMB int) {
+	t.Helper()
+	probe := filepath.Join(root, "quota-probe")
+	file, err := os.Create(probe) //nolint:gosec // G304: a path under the fixture's volume directory
+	require.NoError(t, err)
+	megabyte := make([]byte, 1<<20)
+	written := 0
+	for ; err == nil && written < 2*limitMB; written++ {
+		_, err = file.Write(megabyte)
+	}
+	require.NoError(t, errors.Join(file.Close(), os.Remove(probe)))
+	require.Error(t, err, "%d MB were written to a volume limited to %d MB", written, limitMB)
+	require.LessOrEqual(t, written, limitMB+1, "the write must have been refused at the limit: %v", err)
+}
+
 // restoreAgain restores the source into a new lease once the backend lets it,
 // and returns that lease. The volume is back in place a moment before the
 // source lease may be restored from again, and until then the backend
@@ -201,13 +221,14 @@ func TestBackend_RestoreFailingBeforeAnyWorkloadReturnsTheVolume(t *testing.T) {
 	require.Equal(t, source.inode, inodeOf(t, adopted), "the target must have been given the source's own directory")
 	require.Empty(t, b.Containers(t, failing.LeaseUUID), "no workload of the target may have been created")
 
-	requireHandedBack(t, b, source, failing.LeaseUUID)
+	root := requireHandedBack(t, b, source, failing.LeaseUUID)
+	requireQuotaEnforced(t, root, statefulDiskMB)
 
 	// The same restore, into a new lease, goes through.
 	retry := restoreAgain(t, b, source, largeStatefulSKU)
 	restored := requireOneRunningContainer(t, b, retry.LeaseUUID)
 	require.Equal(t, "kept\n", b.Exec(t, restored.ID, "cat", "/data/sentinel"))
-	root := oneVolumeRoot(t, b, retry.LeaseUUID)
+	root = oneVolumeRoot(t, b, retry.LeaseUUID)
 	require.Equal(t, source.inode, inodeOf(t, root), "the restored volume must be the source's own directory")
 	require.Equal(t, largeDiskMB*1024, b.QuotaLimitKB(t, root), "the restored volume must have the new lease's quota")
 	requireGone(t, b, source.lease)
