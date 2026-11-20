@@ -21,11 +21,15 @@ import (
 // does for a closed lease, and the tenant must be able to restore it
 // (ENG-2130). The other tests of this suite restore from closed leases.
 //
-// Each test also loses the backend's answer to the restore while the restore
-// is under way. providerd then reads the source lease again before it sends
-// the restore a second time, so the tests cover both places where a source
-// that was never active used to be turned away: when the restore is asked
-// for, and when it is taken up again.
+// Each test also interrupts the restore: the backend's answer to it is lost,
+// and providerd is killed while the restored workload is not yet healthy. The
+// restarted providerd finds a restore it never heard back about, and reads
+// the source lease again before it sends the restore a second time. So the
+// tests cover both places where a source that was never active used to be
+// turned away: when the restore is asked for, and when it is taken up again.
+//
+// The restart is needed. A providerd that stays up waits for the backend to
+// report on the restore it asked for, and sends nothing again.
 
 // retainUnacknowledged runs a gated workload with a volume, writes to the
 // volume, and lets end finish the lease on the chain while it is still
@@ -78,23 +82,26 @@ func oneHeld(backend *e2e.Backend, status string, held *container.InspectRespons
 	return true
 }
 
-// requireRestoredAcrossALostAnswer restores the source into a new lease and
+// requireRestoredAcrossAnInterruption restores the source into a new lease,
 // loses the backend's answer while the restored workload is started and not
-// yet healthy. providerd must send the restore again, the backend must not
-// run it twice, and the new lease must become active on the source's data.
-func requireRestoredAcrossALostAnswer(t *testing.T, p *Provider, tenant *Tenant, source restoreSource) {
+// yet healthy, and then kills providerd. The restarted providerd must send
+// the restore again, the backend must not run it twice, and the new lease
+// must become active on the source's data.
+func requireRestoredAcrossAnInterruption(t *testing.T, p *Provider, tenant *Tenant, source restoreSource) {
 	t.Helper()
 	backend, link := p.Backends[0], p.Links[0]
-	sentBefore := p.Dispatched(t, backend, "restore")
 	var held container.InspectResponse
 	lost := link.LoseResponse("restore", func() bool { return oneHeld(backend, "restarting", &held) })
 	asked := time.Now()
-	target := tenant.Restore(t, p.SKUs.Stateful, source.leaseUUID, source.manifest)
+	target := tenant.RestoreUnanswered(t, p.SKUs.Stateful, source.leaseUUID, source.manifest)
 	lost.Require(t)
 	require.Equal(t, LeasePending, p.Chain.Lease(t, target).State, "a lease whose workload is not healthy is not acknowledged")
 
-	eventually(t, "providerd sends the restore of lease "+target+" again", func() bool {
-		return p.Dispatched(t, backend, "restore") >= sentBefore+2
+	p.Kill()
+	p.Start()
+	eventually(t, "the restarted providerd sends the restore of lease "+target+" again", func() bool {
+		// The count starts with the process.
+		return p.Dispatched(t, backend, "restore") >= 1
 	})
 	requireStillHeld(t, backend, target, held)
 	openGate(t, backend, held)
@@ -115,7 +122,7 @@ func TestRestore_FromALeaseTheTenantWithdrew(t *testing.T) {
 		tenant.Cancel(t, leaseUUID)
 		require.Equal(t, LeaseRejected, p.Chain.Lease(t, leaseUUID).State)
 	})
-	requireRestoredAcrossALostAnswer(t, p, tenant, source)
+	requireRestoredAcrossAnInterruption(t, p, tenant, source)
 }
 
 // TestRestore_FromALeaseThatExpired restores the data of a lease the chain
@@ -139,5 +146,5 @@ func TestRestore_FromALeaseThatExpired(t *testing.T) {
 			return false
 		})
 	})
-	requireRestoredAcrossALostAnswer(t, p, tenant, source)
+	requireRestoredAcrossAnInterruption(t, p, tenant, source)
 }

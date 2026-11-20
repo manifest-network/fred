@@ -127,12 +127,32 @@ func (tn *Tenant) Update(t *testing.T, leaseUUID string, manifest map[string]any
 // empty before the restore arrives. It returns the new lease's UUID.
 func (tn *Tenant) Restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any) string {
 	t.Helper()
+	return tn.restore(t, sku, fromLeaseUUID, manifest, func(collect *assert.CollectT, status int, answer string) {
+		assert.Equal(collect, http.StatusAccepted, status, "restore answered: %s", answer)
+	})
+}
+
+// RestoreUnanswered is Restore for a restore whose answer from the backend
+// the test loses. The provider then cannot tell the tenant that the restore
+// is under way, and answers with an error although it is. The request ends
+// at the first answer that is not a conflict.
+func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any) string {
+	t.Helper()
+	return tn.restore(t, sku, fromLeaseUUID, manifest, func(collect *assert.CollectT, status int, answer string) {
+		assert.NotEqual(collect, http.StatusConflict, status, "restore answered: %s", answer)
+	})
+}
+
+// restore creates the lease to restore into and sends the restore until
+// done accepts the provider's answer. The source can still be owned by its
+// close, which the provider answers with a conflict, before it sends anything
+// to a backend, and expects to be retried.
+func (tn *Tenant) restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, done func(collect *assert.CollectT, status int, answer string)) string {
+	t.Helper()
 	_, hashHex := encodeManifest(t, manifest)
 	leaseUUID := tn.createLease(t, sku, hashHex)
 	body, err := json.Marshal(map[string]string{"from_lease_uuid": fromLeaseUUID})
 	require.NoError(t, err)
-	// The source can still be owned by its close, which the provider answers
-	// with a conflict and expects to be retried.
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		token, err := tn.accessToken(t.Context(), leaseUUID)
 		if !assert.NoError(collect, err) {
@@ -140,7 +160,7 @@ func (tn *Tenant) Restore(t *testing.T, sku, fromLeaseUUID string, manifest map[
 		}
 		status, answer, err := tn.post(t.Context(), "/v1/leases/"+leaseUUID+"/restore", token, nil, body)
 		if assert.NoError(collect, err) {
-			assert.Equal(collect, http.StatusAccepted, status, "restore answered: %s", answer)
+			done(collect, status, answer)
 		}
 	}, time.Minute, 2*time.Second)
 	return leaseUUID
