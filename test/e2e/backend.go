@@ -167,9 +167,6 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 	serverCert, serverKey := ca.issue(t, state, "server", "docker-backend", true)
 	b.CAFile = ca.certFile
 	b.ClientCertFile, b.ClientKeyFile = ca.issue(t, state, "client", clientCertName, false)
-	listenAddr := FreeLoopbackAddr(t)
-	b.URL = "https://" + listenAddr
-	b.healthURL = b.URL + "/health"
 
 	// One key signs requests in both directions, as callback_secret does in
 	// production.
@@ -178,6 +175,11 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 	sink := httptest.NewServer(acknowledgeCallbacks(secret))
 	t.Cleanup(sink.Close)
 	callbacks, err := placement.NewCallbackRouteFactory(sink.URL)
+	// Picked after the sink has its own port: the backend's is free, not
+	// reserved, and the next listener this process opens could be given it.
+	listenAddr := FreeLoopbackAddr(t)
+	b.URL = "https://" + listenAddr
+	b.healthURL = b.URL + "/health"
 	require.NoError(t, err)
 	b.Client = &Client{
 		http:         &http.Client{Timeout: time.Minute, Transport: &http.Transport{TLSClientConfig: ca.clientConfig(t)}},

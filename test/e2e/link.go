@@ -24,8 +24,9 @@ import (
 
 // Link is the connection from providerd to one backend, with the test in the
 // middle of it. It forwards every request and response unchanged, until a
-// test asks it to lose a response: the backend then receives the request and
-// does the work, and its caller never hears back.
+// test asks it to lose one. A lost response: the backend receives the request
+// and does the work, and its caller never hears back. A lost request: the
+// backend never receives it, and its caller cannot tell the two apart.
 //
 // The link ends the caller's TLS with a certificate of its own, and calls the
 // backend as providerd would, with the backend's client certificate. Request
@@ -39,9 +40,10 @@ type Link struct {
 	target    *url.URL
 	transport http.RoundTripper
 
-	mu   sync.Mutex
-	lose *LostResponse
-	sent map[string]Command
+	mu          sync.Mutex
+	lose        *LostResponse
+	loseRequest *LostRequest
+	sent        map[string]Command
 }
 
 // Command is one request a caller sent through a Link, kept as it was sent.
@@ -60,6 +62,12 @@ type LostResponse struct {
 
 	done    chan struct{}
 	reached bool
+}
+
+// LostRequest is one request a Link was asked to lose.
+type LostRequest struct {
+	operation string
+	done      chan struct{}
 }
 
 // errLost marks a response the link discards.
@@ -102,7 +110,7 @@ func StartLink(t *testing.T, b *Backend) *Link {
 	key, err := x509.ParseECPrivateKey(keyDER)
 	require.NoError(t, err)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !link.record(r) {
+		if !link.record(r) || link.drops(r) {
 			panic(http.ErrAbortHandler)
 		}
 		proxy.ServeHTTP(w, r)
@@ -128,6 +136,40 @@ func (l *Link) LoseResponse(operation string, settled func() bool) *LostResponse
 	defer l.mu.Unlock()
 	l.lose = lost
 	return lost
+}
+
+// LoseRequest makes the link lose the caller's next request for an operation,
+// named as in LoseResponse. The backend never receives it, and the caller's
+// connection ends without an answer.
+func (l *Link) LoseRequest(operation string) *LostRequest {
+	lost := &LostRequest{operation: operation, done: make(chan struct{})}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.loseRequest = lost
+	return lost
+}
+
+// drops reports whether the request is the one the link was asked to lose.
+func (l *Link) drops(r *http.Request) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lost := l.loseRequest
+	if lost == nil || r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/"+lost.operation) {
+		return false
+	}
+	l.loseRequest = nil
+	close(lost.done)
+	return true
+}
+
+// Require waits until the request was lost.
+func (r *LostRequest) Require(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.done:
+	case <-time.After(lostResponseBudget):
+		t.Fatalf("no %s was sent for the link to lose", r.operation)
+	}
 }
 
 // intercept discards the response the link was asked to lose, and lets every
