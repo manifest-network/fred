@@ -42,8 +42,10 @@ func chain(links int) Spec {
 //   - A service in several instances whose instance names collide with
 //     another service's name: two instances of web are web-0 and web-1.
 func TestBackend_ManifestOutsideTheLimitsIsRefused(t *testing.T) {
-	// Room for the eleven services of the longest chain that is allowed.
-	b := StartBackendWithConfig(t, map[string]any{"total_cpu_cores": 4.0})
+	// Room for the eleven services of the longest chain that is allowed. A
+	// container without a volume is still counted 64 MB of the disk pool, for
+	// what it writes to its scratch space.
+	b := StartBackendWithConfig(t, map[string]any{"total_cpu_cores": 4.0, "total_disk_mb": 1024})
 	timed := func(field, value string) Spec {
 		lease := stateless("tenant-a")
 		lease.Manifest["health_check"] = map[string]any{"test": []string{"CMD", "true"}, field: value}
