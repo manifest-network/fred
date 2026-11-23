@@ -186,6 +186,7 @@ The providerd tier skips unless `MANIFESTD` names a `manifestd` binary. `.manife
 - Workload images are pinned by digest (the constants in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
 - Every image comes from `ghcr.io/manifest-network/fred-e2e`, the Docker Official Images (busybox, redis) included: `test/e2e/images/` republishes them unchanged. A backend pulls without credentials, once per image for every test, and Docker Hub and ECR Public both refuse a client that asks that often.
 - A test that needs an image no public one provides gets one built from a directory under `test/e2e/images/` and published to `ghcr.io/manifest-network/fred-e2e` by `e2e-images.yml`. See `test/e2e/images/README.md`.
+- A test about the image itself (its labels, its platforms, a tag that moves) pushes one to the fixture's own registry, `Backend.Registry`, and deploys it by the reference the push returns. Those images run busybox and need no pin: the test describes them.
 - The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). The providerd tier adds `Provider`, built on that fixture, and `Tenant`. A new feature adds a test, not harness code, and production code carries no hook for the suite.
 
 #### Proving a regression test

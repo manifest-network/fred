@@ -370,6 +370,29 @@ func TestMaintenance_UpdateToAnImageThatCannotBePulledChangesNothing(t *testing.
 	requireUnchanged("after the provider restarted")
 }
 
+// TestMaintenance_RestartKeepsTheImageAfterItsTagMoved restarts a lease whose
+// image tag has moved since the deploy, to an image the backend refuses. A
+// restart runs the lease again as it is: the new container must be created
+// from the image the lease was deployed with, not from what its tag names
+// now (G21).
+func TestMaintenance_RestartKeepsTheImageAfterItsTagMoved(t *testing.T) {
+	p := StartProvider(t, 1)
+	backend, tenant := p.Backends[0], p.NewTenant(t)
+	const name = "app:stable"
+	deployed := backend.Registry.Push(t, name, e2e.Image{Labels: map[string]string{"app.release": "first"}})
+	lease := deployActive(t, p, tenant, p.SKUs.Stateless, runs(deployed.Reference))
+	describeOnFailure(t, backend, lease)
+	before := running(t, backend, lease)
+	require.Equal(t, backend.ImageID(t, deployed), before.Image)
+
+	backend.Registry.Push(t, name, e2e.Image{Labels: map[string]string{"traefik.enable": "true"}})
+	tenant.Restart(t, lease)
+	after := replaced(t, backend, lease, before)
+	require.Equal(t, backend.ImageID(t, deployed), after.Image, "the restarted container must run the image the lease was deployed with")
+	requireImage(t, after, deployed.Reference)
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
+}
+
 // TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload updates a
 // lease to a manifest whose workload starts and never passes its health
 // check. By then the lease's old container is gone: it was stopped before the
