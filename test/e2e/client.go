@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -38,6 +39,10 @@ const CodeInsufficientResources = backend.CodeInsufficientResources
 // CodeCompletionPending is the code of the refusal a backend gives a lease's
 // next command while its report of the previous one is unacknowledged.
 const CodeCompletionPending = backend.CodeOperationCompletionPending
+
+// CodeDemoteExceedsTier is the code of the refusal a backend gives a restore
+// into a lease with less disk than the retained data takes.
+const CodeDemoteExceedsTier = backend.CodeDemoteExceedsTier
 
 // What a backend finds wrong with a lease it refuses as invalid.
 const (
@@ -96,6 +101,10 @@ type Lease struct {
 	// closing the lease, and BudgetExhausted whether they have closed it.
 	ConsecutiveFailures int
 	BudgetExhausted     bool
+	// RetainedUntil is when the backend will destroy a retained lease's
+	// data. Zero for a lease that is not retained, and for one a backend
+	// keeps without an age limit.
+	RetainedUntil time.Time
 }
 
 // StatusError is a response outside 2xx.
@@ -262,6 +271,7 @@ func leaseOf(info backend.ProvisionInfo) Lease {
 	lease := Lease{
 		UUID: info.LeaseUUID, Status: string(info.Status), Partition: info.Partition,
 		FailCount: info.FailCount, Reason: string(info.Reason), Message: info.Message,
+		RetainedUntil: info.RetainedUntil,
 	}
 	if budget := info.TerminalBudget; budget != nil {
 		lease.ConsecutiveFailures = budget.ConsecutiveFailures

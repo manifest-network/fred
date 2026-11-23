@@ -12,7 +12,19 @@ import (
 // the pquota option required for project-quota enforcement. Returns the mount
 // path. Cleanup (umount) is registered via t.Cleanup.
 // Skips if root, mkfs.xfs, xfs_quota, or a usable loop device are absent.
+//
+// 512M: modern xfsprogs refuses to mkfs an XFS filesystem smaller than 300MB
+// ("Filesystem must be larger than 300MB"). The per-volume project quotas
+// (tens of MiB) are independent of this backing-image size.
 func SetupXFSLoopback(t testing.TB) string {
+	t.Helper()
+	return SetupXFSLoopbackOfSize(t, "512M")
+}
+
+// SetupXFSLoopbackOfSize is SetupXFSLoopback with a backing image of the
+// given size, as truncate(1) takes it. The image is sparse: a larger one
+// costs no more disk, and holds more inodes.
+func SetupXFSLoopbackOfSize(t testing.TB, size string) string {
 	t.Helper()
 
 	if os.Getuid() != 0 {
@@ -32,10 +44,7 @@ func SetupXFSLoopback(t testing.TB) string {
 		t.Fatalf("create mount point: %v", err)
 	}
 
-	// 512M: modern xfsprogs refuses to mkfs an XFS filesystem smaller than
-	// 300MB ("Filesystem must be larger than 300MB"). The per-volume project
-	// quotas (tens of MiB) are independent of this backing-image size.
-	if out, err := exec.Command("truncate", "-s", "512M", imgFile).CombinedOutput(); err != nil { //nolint:gosec // G204: constant binary, path under t.TempDir
+	if out, err := exec.Command("truncate", "-s", size, imgFile).CombinedOutput(); err != nil { //nolint:gosec // G204: constant binary, a size the test names, path under t.TempDir
 		t.Fatalf("truncate: %v: %s", err, out)
 	}
 	if out, err := exec.Command("mkfs.xfs", "-f", imgFile).CombinedOutput(); err != nil { //nolint:gosec // G204: constant binary, path under t.TempDir

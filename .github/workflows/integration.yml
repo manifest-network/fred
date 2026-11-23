@@ -286,7 +286,7 @@ jobs:
           set -uo pipefail
           case "$SUITE" in
             e2e)
-              images="ghcr.io/manifest-network/fred-e2e:busybox-6fb94d8d9227@sha256:b66abc847a308ea12831a6c12cb6f3920cfb99400d92b951c52bc4d914cf48b2 ghcr.io/manifest-network/fred-e2e:redis-5612f20db1e9@sha256:abb96089ca435b3d656fa453f155ec3aa54dd757cbe3f3d42fc2eabd8cbbbf03 ghcr.io/manifest-network/fred-e2e:redis-alpine-801a158eb48c@sha256:621bf77af3920abd1956aa833809b12297ed53350ac7a698ba4c437f944b38a6 ghcr.io/manifest-network/fred-e2e:nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00 ghcr.io/manifest-network/fred-e2e:projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
+              images="ghcr.io/manifest-network/fred-e2e:busybox-6fb94d8d9227@sha256:b66abc847a308ea12831a6c12cb6f3920cfb99400d92b951c52bc4d914cf48b2 ghcr.io/manifest-network/fred-e2e:redis-5612f20db1e9@sha256:abb96089ca435b3d656fa453f155ec3aa54dd757cbe3f3d42fc2eabd8cbbbf03 ghcr.io/manifest-network/fred-e2e:redis-alpine-801a158eb48c@sha256:621bf77af3920abd1956aa833809b12297ed53350ac7a698ba4c437f944b38a6 ghcr.io/manifest-network/fred-e2e:nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00 ghcr.io/manifest-network/fred-e2e:projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396 ghcr.io/manifest-network/fred-e2e:writable-path-a32ef8280dcd@sha256:17026bb62210c9a869db160328102cd9a1d6a059130af64d24d43174310406f5"
               ;;
             *)
               images="busybox:latest alpine:latest redis:7 redis:7-alpine"
