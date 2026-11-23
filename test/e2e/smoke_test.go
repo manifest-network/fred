@@ -79,7 +79,7 @@ func TestBackend_Lifecycle(t *testing.T) {
 
 	leases, err := b.Client.List(ctx)
 	require.NoError(t, err)
-	require.Equal(t, []Lease{{UUID: lease.LeaseUUID, Status: statusReady}}, leases)
+	require.Equal(t, []Lease{{UUID: lease.LeaseUUID, Status: statusReady, Tenant: lease.Tenant}}, leases)
 
 	closeLease(t, b, lease.LeaseUUID)
 	requireGone(t, b, lease.LeaseUUID)
