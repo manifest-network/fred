@@ -201,6 +201,15 @@ func TestBackend_RetainedDataIsDestroyedAtItsAgeLimit(t *testing.T) {
 	requireNotListed(t, b, source.lease)
 }
 
+// writeDirect is a dd that writes megabytes of zeros straight to the disk,
+// to the file and in the number its arguments name. A dd that wrote 96 MB
+// through the page cache was killed (exit 137) once in CI, in a container
+// with 128 MB of memory: a buffered write is counted against the container's
+// memory until it reaches the disk, which is the likely cause.
+func writeDirect(file string, megabytes int) []string {
+	return []string{"dd", "if=/dev/zero", "bs=1M", "oflag=direct", "of=" + file, fmt.Sprintf("count=%d", megabytes)}
+}
+
 // filled runs a lease with a volume on the given SKU and writes megabytes of
 // data to the volume. It returns the lease and its container.
 func filled(t *testing.T, b *Backend, sku string, megabytes int) (Spec, string) {
@@ -209,7 +218,7 @@ func filled(t *testing.T, b *Backend, sku string, megabytes int) (Spec, string) 
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	workload := requireOneRunningContainer(t, b, lease.LeaseUUID)
-	b.Exec(t, workload.ID, "dd", "if=/dev/zero", "of=/data/payload", "bs=1M", fmt.Sprintf("count=%d", megabytes), "conv=fsync")
+	b.Exec(t, workload.ID, writeDirect("/data/payload", megabytes)...)
 	return lease, workload.ID
 }
 
@@ -240,7 +249,7 @@ func TestBackend_RestoreIntoAnotherTier(t *testing.T) {
 		between = statefulDiskMB + statefulDiskMB/2
 	)
 	// fill brings a volume that holds little to between.
-	fill := []string{"dd", "if=/dev/zero", "of=/data/more", "bs=1M", fmt.Sprintf("count=%d", between-little)}
+	fill := writeDirect("/data/more", between-little)
 	restore := func(t *testing.T, source retainedVolume, sku string) (Spec, error) {
 		target := Spec{LeaseUUID: uuid.NewString(), Tenant: source.tenant, SKU: sku}
 		return target, b.Client.Restore(t.Context(), target, source.lease)

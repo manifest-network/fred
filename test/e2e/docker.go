@@ -202,6 +202,12 @@ func (b *Backend) OccupyContainerName(t *testing.T, name, image string) {
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	t.Helper()
 	exitCode, output := b.TryExec(t, containerID, cmd...)
+	if exitCode == 137 {
+		// Killed. A process killed for the container's memory limit says
+		// nothing itself; the container's counters do.
+		_, events := b.TryExec(t, containerID, "cat", "/sys/fs/cgroup/memory.events")
+		output += "\nthe container's memory events:\n" + events
+	}
 	require.Zero(t, exitCode, "exec %v: %s", cmd, output)
 	return output
 }

@@ -233,11 +233,11 @@ func TestBackend_EveryInstanceHasItsOwnVolume(t *testing.T) {
 // moment the workload is refused, so the refusal is the volume's limit and
 // not a full filesystem (ENG-548).
 //
-// The lease has a gigabyte of memory. With the fixture's 128 MB, the shell
-// creating the files was killed three quarters of the way to the limit. The
-// likely cause: the kernel counts the inodes a container creates against the
-// container's memory for as long as it caches them. The test logs the
-// container's peak memory.
+// The lease has a gigabyte of memory. The kernel counts the inodes a
+// container creates against the container's memory for as long as it caches
+// them: in CI the container's memory peaked near 400 MB, and with the
+// fixture's 128 MB the shell creating the files was killed three quarters of
+// the way to the limit.
 func TestBackend_VolumeQuotaIsEnforced(t *testing.T) {
 	b := StartBackendWithConfig(t, map[string]any{"sku_profiles": map[string]any{
 		"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
@@ -269,13 +269,8 @@ func TestBackend_VolumeQuotaIsEnforced(t *testing.T) {
 	const batch = 20_000
 	for from := 0; from < limit-used; from += batch {
 		create := fmt.Sprintf("i=%d; while [ $i -lt %d ]; do : > /data/f$i || exit 1; i=$((i+1)); done", from, min(from+batch, limit-used))
-		if code, out := b.TryExec(t, workload.ID, "sh", "-c", create); code != 0 {
-			_, memory := b.TryExec(t, workload.ID, "cat", "/sys/fs/cgroup/memory.events")
-			require.Failf(t, "creating files below the limit failed", "from file %d, exit code %d: %s\nthe container's memory events:\n%s", from, code, out, memory)
-		}
+		b.Exec(t, workload.ID, "sh", "-c", create)
 	}
-	_, peak := b.TryExec(t, workload.ID, "cat", "/sys/fs/cgroup/memory.peak")
-	t.Logf("the container's memory peaked at %s bytes", strings.TrimSpace(peak))
 	used, _ = b.InodeQuota(t, root)
 	require.Equal(t, limit, used, "the volume must hold exactly its limit")
 
