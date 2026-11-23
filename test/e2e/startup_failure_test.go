@@ -71,12 +71,14 @@ func TestBackend_WorkloadThatExitsAtOnceFailsTheLease(t *testing.T) {
 }
 
 // applyAgain applies a lease whose previous deploy failed, and returns when
-// the backend accepted it. A 0.14 backend reports a failure before its
-// callback about it is acknowledged, and refuses the lease's next command
-// until then. Only that refusal is retried, for thirty seconds; the sink
-// acknowledges every callback at once.
+// the backend accepted it. A 0.14 backend refuses a failed lease's next
+// command until it has settled the failed one and its callback about it is
+// acknowledged, both of which come after it reports the lease failed. So this
+// waits for that callback, then retries the one refusal that is left, of a
+// callback sent and not yet recorded as acknowledged, for thirty seconds.
 func applyAgain(t *testing.T, b *Backend, lease Spec) time.Time {
 	t.Helper()
+	b.AwaitCompletionCallback(t, lease.LeaseUUID)
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		applied := time.Now()
@@ -100,7 +102,12 @@ func TestBackend_WorkloadThatExitsWhileWatchedCountsEveryTime(t *testing.T) {
 	b := StartBackendWithConfig(t, map[string]any{"provision_timeout": "10m", "startup_verify_duration": "5s"})
 	lease := leaseRunning("sh", "-c", "sleep 1; exit 3")
 	for attempt := 1; attempt <= 3; attempt++ {
-		applied := applyAgain(t, b, lease)
+		applied := time.Now()
+		if attempt == 1 {
+			require.NoError(t, b.Client.Apply(t.Context(), lease))
+		} else {
+			applied = applyAgain(t, b, lease)
+		}
 		failed := requireStartupFailure(t, b, lease.LeaseUUID, applied, reasonContainerExited, messageExitedDuringStartup)
 		require.Equal(t, attempt, failed.FailCount, "attempt %d", attempt)
 		require.Equal(t, attempt, failed.ConsecutiveFailures, "attempt %d counts towards closing the lease", attempt)

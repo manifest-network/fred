@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -127,6 +128,11 @@ type Client struct {
 	providerUUID string
 	storageID    backendidentity.ID
 	callbacks    *placement.CallbackRouteFactory
+
+	mu sync.Mutex
+	// accepted is the callback URL of the last Apply or Restore the backend
+	// accepted for each lease.
+	accepted map[string]string
 }
 
 // Apply asks the backend to run the lease. The work is asynchronous: poll Get.
@@ -139,7 +145,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, "/provision", true, backend.ProvisionRequest{
+	err = c.do(ctx, http.MethodPost, "/provision", true, backend.ProvisionRequest{
 		LeaseUUID:            spec.LeaseUUID,
 		Tenant:               spec.Tenant,
 		ProviderUUID:         c.providerUUID,
@@ -148,6 +154,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 		LifecycleCallbackURL: lifecycleURL,
 		Payload:              payload,
 	}, nil)
+	return c.noteAccepted(spec.LeaseUUID, operationURL, err)
 }
 
 // Get reports one lease, or ErrNotFound.
@@ -216,7 +223,7 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, "/restore", true, backend.RestoreRequest{
+	err = c.do(ctx, http.MethodPost, "/restore", true, backend.RestoreRequest{
 		LeaseUUID:            spec.LeaseUUID,
 		FromLeaseUUID:        from,
 		Tenant:               spec.Tenant,
@@ -225,6 +232,30 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,
 	}, nil)
+	return c.noteAccepted(spec.LeaseUUID, operationURL, err)
+}
+
+// noteAccepted remembers the callback URL of a command the backend accepted,
+// and returns the command's error unchanged.
+func (c *Client) noteAccepted(leaseUUID, operationURL string, err error) error {
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accepted == nil {
+		c.accepted = map[string]string{}
+	}
+	c.accepted[leaseUUID] = operationURL
+	return nil
+}
+
+// lastAccepted is the callback URL of the last Apply or Restore the backend
+// accepted for the lease, or empty.
+func (c *Client) lastAccepted(leaseUUID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.accepted[leaseUUID]
 }
 
 func leaseOf(info backend.ProvisionInfo) Lease {
