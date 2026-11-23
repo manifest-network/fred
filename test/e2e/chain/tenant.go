@@ -151,6 +151,10 @@ func (tn *Tenant) Token(t *testing.T, leaseUUID string) string {
 // lasts that much longer.
 func (tn *Tenant) TokenAt(t *testing.T, leaseUUID string, at time.Time) string {
 	t.Helper()
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+	// A later token for the lease must not be dated the same second.
+	tn.minted[leaseUUID] = max(tn.minted[leaseUUID], at.Unix())
 	token, err := tn.mint(t.Context(), leaseUUID, "-timestamp", strconv.FormatInt(at.Unix(), 10))
 	require.NoError(t, err)
 	return token
@@ -319,14 +323,17 @@ func (tn *Tenant) createLease(t *testing.T, hashHex string, items ...string) str
 // few seconds only, and for a request that changes something only once.
 func (tn *Tenant) accessToken(ctx context.Context, leaseUUID string) (string, error) {
 	// A token carries the second it was minted in and nothing finer, so the
-	// next one for the same lease waits for the next second.
+	// next one for the same lease waits for the next second. The second is
+	// given to the tool: left to read the clock itself, it could start in
+	// the second after the one recorded here, and mint the next token's twin.
 	tn.mu.Lock()
 	defer tn.mu.Unlock()
 	for time.Now().Unix() <= tn.minted[leaseUUID] {
 		time.Sleep(50 * time.Millisecond)
 	}
-	tn.minted[leaseUUID] = time.Now().Unix()
-	return tn.mint(ctx, leaseUUID)
+	second := time.Now().Unix()
+	tn.minted[leaseUUID] = second
+	return tn.mint(ctx, leaseUUID, "-timestamp", strconv.FormatInt(second, 10))
 }
 
 // mint runs the lease-token binary for a lease.
