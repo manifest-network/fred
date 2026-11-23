@@ -106,6 +106,7 @@ func TestBackend_RestoreKeepsTheVolumeExactly(t *testing.T) {
 	closeLease(t, b, source.LeaseUUID)
 	retained := requireRetained(t, b, source.LeaseUUID)[0]
 	require.True(t, retained.RetainedUntil.IsZero(), "a backend without an age limit must report no expiry, not %s", retained.RetainedUntil)
+	require.Equal(t, source.Tenant, retained.Tenant, "a retained lease must still name its tenant")
 	require.Empty(t, b.Containers(t, source.LeaseUUID))
 	kept := oneVolumeRoot(t, b, source.LeaseUUID)
 	require.Equal(t, inode, inodeOf(t, kept), "the retained volume must be the lease's own directory")

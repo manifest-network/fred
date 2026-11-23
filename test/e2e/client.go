@@ -88,6 +88,8 @@ func (s Spec) items() []backend.LeaseItem {
 type Lease struct {
 	UUID   string
 	Status string
+	// Tenant is the tenant the lease belongs to.
+	Tenant string
 	// Partition is the retention partition of a retained lease, as Get
 	// reports it. Empty is the tenant's default partition.
 	Partition string
@@ -271,7 +273,7 @@ func leaseOf(info backend.ProvisionInfo) Lease {
 	lease := Lease{
 		UUID: info.LeaseUUID, Status: string(info.Status), Partition: info.Partition,
 		FailCount: info.FailCount, Reason: string(info.Reason), Message: info.Message,
-		RetainedUntil: info.RetainedUntil,
+		RetainedUntil: info.RetainedUntil, Tenant: info.Tenant,
 	}
 	if budget := info.TerminalBudget; budget != nil {
 		lease.ConsecutiveFailures = budget.ConsecutiveFailures
