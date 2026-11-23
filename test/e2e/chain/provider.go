@@ -59,6 +59,9 @@ type Provider struct {
 	// one goes: the least loaded backend. Each backend's own SKUs.Pinned is
 	// served by that backend alone.
 	SKUs e2e.SKUs
+	// BillingOnlySKU, when the test asked for one (see Options), is a SKU no
+	// backend serves and the provider is configured to bill for only.
+	BillingOnlySKU string
 
 	t       *testing.T
 	binDir  string
@@ -87,6 +90,9 @@ type Options struct {
 	// Links makes providerd reach each backend through an e2e.Link, so the
 	// test can lose a backend's response.
 	Links bool
+	// BillingOnly gives the provider one more SKU, Provider.BillingOnlySKU,
+	// that it bills for and never deploys.
+	BillingOnly bool
 	// PendingTimeout, when set, is how long the chain keeps a lease the
 	// provider has not acknowledged before it expires it. The chain's default
 	// is half an hour and its minimum a minute.
@@ -136,6 +142,9 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	require.Equal(t, key.Address, created["address"])
 	p.UUID = created["provider_uuid"]
 	p.SKUs = e2e.SKUs{Stateless: p.createSKU("e2e-stateless"), Stateful: p.createSKU("e2e-stateful")}
+	if options.BillingOnly {
+		p.BillingOnlySKU = p.createSKU("e2e-billing-only")
+	}
 	for i := range backends {
 		served := p.SKUs
 		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
@@ -174,6 +183,9 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	listenAddr := e2e.FreeLoopbackAddr(t)
 	p.URL = "http://" + listenAddr
 	config := p.config(key, state, listenAddr)
+	if options.BillingOnly {
+		config["billing_only_skus"] = []string{p.BillingOnlySKU}
+	}
 	for name, value := range options.ProviderSettings {
 		config[name] = value
 	}

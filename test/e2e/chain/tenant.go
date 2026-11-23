@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +46,24 @@ type Tenant struct {
 	provider *Provider
 	key      Key
 	signer   *testutil.TestKeyPair
+
+	// minted is the second in which the last token for each lease was
+	// minted. Two tokens for one lease minted in the same second are the
+	// same token, and the provider accepts a token once.
+	mu     sync.Mutex
+	minted map[string]int64
+}
+
+// Answer is what the provider's API answered one request with.
+type Answer struct {
+	Status int
+	// Error and Reason are the text and the machine-readable reason of a
+	// refusal, and RetryAfter its Retry-After header.
+	Error      string
+	Reason     string
+	RetryAfter string
+	// Body is the answer as it was sent.
+	Body string
 }
 
 // NewTenant creates an account, funds it from the validator's genesis
@@ -65,7 +85,7 @@ func (p *Provider) NewTenant(t *testing.T) *Tenant {
 	derivedAddress, err := sdktypes.Bech32ifyAddressBytes("manifest", signer.PubKey.Address().Bytes())
 	require.NoError(t, err)
 	require.Equal(t, key.Address, derivedAddress, "the derived key is not the keyring's key")
-	return &Tenant{provider: p, key: key, signer: signer}
+	return &Tenant{provider: p, key: key, signer: signer, minted: map[string]int64{}}
 }
 
 // Address is the tenant's account on the chain.
@@ -77,6 +97,80 @@ func (tn *Tenant) Address() string { return tn.key.Address }
 func (tn *Tenant) Deploy(t *testing.T, sku string, manifest map[string]any) string {
 	t.Helper()
 	return tn.DeployItems(t, manifest, sku+":1")
+}
+
+// CreateLease creates a lease that records a manifest's hash, and uploads
+// nothing: the lease stays pending until something is done about it. Items
+// are as for DeployItems.
+func (tn *Tenant) CreateLease(t *testing.T, manifest map[string]any, items ...string) string {
+	t.Helper()
+	_, hashHex := encodeManifest(t, manifest)
+	return tn.createLease(t, hashHex, items...)
+}
+
+// Upload sends a lease's manifest to the provider once and returns the
+// answer, for a test about an upload the provider refuses.
+func (tn *Tenant) Upload(t *testing.T, leaseUUID string, manifest map[string]any) Answer {
+	t.Helper()
+	payload, hashHex := encodeManifest(t, manifest)
+	token := testutil.CreateTestPayloadToken(tn.signer, leaseUUID, hashHex, time.Now())
+	answer, err := tn.exchange(t.Context(), http.MethodPost, "/v1/leases/"+leaseUUID+"/data", token,
+		map[string]string{"Content-Type": "application/octet-stream"}, payload)
+	require.NoError(t, err, "upload the manifest of lease %s", leaseUUID)
+	return answer
+}
+
+// Ask sends one request about a lease to the provider as its tenant, with a
+// fresh token, and returns the answer whatever it is. action is the last
+// element of the path: "restart", "update", "restore", or a resource to read.
+func (tn *Tenant) Ask(t *testing.T, method, leaseUUID, action string, headers map[string]string, body []byte) Answer {
+	t.Helper()
+	token, err := tn.accessToken(t.Context(), leaseUUID)
+	require.NoError(t, err)
+	return tn.AskWith(t, token, method, leaseUUID, action, headers, body)
+}
+
+// AskWith is Ask with a token the test already holds.
+func (tn *Tenant) AskWith(t *testing.T, token, method, leaseUUID, action string, headers map[string]string, body []byte) Answer {
+	t.Helper()
+	answer, err := tn.exchange(t.Context(), method, "/v1/leases/"+leaseUUID+"/"+action, token, headers, body)
+	require.NoError(t, err, "%s %s of lease %s", method, action, leaseUUID)
+	return answer
+}
+
+// Token mints a token for a lease, for a test that sends it itself.
+func (tn *Tenant) Token(t *testing.T, leaseUUID string) string {
+	t.Helper()
+	token, err := tn.accessToken(t.Context(), leaseUUID)
+	require.NoError(t, err)
+	return token
+}
+
+// TokenAt is Token for a token that says it was minted at the given moment.
+// The provider takes a token dated up to ten seconds ahead, and such a token
+// lasts that much longer.
+func (tn *Tenant) TokenAt(t *testing.T, leaseUUID string, at time.Time) string {
+	t.Helper()
+	token, err := tn.mint(t.Context(), leaseUUID, "-timestamp", strconv.FormatInt(at.Unix(), 10))
+	require.NoError(t, err)
+	return token
+}
+
+// RestoreFrom is the body of a request to restore a closed lease's data.
+func RestoreFrom(t *testing.T, fromLeaseUUID string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"from_lease_uuid": fromLeaseUUID})
+	require.NoError(t, err)
+	return body
+}
+
+// UpdateTo is the body of a request to run a lease on a new manifest.
+func UpdateTo(t *testing.T, manifest map[string]any) []byte {
+	t.Helper()
+	payload, _ := encodeManifest(t, manifest)
+	body, err := json.Marshal(map[string][]byte{"payload": payload})
+	require.NoError(t, err)
+	return body
 }
 
 // DeployItems is Deploy for a lease of anything but one unit of one SKU. An
@@ -123,10 +217,7 @@ func (tn *Tenant) Restart(t *testing.T, leaseUUID string) {
 // Update asks the provider to run an active lease on a new manifest.
 func (tn *Tenant) Update(t *testing.T, leaseUUID string, manifest map[string]any) {
 	t.Helper()
-	payload, _ := encodeManifest(t, manifest)
-	body, err := json.Marshal(map[string][]byte{"payload": payload})
-	require.NoError(t, err)
-	tn.maintain(t, leaseUUID, "update", body)
+	tn.maintain(t, leaseUUID, "update", UpdateTo(t, manifest))
 }
 
 // Restore creates a lease for one unit of a SKU and asks the provider to give
@@ -159,10 +250,8 @@ func (tn *Tenant) RestoreUnanswered(t *testing.T, sku, fromLeaseUUID string, man
 // to a backend, and expects to be retried.
 func (tn *Tenant) restore(t *testing.T, sku, fromLeaseUUID string, manifest map[string]any, done func(collect *assert.CollectT, status int, answer string)) string {
 	t.Helper()
-	_, hashHex := encodeManifest(t, manifest)
-	leaseUUID := tn.createLease(t, hashHex, sku+":1")
-	body, err := json.Marshal(map[string]string{"from_lease_uuid": fromLeaseUUID})
-	require.NoError(t, err)
+	leaseUUID := tn.CreateLease(t, manifest, sku+":1")
+	body := RestoreFrom(t, fromLeaseUUID)
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		token, err := tn.accessToken(t.Context(), leaseUUID)
 		if !assert.NoError(collect, err) {
@@ -226,11 +315,24 @@ func (tn *Tenant) createLease(t *testing.T, hashHex string, items ...string) str
 }
 
 // accessToken mints the bearer token for one request on a lease, with the
-// lease-token binary a tenant would use. The provider accepts each token
-// once, and only for a few seconds.
+// lease-token binary a tenant would use. The provider accepts a token for a
+// few seconds only, and for a request that changes something only once.
 func (tn *Tenant) accessToken(ctx context.Context, leaseUUID string) (string, error) {
-	cmd := exec.CommandContext(ctx, filepath.Join(tn.provider.binDir, "lease-token"), //nolint:gosec // G204: a binary under test and fixture-built arguments
-		"-tenant", tn.key.Address, "-lease-uuid", leaseUUID)
+	// A token carries the second it was minted in and nothing finer, so the
+	// next one for the same lease waits for the next second.
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+	for time.Now().Unix() <= tn.minted[leaseUUID] {
+		time.Sleep(50 * time.Millisecond)
+	}
+	tn.minted[leaseUUID] = time.Now().Unix()
+	return tn.mint(ctx, leaseUUID)
+}
+
+// mint runs the lease-token binary for a lease.
+func (tn *Tenant) mint(ctx context.Context, leaseUUID string, args ...string) (string, error) {
+	args = append([]string{"-tenant", tn.key.Address, "-lease-uuid", leaseUUID}, args...)
+	cmd := exec.CommandContext(ctx, filepath.Join(tn.provider.binDir, "lease-token"), args...) //nolint:gosec // G204: a binary under test and fixture-built arguments
 	// The mnemonic never goes on a command line.
 	cmd.Env = []string{"FRED_MNEMONIC=" + tn.key.Mnemonic}
 	out, err := cmd.Output()
@@ -242,11 +344,18 @@ func (tn *Tenant) accessToken(ctx context.Context, leaseUUID string) (string, er
 
 // request sends one request to the provider's API with a tenant token.
 func (tn *Tenant) request(ctx context.Context, method, path, token string, headers map[string]string, body []byte) (int, string, error) {
+	answer, err := tn.exchange(ctx, method, path, token, headers, body)
+	return answer.Status, answer.Body, err
+}
+
+// exchange sends one request to the provider's API with a tenant token and
+// returns the whole answer.
+func (tn *Tenant) exchange(ctx context.Context, method, path, token string, headers map[string]string, body []byte) (Answer, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, tn.provider.URL+path, bytes.NewReader(body))
 	if err != nil {
-		return 0, "", err
+		return Answer{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -255,11 +364,20 @@ func (tn *Tenant) request(ctx context.Context, method, path, token string, heade
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, "", err
+		return Answer{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	answer, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode, string(answer), err
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	answer := Answer{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Body: string(raw)}
+	// A refusal is a JSON object; anything else leaves the fields empty.
+	var refusal struct {
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(raw, &refusal) == nil {
+		answer.Error, answer.Reason = refusal.Error, refusal.Reason
+	}
+	return answer, err
 }
 
 // encodeManifest returns a manifest as the bytes a tenant uploads, and the
