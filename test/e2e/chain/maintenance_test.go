@@ -5,6 +5,7 @@ package chain
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -506,6 +507,15 @@ func TestDeploy_FailedDeployStaysExplained(t *testing.T) {
 	})
 	eventually(t, "backend "+backend.Name+" runs nothing for lease "+lease, func() bool {
 		return len(backend.Containers(t, lease)) == 0
+	})
+	// The provider has the backend remove the rejected lease. While the
+	// backend does, 0.14 answers for the lease's logs with none: it serves a
+	// lease's stored output while the lease is failed and once it is gone,
+	// and not in between. The test reads after the removal.
+	eventually(t, "backend "+backend.Name+" no longer lists lease "+lease, func() bool {
+		listed, err := backend.Client.List(t.Context())
+		require.NoError(t, err)
+		return !slices.ContainsFunc(listed, func(one e2e.Lease) bool { return one.UUID == lease })
 	})
 
 	requireExplained := func(when string) {
