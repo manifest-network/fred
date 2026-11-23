@@ -183,15 +183,13 @@ func TestBackend_RestoreKeepsEachInstancesData(t *testing.T) {
 func TestBackend_RetainedDataIsDestroyedAtItsAgeLimit(t *testing.T) {
 	const ageLimit = 45 * time.Second
 	b := StartBackendWithConfig(t, map[string]any{"retention_max_age": ageLimit.String(), "retention_reap_interval": "1s"})
-	closing := time.Now()
 	source := retainVolume(t, b, sleeper(RedisImage))
-	closed := time.Now()
 
 	retained, err := b.Client.Get(t.Context(), source.lease)
 	require.NoError(t, err)
 	require.Equal(t, statusRetained, retained.Status)
-	// The age counts from a moment during the close.
-	require.WithinRange(t, retained.RetainedUntil, closing.Add(ageLimit), closed.Add(ageLimit), "the expiry the backend reports")
+	// The age counts from the close, not from the deploy before it.
+	require.WithinRange(t, retained.RetainedUntil, source.closing.Add(ageLimit), source.closed.Add(ageLimit), "the expiry the backend reports")
 	root := oneVolumeRoot(t, b, source.lease)
 	require.Equal(t, "kept\n", volumeFile(t, root, "sentinel"))
 

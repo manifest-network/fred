@@ -58,22 +58,17 @@ func volumeRootOf(t *testing.T, b *Backend, c container.InspectResponse, destina
 	return filepath.Join(b.VolumePath, strings.Split(relative, string(filepath.Separator))[0])
 }
 
-// requireNoQuotaLeft waits until the given projects have neither usage nor a
-// limit, and the backend's storage carries the given number of quota entries.
+// requireNoQuotaLeft waits until XFS no longer lists the given projects, and
+// the backend's storage carries the given number of quota entries. A project
+// stays listed while it has any usage or any limit, on blocks or on inodes,
+// so one limit left behind keeps its entry (ENG-459).
 func requireNoQuotaLeft(t *testing.T, b *Backend, entries int, projects ...int) {
 	t.Helper()
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		report := b.quotaReport(t)
 		for _, project := range projects {
-			assert.Zero(collect, report[project], "the quota of project %d", project)
+			assert.False(collect, b.QuotaListed(t, project), "project %d still has a quota entry", project)
 		}
-		limited := 0
-		for _, quota := range report {
-			if quota.limitKB > 0 {
-				limited++
-			}
-		}
-		assert.Equal(collect, entries, limited, "quota entries on the backend's storage")
+		assert.Equal(collect, entries, b.QuotaEntries(t), "quota entries on the backend's storage")
 	}, time.Minute, time.Second)
 }
 

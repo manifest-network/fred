@@ -47,16 +47,32 @@ func (b *Backend) QuotaUsedKB(t *testing.T, project int) int {
 }
 
 // QuotaEntries counts the XFS projects on this backend's storage that carry
-// a block limit. Every volume directory has one, and nothing else may.
+// a limit, on blocks or on inodes. Every volume directory has both, and
+// nothing else may have either.
 func (b *Backend) QuotaEntries(t *testing.T) int {
 	t.Helper()
-	entries := 0
-	for _, quota := range b.quotaReport(t) {
-		if quota.limitKB > 0 {
-			entries++
+	limited := map[int]bool{}
+	for _, kind := range []string{"-b", "-i"} {
+		for project, quota := range b.report(t, kind) {
+			if quota.limitKB > 0 {
+				limited[project] = true
+			}
 		}
 	}
-	return entries
+	return len(limited)
+}
+
+// QuotaListed reports whether xfs_quota lists the project on this backend's
+// storage, in its block report or its inode report. XFS lists a project for
+// as long as anything is charged to it or it carries any limit.
+func (b *Backend) QuotaListed(t *testing.T, project int) bool {
+	t.Helper()
+	for _, kind := range []string{"-b", "-i"} {
+		if _, listed := b.report(t, kind)[project]; listed {
+			return true
+		}
+	}
+	return false
 }
 
 // InodeQuota reads how many inodes the XFS project of a volume directory of

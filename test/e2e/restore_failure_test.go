@@ -68,6 +68,10 @@ type retainedVolume struct {
 	// container the name its container had.
 	image     string
 	container string
+	// closing and closed are moments before the close was sent and after
+	// the backend reported the lease retained: it was retained between them.
+	closing time.Time
+	closed  time.Time
 }
 
 // retainVolume runs a lease with a volume on StatefulSKU, lets prepare write
@@ -87,8 +91,10 @@ func retainVolume(t *testing.T, b *Backend, manifest map[string]any, prepare ...
 	require.Contains(t, kept.container, kept.lease, "a container is named after its lease")
 	require.NotZero(t, kept.project, "a volume belongs to a project")
 
+	kept.closing = time.Now()
 	closeLease(t, b, lease.LeaseUUID)
 	requireRetained(t, b, lease.LeaseUUID)
+	kept.closed = time.Now()
 	return kept
 }
 
