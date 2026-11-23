@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -69,18 +70,37 @@ func TestBackend_WorkloadThatExitsAtOnceFailsTheLease(t *testing.T) {
 	requireStartupFailure(t, b, lease.LeaseUUID, applied, reasonContainerExited, messageExitedDuringStartup)
 }
 
+// applyAgain applies a lease whose previous deploy failed, and returns when
+// the backend accepted it. A 0.14 backend reports a failure before its
+// callback about it is acknowledged, and refuses the lease's next command
+// until then. Only that refusal is retried, for thirty seconds; the sink
+// acknowledges every callback at once.
+func applyAgain(t *testing.T, b *Backend, lease Spec) time.Time {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		applied := time.Now()
+		err := b.Client.Apply(t.Context(), lease)
+		var refused *StatusError
+		if !errors.As(err, &refused) || refused.Code != CodeCompletionPending || applied.After(deadline) {
+			require.NoError(t, err, "apply lease %s again", lease.LeaseUUID)
+			return applied
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestBackend_WorkloadThatExitsWhileWatchedCountsEveryTime deploys a workload
 // that starts and exits a second later, by itself, while the backend is still
 // watching it start. That is an observed run, so it counts towards the
-// failures that can close a lease. A failed lease can be applied again at
-// once, and each of three attempts must fail the same way and be counted.
+// failures that can close a lease. A failed lease can be applied again, and
+// each of three attempts must fail the same way and be counted.
 func TestBackend_WorkloadThatExitsWhileWatchedCountsEveryTime(t *testing.T) {
 	// The watch must outlast the workload's one second.
 	b := StartBackendWithConfig(t, map[string]any{"provision_timeout": "10m", "startup_verify_duration": "5s"})
 	lease := leaseRunning("sh", "-c", "sleep 1; exit 3")
 	for attempt := 1; attempt <= 3; attempt++ {
-		applied := time.Now()
-		require.NoError(t, b.Client.Apply(t.Context(), lease), "attempt %d", attempt)
+		applied := applyAgain(t, b, lease)
 		failed := requireStartupFailure(t, b, lease.LeaseUUID, applied, reasonContainerExited, messageExitedDuringStartup)
 		require.Equal(t, attempt, failed.FailCount, "attempt %d", attempt)
 		require.Equal(t, attempt, failed.ConsecutiveFailures, "attempt %d counts towards closing the lease", attempt)

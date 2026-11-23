@@ -34,6 +34,10 @@ var ErrNotFound = errors.New("lease not found")
 // lease it has no capacity for.
 const CodeInsufficientResources = backend.CodeInsufficientResources
 
+// CodeCompletionPending is the code of the refusal a backend gives a lease's
+// next command while its report of the previous one is unacknowledged.
+const CodeCompletionPending = backend.CodeOperationCompletionPending
+
 // What a backend finds wrong with a lease it refuses as invalid.
 const (
 	CodeUnknownSKU      = string(backend.ValidationCodeUnknownSKU)
