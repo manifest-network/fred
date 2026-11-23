@@ -58,6 +58,26 @@ func requireImageRefused(t *testing.T, b *Backend, leaseUUID string, applied tim
 	require.False(t, b.HoldsImage(t, image.Reference), "a refused image must not reach the daemon")
 }
 
+// closeRefused closes a lease whose image the backend refused. The backend
+// stops listing the lease and goes on answering for it with why it failed,
+// as for any failed deploy (TestBackend_FailedDeployStaysExplained).
+func closeRefused(t *testing.T, b *Backend, leaseUUID string) {
+	t.Helper()
+	closeLease(t, b, leaseUUID)
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		listed, err := b.Client.List(t.Context())
+		if assert.NoError(collect, err) {
+			for _, lease := range listed {
+				assert.NotEqual(collect, leaseUUID, lease.UUID, "the backend still lists the closed lease")
+			}
+		}
+	}, time.Minute, 500*time.Millisecond)
+	closed, err := b.Client.Get(t.Context(), leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, statusFailed, closed.Status)
+	require.Equal(t, reasonImagePullFailed, closed.Reason, "a closed lease must still say why its deploy failed")
+}
+
 // TestBackend_ImageWithAReservedLabelIsNeverRun deploys images that carry a
 // label the platform keeps for itself: one of the ingress's, one of the
 // backend's own and one of Compose's, in the spelling an image chose. Each
@@ -86,8 +106,7 @@ func TestBackend_ImageWithAReservedLabelIsNeverRun(t *testing.T) {
 			requireImageRefused(t, b, lease.LeaseUUID, applied, reserved)
 			require.Empty(t, b.Containers(t, lease.LeaseUUID))
 
-			closeLease(t, b, lease.LeaseUUID)
-			requireGone(t, b, lease.LeaseUUID)
+			closeRefused(t, b, lease.LeaseUUID)
 		})
 	}
 	requireOneRunningContainer(t, b, accepted.LeaseUUID)
@@ -175,8 +194,7 @@ func TestBackend_LeaseKeepsItsImageWhenItsTagMoves(t *testing.T) {
 	require.Equal(t, reasonImagePullFailed, refused.Reason)
 	require.True(t, b.Registry.Requested(moved.Config), "the backend must have read the image the tag names now")
 	require.Empty(t, b.Created(t, applied), "no container may be created from a refused image")
-	closeLease(t, b, newcomer.LeaseUUID)
-	requireGone(t, b, newcomer.LeaseUUID)
+	closeRefused(t, b, newcomer.LeaseUUID)
 
 	// A backend restart leaves the lease in its container.
 	b.Stop()
