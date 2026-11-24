@@ -388,6 +388,11 @@ func TestCrash_BackendDuringUpdate(t *testing.T) {
 func TestCrash_ProviderdDuringUpdate(t *testing.T) {
 	options := heldSettings(nil)
 	options.Links = true
+	// providerd answers the update only once the link has lost the backend's
+	// answer, which is when the new container runs. That can take longer
+	// than the 15 seconds after which providerd cuts off an answer it has
+	// not finished writing.
+	options.ProviderSettings = map[string]any{"http_write_timeout": "2m"}
 	p := StartProviderWith(t, 1, options)
 	backend, link, tenant := p.Backends[0], p.Links[0], p.NewTenant(t)
 	lease := deployActive(t, p, tenant, p.SKUs.Stateless, runs(e2e.BusyboxImage))
