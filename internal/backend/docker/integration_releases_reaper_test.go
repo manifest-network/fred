@@ -33,8 +33,6 @@ import (
 //
 // This is the full chain the mock recover_state_test.go cannot reach: the REAL
 // constructor reaper-before-recover ordering AND a REAL Restart succeeding afterward.
-// Reconstruct/recover mechanics mirror TestIntegration_Docker_ColdStartRecovery; the
-// Restart assertion mirrors TestIntegration_Docker_RestartLifecycle.
 //
 // "Ageing": instead of a tiny ReleasesMaxAge (which would also make the background
 // cleanup loop interval ~0 and hot-spin a core for the second backend's lifetime),
@@ -46,9 +44,9 @@ func TestIntegration_Docker_AgeReapedReleaseStillRestartable(t *testing.T) {
 	ctx := context.Background()
 
 	// Manual, reconstructable cfg (cannot use testBackendWithRealDocker: it hides
-	// its tmpDir and randomizes Name, so it cannot be fed to a second New()). Mirror
-	// TestIntegration_Docker_ColdStartRecovery, plus an explicit ReleasesDBPath so the
-	// release record persists in tmpDir and is shared by both backend instances.
+	// its tmpDir and randomizes Name, so it cannot be fed to a second New()). An
+	// explicit ReleasesDBPath makes the release record persist in tmpDir, shared
+	// by both backend instances.
 	cfg := integrationDockerConfig()
 	cfg.SKUProfiles = defaultTestSKUProfiles()
 	cfg.Name = fmt.Sprintf("test-eng440-%d", time.Now().UnixNano())

@@ -9,28 +9,19 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"testing"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
-
-// anonVolNameRE matches Docker's anonymous-volume naming (64 lowercase hex).
-// The leak this suite guards against is specifically these volumes, so the
-// before/after diff filters to them — staying immune to unrelated named volumes
-// that may already exist (or be created by something else) on a shared daemon.
-var anonVolNameRE = regexp.MustCompile("^[0-9a-f]{64}$")
 
 // cleanupTimeout bounds each test-cleanup Docker call. Cleanups use a fresh
 // context (the test ctx is already canceled by the time t.Cleanup runs) but
@@ -49,18 +40,6 @@ func newIntegrationDockerClient(t *testing.T, ctx context.Context) *DockerClient
 		t.Skip("Docker not available:", err)
 	}
 	return docker
-}
-
-// dockerVolumeSet returns the set of all Docker volume names currently present.
-func dockerVolumeSet(t *testing.T, ctx context.Context, sdk *client.Client) map[string]bool {
-	t.Helper()
-	resp, err := sdk.VolumeList(ctx, volume.ListOptions{})
-	require.NoError(t, err)
-	set := make(map[string]bool, len(resp.Volumes))
-	for _, v := range resp.Volumes {
-		set[v.Name] = true
-	}
-	return set
 }
 
 // TestIntegration_Docker_ComposeDown_RemovesAnonymousVolumes pins the leak-prevention contract for
@@ -203,68 +182,6 @@ func TestIntegration_Docker_RemoveContainer_RemovesAnonymousVolumes(t *testing.T
 		"anonymous volume %s must be removed by RemoveContainer; got err=%v", anonVol, err)
 }
 
-// TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes pins that the image-
-// introspection temp containers (ENG-372 (a)) do not leak anonymous volumes.
-// Each of ResolveImageUser/DetectVolumeOwner/DetectWritablePaths spins up a
-// throwaway container FROM the tenant image to read its filesystem; Docker
-// materializes the image's VOLUME directives as anonymous volumes at create
-// time (even though these containers are never started), so the teardown must
-// remove them. These run on the provision path (cache-missed image setup), so
-// a leak here accumulates per distinct image and across backend restarts.
-func TestIntegration_Docker_ImageIntrospection_DoesNotLeakAnonymousVolumes(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	docker := newIntegrationDockerClient(t, ctx)
-	sdk := newImageSecurityFixtureClient(t)
-
-	const img = "redis:7-alpine" // declares VOLUME /data
-	// Pull rather than skip-if-absent: a skip here would silently turn the leak
-	// assertion into a false green on a clean CI daemon.
-	require.NoError(t, pullImageForTest(t, docker, ctx, img, 120*time.Second))
-	_, err := docker.AdmitImage(ctx, img)
-	require.NoError(t, err)
-
-	before := dockerVolumeSet(t, ctx, sdk)
-
-	// Drive the three introspection entrypoints; each creates one temp container
-	// from the image (sites readFileFromImage / DetectVolumeOwner /
-	// DetectWritablePaths). Require success: if a helper failed before creating
-	// its container, the diff would be empty and the leak assertion would
-	// false-green without ever exercising the reap path.
-	h := newIntegrationInspectionHarness(t, docker, img)
-	h.execute(t, func(work context.Context, origin shared.ImageInspectionOrigin) error {
-		_, _, err = docker.ResolveImageUser(work, h.image, "redis", origin)
-		require.NoError(t, err)
-		_, _, err = docker.DetectVolumeOwner(work, h.image, []string{"/data"}, origin)
-		require.NoError(t, err)
-		_, err = docker.DetectWritablePaths(work, h.image, 0, []string{"/data"}, origin)
-		require.NoError(t, err)
-		require.Empty(t, docker.ExtractImageContent(work, h.image, []string{"/data"}, t.TempDir(), 1<<20, 100, origin))
-		return nil
-	})
-
-	after := dockerVolumeSet(t, ctx, sdk)
-
-	// Count only newly-appeared anonymous (64-hex) volumes — the leak shape —
-	// so an unrelated named volume on a shared daemon can't cause a false fail.
-	var leaked []string
-	for v := range after {
-		if !before[v] && anonVolNameRE.MatchString(v) {
-			leaked = append(leaked, v)
-		}
-	}
-	// Best-effort cleanup so a RED run doesn't pollute the daemon.
-	t.Cleanup(func() {
-		cctx, ccancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		defer ccancel()
-		for _, v := range leaked {
-			_ = sdk.VolumeRemove(cctx, v, true)
-		}
-	})
-
-	assert.Empty(t, leaked, "image introspection leaked anonymous volume(s): %v", leaked)
-}
-
 // TestIntegration_Docker_TeardownFallback_RemovesAnonymousVolumesWhenDownFails closes
 // the loop the other two tests in this file each cover half of: it drives fred's real
 // compensation path — teardownLeaseContainers — against a real daemon, with compose
@@ -404,4 +321,14 @@ func newIntegrationInspectionHarness(t *testing.T, docker *DockerClient, referen
 		return nil
 	}}
 	return h
+}
+
+// newImageSecurityFixtureClient owns the raw SDK only in test fixtures. The
+// production lifecycle wrapper deliberately cannot create arbitrary containers.
+func newImageSecurityFixtureClient(t *testing.T) *client.Client {
+	t.Helper()
+	sdk, err := client.NewClientWithOpts(client.WithAPIVersionNegotiation())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sdk.Close()) })
+	return sdk
 }

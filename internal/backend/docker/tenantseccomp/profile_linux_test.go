@@ -217,8 +217,8 @@ func TestTenantProfileSemantics(t *testing.T) {
 	}
 	// The kernel caps a filter at BPF_MAXINSNS (4096) instructions; libseccomp
 	// emits a few per rule and per architecture. Keep the addition small: the
-	// root integration test TestIntegration_Docker_XFS_TenantCannotChangeProjectID
-	// (package docker) proves the filter loads and denies on a real kernel.
+	// black-box test TestBackend_TenantCannotChangeProjectID (test/e2e) proves
+	// the filter loads and denies on a real kernel.
 	require.Positive(t, ioctlRules)
 	require.LessOrEqual(t, ioctlRules, 40)
 

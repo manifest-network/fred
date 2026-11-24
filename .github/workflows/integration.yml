@@ -328,11 +328,12 @@ jobs:
 
       - name: Run docker + xfs integration suite (as root)
         if: matrix.suite == 'in-process'
-        # `-run Integration` covers the ENTIRE docker package: core lifecycle,
-        # stack, restart/update, reconciler, idempotency, image admission and
-        # immutable platform binding, volume/quota, and the
-        # ENG-325 retain/restore tests. 30m timeout: the restore tests are slow
-        # (multi-minute provision waits) and the default 15m predates them.
+        # `-run Integration` covers the whole docker package: the kernel,
+        # Docker and image-store contracts of single components (XFS quota,
+        # deep-tree deletion, image import, idempotent container create and
+        # remove), and the tests of mechanisms the black-box suite cannot
+        # reach. Lease lifecycle, stacks, restart/update, volumes, restore and
+        # images are the e2e legs'. The 30m timeout predates that split.
         # `sudo -E env PATH=$PATH` preserves the actions/setup-go toolchain that
         # sudo's secure_path would otherwise hide (the containerd idiom); -E
         # also carries FRED_TEST_IMAGE_STORE and FRED_TEST_IMAGE_DATA_PATH.

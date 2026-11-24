@@ -4,6 +4,7 @@ package docker
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -130,4 +132,38 @@ func TestIntegration_XFS_ProjectIDAuditDetectsHistoricalDrift(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, want, got, "audit changed contents at %s", path)
 	}
+}
+
+type integrationXFSVolume struct {
+	name   managedVolumeName
+	path   string
+	projID uint32
+}
+
+func createIntegrationXFSVolume(t *testing.T, mgr volumeManager) integrationXFSVolume {
+	t.Helper()
+	name, err := parseManagedVolumeName(canonicalVolumeName(uuid.NewString(), "app", 0))
+	require.NoError(t, err)
+	path, created, err := mgr.Create(t.Context(), name.value(), 16)
+	require.NoError(t, err)
+	require.True(t, created)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		require.NoError(t, volDestroyer(t, mgr).Destroy(ctx, name.value()))
+	})
+	projID, err := readProjectIDFile(path)
+	require.NoError(t, err)
+	require.NotZero(t, projID)
+	return integrationXFSVolume{name: name, path: path, projID: projID}
+}
+
+func integrationXFSAttributes(t *testing.T, path string) linuxFSXAttr {
+	t.Helper()
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, file.Close()) }()
+	attr, err := readXFSProjectAttributes(file)
+	require.NoError(t, err)
+	return attr
 }
