@@ -80,17 +80,24 @@ func TestReconcile_CrashLoopIsCountedAndRunAgain(t *testing.T) {
 	})
 	describeOnFailure(t, backend, lease)
 
-	for crash := 1; crash <= 3; crash++ {
-		eventually(t, "the backend counts another failure of lease "+lease, func() bool {
-			return reported(t, backend, lease).ConsecutiveFailures >= crash
-		})
+	// Every container of the lease exits by itself, and the provider starts
+	// the next one only once the backend has reported the lease failed. So
+	// at any moment the failures counted are one for each container started,
+	// but for the last one while it still runs. The containers are counted
+	// from the daemon's events, not from what the backend says, and read
+	// first: a container cannot start and exit between the two reads.
+	const crashes = 3
+	starts := 0
+	eventually(t, "lease "+lease+" has crashed and been run again three times", func() bool {
+		starts = len(backend.Started(t, lease, deployed))
 		counted := reported(t, backend, lease)
-		require.Equal(t, crash, counted.ConsecutiveFailures, "each exit counts once")
-		require.False(t, counted.BudgetExhausted, "failure %d is within the first half hour", crash)
-		eventually(t, "the provider runs lease "+lease+" again", func() bool {
-			return len(backend.Started(t, lease, deployed)) > crash
-		})
-	}
+		require.GreaterOrEqual(t, counted.ConsecutiveFailures, starts-1, "an exit was not counted: %d containers were started", starts)
+		require.LessOrEqual(t, counted.ConsecutiveFailures, starts, "an exit was counted twice: %d containers were started", starts)
+		require.False(t, counted.BudgetExhausted, "%d failures are within the first half hour", counted.ConsecutiveFailures)
+		return starts > crashes
+	})
+	require.Equal(t, crashes+1, starts, "one container for the deploy, and one for each time the lease was run again")
+	require.Equal(t, crashes, reported(t, backend, lease).ConsecutiveFailures, "each exit counts once")
 	onChain := p.Chain.Lease(t, lease)
 	require.Equal(t, LeaseActive, onChain.State, "a young crash loop must not close the lease: %q", onChain.ClosureReason)
 }
