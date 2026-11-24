@@ -8,6 +8,10 @@
 // signed requests and decodes responses, nothing else. A new feature adds a
 // test, not harness code.
 //
+// This package is the backend tier: its tests drive a backend directly. The
+// chain subpackage is the providerd tier, which puts a chain and a providerd
+// in front of the same backend fixture.
+//
 // Everything but this file carries the integration build tag. The tests need
 // root, Docker, xfsprogs and capsh, and skip without them; `make test-e2e`
 // builds the binaries unprivileged and runs the test binary under sudo. Run
