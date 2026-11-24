@@ -91,6 +91,9 @@ type Backend struct {
 	VolumePath string
 	// SKUs are the SKUs this backend serves.
 	SKUs SKUs
+	// Registry is an image registry of the test's own that this backend
+	// pulls from, for the images no public registry has.
+	Registry *Registry
 
 	// What a providerd needs to reach this backend: its base URL, the CA that
 	// signed its server certificate, a client certificate it accepts, and the
@@ -110,6 +113,9 @@ type Backend struct {
 	dockerGID uint32
 	healthURL string
 	sink      *callbackSink
+	// trustFile holds the certificates the process trusts as a client: the
+	// host's, and the authority that signed the Registry's.
+	trustFile string
 }
 
 // StartBackend starts a backend on the first Docker daemon, serving
@@ -176,6 +182,10 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 	serverCert, serverKey := ca.issue(t, state, "server", "docker-backend", true)
 	b.CAFile = ca.certFile
 	b.ClientCertFile, b.ClientKeyFile = ca.issue(t, state, "client", clientCertName, false)
+	b.Registry = startRegistry(t, ca, docker)
+	b.trustFile = filepath.Join(state, "trusted-roots.pem")
+	writeTrustBundle(t, b.trustFile, ca)
+	GiveToServiceAccount(t, b.trustFile)
 
 	// One key signs requests in both directions, as callback_secret does in
 	// production.
@@ -221,8 +231,9 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
 			"e2e-stateful":  map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 64},
 		},
-		// GHCR, for the images published from test/e2e/images.
-		"allowed_registries":  []string{"ghcr.io"},
+		// GHCR for the images published from test/e2e/images, and the
+		// fixture's own registry.
+		"allowed_registries":  []string{"ghcr.io", b.Registry.Host},
 		"callback_secret":     secret,
 		"callback_db_path":    filepath.Join(state, "callbacks.db"),
 		"diagnostics_db_path": filepath.Join(state, "diagnostics.db"),
@@ -335,7 +346,10 @@ func (b *Backend) command(ctx context.Context, args ...string) *exec.Cmd {
 		"--", "-c", `exec "$0" "$@"`, b.binary,
 	}
 	cmd := exec.CommandContext(ctx, "capsh", append(argv, args...)...) //nolint:gosec // G204: the binary under test and fixture-built arguments
-	cmd.Env = b.process.Env()
+	// docker-backend has no setting for the authorities it trusts as a
+	// registry client: like any Go program it reads the host's, from the
+	// file this variable names.
+	cmd.Env = append(b.process.Env(), "SSL_CERT_FILE="+b.trustFile)
 	return cmd
 }
 

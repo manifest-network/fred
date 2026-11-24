@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,7 +19,9 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/stretchr/testify/require"
@@ -33,6 +36,9 @@ const (
 	labelServiceName = "fred.service_name"
 	// labelInstanceIndex numbers the instances of one service, from zero.
 	labelInstanceIndex = "fred.instance_index"
+	// labelImageReference is the image a container runs, as the lease's
+	// manifest names it.
+	labelImageReference = "fred.image_reference"
 	// An image-inspection helper carries none of the labels above. The backend
 	// removes it when admission ends, so one is left behind only when the
 	// process dies during admission.
@@ -127,6 +133,29 @@ func dockerClient(t *testing.T, socket string) *client.Client {
 		t.Skipf("Docker not available at %s: %v", socket, err)
 	}
 	return docker
+}
+
+// requireImage pulls an image the daemon does not have yet. ContainerCreate
+// never pulls, and a test that creates containers itself must not depend on
+// an earlier test or a CI step having fetched the image.
+func requireImage(t *testing.T, docker *client.Client, ref string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	_, err := docker.ImageInspect(ctx, ref)
+	if err == nil {
+		return
+	}
+	require.True(t, errdefs.IsNotFound(err), "inspect %s: %v", ref, err)
+	progress, err := docker.ImagePull(ctx, ref, image.PullOptions{})
+	require.NoError(t, err)
+	defer func() { _ = progress.Close() }()
+	// The pull runs as its progress stream is read, and reports a failure in
+	// that stream, so the image is looked up again afterwards.
+	_, err = io.Copy(io.Discard, progress)
+	require.NoError(t, err)
+	_, err = docker.ImageInspect(ctx, ref)
+	require.NoError(t, err, "pull %s", ref)
 }
 
 // Containers inspects every container of a lease on this backend's daemon,
@@ -248,6 +277,120 @@ func (b *Backend) KillContainer(t *testing.T, containerID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	require.NoError(t, b.docker.ContainerKill(ctx, containerID, "SIGKILL"))
+}
+
+// Created lists the containers this backend's daemon has created since the
+// given time, in order: the workloads of any lease, and the containers the
+// backend inspects images in. Each is given as the daemon reported its
+// creation: its ID, and as attributes its labels, its "name" and its "image".
+// A container that was removed since is listed too.
+func (b *Backend) Created(t *testing.T, since time.Time) []events.Actor {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	messages, errs := b.docker.Events(ctx, events.ListOptions{
+		Since: strconv.FormatInt(since.Unix(), 10),
+		Until: strconv.FormatInt(time.Now().Unix()+1, 10),
+		Filters: filters.NewArgs(
+			filters.Arg("type", string(events.ContainerEventType)),
+			filters.Arg("event", string(events.ActionCreate)),
+		),
+	})
+	var created []events.Actor
+	for {
+		select {
+		case message := <-messages:
+			// The daemon takes whole seconds; the test means the moment.
+			if message.TimeNano >= since.UnixNano() {
+				created = append(created, message.Actor)
+			}
+		case err := <-errs:
+			if !errors.Is(err, io.EOF) {
+				require.NoError(t, err, "read the daemon's events")
+			}
+			return created
+		}
+	}
+}
+
+// InspectionHelper reports whether a created container is one the backend
+// inspects an image in, and not a lease's workload.
+func InspectionHelper(created events.Actor) bool {
+	_, helper := created.Attributes[labelInspectionSchema]
+	return helper
+}
+
+// ContainersLabeled names the containers on this backend's daemon, running
+// or not, that carry the label with the value.
+func (b *Backend) ContainersLabeled(t *testing.T, label, value string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	selector := label
+	if value != "" {
+		selector += "=" + value
+	}
+	listed, err := b.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", selector))})
+	require.NoError(t, err)
+	var names []string
+	for _, one := range listed {
+		names = append(names, strings.Join(one.Names, ","))
+	}
+	return names
+}
+
+// anonymousVolumeName is the name Docker gives a volume nobody named: 64
+// hexadecimal digits.
+var anonymousVolumeName = regexp.MustCompile("^[0-9a-f]{64}$")
+
+// AnonymousVolumes names the anonymous volumes on this backend's daemon.
+// Docker creates one with a container for each volume its image declares
+// that nothing else is mounted on, and keeps it when the container is removed
+// unless it is told otherwise.
+func (b *Backend) AnonymousVolumes(t *testing.T) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	listed, err := b.docker.VolumeList(ctx, volume.ListOptions{})
+	require.NoError(t, err)
+	var names []string
+	for _, one := range listed.Volumes {
+		if anonymousVolumeName.MatchString(one.Name) {
+			names = append(names, one.Name)
+		}
+	}
+	return names
+}
+
+// HoldsImage reports whether this backend's daemon has an image under the
+// reference.
+func (b *Backend) HoldsImage(t *testing.T, reference string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := b.docker.ImageInspect(ctx, reference)
+	if errdefs.IsNotFound(err) {
+		return false
+	}
+	require.NoError(t, err, "inspect image %s", reference)
+	return true
+}
+
+// ImageID is how this backend's daemon identifies a pushed image, and so
+// what a container created from it names as its image: the digest of the
+// image's manifest in a containerd image store, and of its configuration in
+// a classic one.
+func (b *Backend) ImageID(t *testing.T, image PushedImage) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	info, err := b.docker.Info(ctx)
+	require.NoError(t, err)
+	// The containerd image store reports its snapshotter as the driver.
+	if info.Driver == "overlayfs" {
+		return image.Manifest
+	}
+	return image.Config
 }
 
 // networkNames lists the networks this backend's daemon holds for a lease. A

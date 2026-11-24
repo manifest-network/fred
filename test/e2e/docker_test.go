@@ -4,39 +4,12 @@ package e2e
 
 import (
 	"context"
-	"io"
 	"testing"
-	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/require"
 )
-
-// requireImage pulls an image the daemon does not have yet. ContainerCreate
-// never pulls, and a test that creates containers itself must not depend on
-// an earlier test or a CI step having fetched the image.
-func requireImage(t *testing.T, docker *client.Client, ref string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	_, err := docker.ImageInspect(ctx, ref)
-	if err == nil {
-		return
-	}
-	require.True(t, errdefs.IsNotFound(err), "inspect %s: %v", ref, err)
-	progress, err := docker.ImagePull(ctx, ref, image.PullOptions{})
-	require.NoError(t, err)
-	defer func() { _ = progress.Close() }()
-	// The pull runs as its progress stream is read, and reports a failure in
-	// that stream, so the image is looked up again afterwards.
-	_, err = io.Copy(io.Discard, progress)
-	require.NoError(t, err)
-	_, err = docker.ImageInspect(ctx, ref)
-	require.NoError(t, err, "pull %s", ref)
-}
 
 // TestSweepDockerResources checks the cleanup every fixture and TestMain rely
 // on. It must remove both kinds of container a backend creates, and nothing

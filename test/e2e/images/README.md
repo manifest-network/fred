@@ -22,3 +22,9 @@ the reference it prints into `test/e2e/docker.go` and the e2e pre-pull list in
 
 The package is public, because the backend under test pulls without
 credentials. Nothing here may contain a secret.
+
+A test about the image itself, not about what runs in it, needs no directory
+here: it describes the image (labels, declared volumes, platforms) and pushes
+it to the registry every backend fixture has (`Backend.Registry` in
+`test/e2e/registry.go`). That is also the only way to move a tag under a
+running lease.

@@ -4,9 +4,9 @@
 //
 // The harness is one fixture and one client. Backend owns a docker-backend
 // process and everything it needs: an XFS loopback, a storage identity, a
-// listen port, a throwaway CA, and a sink for its callbacks. Client sends
-// signed requests and decodes responses, nothing else. A new feature adds a
-// test, not harness code.
+// listen port, a throwaway CA, a sink for its callbacks, and an image
+// registry of its own. Client sends signed requests and decodes responses,
+// nothing else. A new feature adds a test, not harness code.
 //
 // This package is the backend tier: its tests drive a backend directly. The
 // chain subpackage is the providerd tier, which puts a chain and a providerd
