@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -33,6 +35,17 @@ var ErrNotFound = errors.New("lease not found")
 // lease it has no capacity for.
 const CodeInsufficientResources = backend.CodeInsufficientResources
 
+// CodeCompletionPending is the code of the refusal a backend gives a lease's
+// next command while its report of the previous one is unacknowledged.
+const CodeCompletionPending = backend.CodeOperationCompletionPending
+
+// What a backend finds wrong with a lease it refuses as invalid.
+const (
+	CodeUnknownSKU      = string(backend.ValidationCodeUnknownSKU)
+	CodeInvalidManifest = string(backend.ValidationCodeInvalidManifest)
+	CodeImageNotAllowed = string(backend.ValidationCodeImageNotAllowed)
+)
+
 // Spec is what a lease should run.
 type Spec struct {
 	LeaseUUID string
@@ -42,6 +55,10 @@ type Spec struct {
 	// Services names the services of a stack manifest. Each gets one unit of
 	// SKU. Empty for a manifest that describes a single workload.
 	Services []string
+	// Quantity is how many instances a service runs, for the services that
+	// run more than one. The single workload of a manifest without services
+	// is named by the empty string.
+	Quantity map[string]int
 	// Manifest is the tenant manifest (docs/manifest-guide.md). Restore
 	// ignores it: on 0.14 a restore runs the source lease's manifest.
 	Manifest map[string]any
@@ -49,12 +66,15 @@ type Spec struct {
 
 // items is what the lease buys: one unit of the SKU, or one per service.
 func (s Spec) items() []backend.LeaseItem {
+	quantity := func(service string) int {
+		return max(1, s.Quantity[service])
+	}
 	if len(s.Services) == 0 {
-		return []backend.LeaseItem{{SKU: s.SKU, Quantity: 1}}
+		return []backend.LeaseItem{{SKU: s.SKU, Quantity: quantity("")}}
 	}
 	items := make([]backend.LeaseItem, len(s.Services))
 	for i, service := range s.Services {
-		items[i] = backend.LeaseItem{SKU: s.SKU, Quantity: 1, ServiceName: service}
+		items[i] = backend.LeaseItem{SKU: s.SKU, Quantity: quantity(service), ServiceName: service}
 	}
 	return items
 }
@@ -66,12 +86,23 @@ type Lease struct {
 	// Partition is the retention partition of a retained lease, as Get
 	// reports it. Empty is the tenant's default partition.
 	Partition string
+	// FailCount is how many failures the backend has recorded for the lease.
+	FailCount int
+	// Reason and Message say why a failed lease failed, in the backend's
+	// fixed vocabulary. Both are empty for a lease that has not failed.
+	Reason  string
+	Message string
+	// ConsecutiveFailures is how many failures in a row count towards
+	// closing the lease, and BudgetExhausted whether they have closed it.
+	ConsecutiveFailures int
+	BudgetExhausted     bool
 }
 
 // StatusError is a response outside 2xx.
 type StatusError struct {
 	Status int
-	// Code is the backend's machine-readable discriminator, when it sent one.
+	// Code is the backend's machine-readable discriminator, when it sent one:
+	// what kind of refusal, or what is wrong with a request it found invalid.
 	Code    string
 	Message string
 }
@@ -97,6 +128,11 @@ type Client struct {
 	providerUUID string
 	storageID    backendidentity.ID
 	callbacks    *placement.CallbackRouteFactory
+
+	mu sync.Mutex
+	// accepted is the callback URL of the last Apply or Restore the backend
+	// accepted for each lease.
+	accepted map[string]string
 }
 
 // Apply asks the backend to run the lease. The work is asynchronous: poll Get.
@@ -109,7 +145,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, "/provision", true, backend.ProvisionRequest{
+	err = c.do(ctx, http.MethodPost, "/provision", true, backend.ProvisionRequest{
 		LeaseUUID:            spec.LeaseUUID,
 		Tenant:               spec.Tenant,
 		ProviderUUID:         c.providerUUID,
@@ -118,6 +154,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 		LifecycleCallbackURL: lifecycleURL,
 		Payload:              payload,
 	}, nil)
+	return c.noteAccepted(spec.LeaseUUID, operationURL, err)
 }
 
 // Get reports one lease, or ErrNotFound.
@@ -186,7 +223,7 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, "/restore", true, backend.RestoreRequest{
+	err = c.do(ctx, http.MethodPost, "/restore", true, backend.RestoreRequest{
 		LeaseUUID:            spec.LeaseUUID,
 		FromLeaseUUID:        from,
 		Tenant:               spec.Tenant,
@@ -195,10 +232,42 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,
 	}, nil)
+	return c.noteAccepted(spec.LeaseUUID, operationURL, err)
+}
+
+// noteAccepted remembers the callback URL of a command the backend accepted,
+// and returns the command's error unchanged.
+func (c *Client) noteAccepted(leaseUUID, operationURL string, err error) error {
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accepted == nil {
+		c.accepted = map[string]string{}
+	}
+	c.accepted[leaseUUID] = operationURL
+	return nil
+}
+
+// lastAccepted is the callback URL of the last Apply or Restore the backend
+// accepted for the lease, or empty.
+func (c *Client) lastAccepted(leaseUUID string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.accepted[leaseUUID]
 }
 
 func leaseOf(info backend.ProvisionInfo) Lease {
-	return Lease{UUID: info.LeaseUUID, Status: string(info.Status), Partition: info.Partition}
+	lease := Lease{
+		UUID: info.LeaseUUID, Status: string(info.Status), Partition: info.Partition,
+		FailCount: info.FailCount, Reason: string(info.Reason), Message: info.Message,
+	}
+	if budget := info.TerminalBudget; budget != nil {
+		lease.ConsecutiveFailures = budget.ConsecutiveFailures
+		lease.BudgetExhausted = budget.Verdict == backend.TerminalVerdictExhausted
+	}
+	return lease
 }
 
 // callbackURLs mints the callback pair of one operation with providerd's own
@@ -257,13 +326,14 @@ func (c *Client) do(ctx context.Context, method, path string, mutation bool, in,
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		var failure struct {
-			Error string `json:"error"`
-			Code  string `json:"code"`
+			Error      string `json:"error"`
+			Code       string `json:"code"`
+			Validation string `json:"validation_code"`
 		}
 		if json.Unmarshal(data, &failure) != nil || failure.Error == "" {
 			failure.Error = string(data)
 		}
-		return &StatusError{Status: resp.StatusCode, Code: failure.Code, Message: failure.Error}
+		return &StatusError{Status: resp.StatusCode, Code: cmp.Or(failure.Code, failure.Validation), Message: failure.Error}
 	}
 	if out == nil {
 		return nil

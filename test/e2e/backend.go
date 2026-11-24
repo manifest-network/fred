@@ -12,10 +12,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -101,6 +103,7 @@ type Backend struct {
 	docker    *client.Client
 	dockerGID uint32
 	healthURL string
+	sink      *callbackSink
 }
 
 // StartBackend starts a backend on the first Docker daemon, serving
@@ -172,7 +175,8 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 	// production.
 	secret := randomHex(t, 32)
 	b.HMACSecret = secret
-	sink := httptest.NewServer(acknowledgeCallbacks(secret))
+	b.sink = &callbackSink{secret: secret, acknowledged: map[string]bool{}}
+	sink := httptest.NewServer(b.sink)
 	t.Cleanup(sink.Close)
 	callbacks, err := placement.NewCallbackRouteFactory(sink.URL)
 	// Picked after the sink has its own port: the backend's is free, not
@@ -349,24 +353,51 @@ func (b *Backend) servingIdentity() (backendidentity.ID, bool) {
 	return id, err == nil
 }
 
-// acknowledgeCallbacks is the callback sink: it stands where providerd's
-// callback endpoint does. A backend holds a lease's next operation until the
-// previous completion is acknowledged, so every authentic callback gets a 200.
-// Tests observe leases through the client, not through callbacks.
-func acknowledgeCallbacks(secret string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
-		if err != nil {
-			http.Error(w, "unreadable callback", http.StatusBadRequest)
-			return
-		}
-		signature := r.Header.Get(hmacauth.SignatureHeader)
-		if err := hmacauth.VerifyRequest(secret, r, body, signature, 5*time.Minute); err != nil {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
+// callbackSink stands where providerd's callback endpoint does. A backend
+// holds a lease's next operation until the previous completion is
+// acknowledged, so every authentic callback gets a 200. Tests observe leases
+// through the client, not through callbacks; the sink only remembers which
+// callbacks came, for AwaitCompletionCallback.
+type callbackSink struct {
+	secret string
+
+	mu           sync.Mutex
+	acknowledged map[string]bool // by request URI
+}
+
+func (s *callbackSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "unreadable callback", http.StatusBadRequest)
+		return
 	}
+	signature := r.Header.Get(hmacauth.SignatureHeader)
+	if err := hmacauth.VerifyRequest(s.secret, r, body, signature, 5*time.Minute); err != nil {
+		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+	s.mu.Lock()
+	s.acknowledged[r.URL.RequestURI()] = true
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+}
+
+// AwaitCompletionCallback waits until the backend has sent its callback about
+// the last Apply or Restore it accepted for the lease. A 0.14 backend reports
+// a lease failed before it has settled the operation that failed, and refuses
+// the lease's next command until it has: a test that applies a failed lease
+// again waits here first. The callback is sent once the operation is settled.
+func (b *Backend) AwaitCompletionCallback(t *testing.T, leaseUUID string) {
+	t.Helper()
+	operationURL := b.Client.lastAccepted(leaseUUID)
+	require.NotEmpty(t, operationURL, "the backend accepted no command for lease %s", leaseUUID)
+	target, err := url.Parse(operationURL)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		b.sink.mu.Lock()
+		defer b.sink.mu.Unlock()
+		return b.sink.acknowledged[target.RequestURI()]
+	}, 30*time.Second, 50*time.Millisecond, "the backend sent no callback about the last command for lease %s", leaseUUID)
 }
 
 // FreeLoopbackAddr picks a free loopback port for a process to listen on. The
