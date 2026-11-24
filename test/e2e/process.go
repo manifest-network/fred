@@ -37,7 +37,8 @@ type Process struct {
 	logPath  string
 	coverDir string
 
-	// stop and exited are nil while the process is not running.
+	// cmd, stop and exited are nil while the process is not running.
+	cmd    *exec.Cmd
 	stop   context.CancelFunc
 	exited chan error
 }
@@ -67,6 +68,15 @@ func (p *Process) Env() []string {
 // The command gets SIGTERM, not SIGKILL, when the process is stopped.
 func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() bool) {
 	p.t.Helper()
+	p.Launch(build)
+	p.AwaitReady(ready)
+}
+
+// Launch runs the command build returns and does not wait for it to serve.
+// A test that has something to do while the process starts follows it with
+// AwaitReady.
+func (p *Process) Launch(build func(ctx context.Context) *exec.Cmd) {
+	p.t.Helper()
 	require.Nil(p.t, p.stop, "%s is already running", p.name)
 
 	// World-readable: CI uploads the log as the unprivileged runner account.
@@ -87,16 +97,22 @@ func (p *Process) Start(build func(ctx context.Context) *exec.Cmd, ready func() 
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
-	p.stop, p.exited = cancel, exited
+	p.cmd, p.stop, p.exited = cmd, cancel, exited
+}
 
+// AwaitReady waits until ready reports true for a launched process. The
+// process exiting first, or not serving in time, fails the test.
+func (p *Process) AwaitReady(ready func() bool) {
+	p.t.Helper()
+	require.NotNil(p.t, p.stop, "%s was not launched", p.name)
 	deadline := time.After(startTimeout)
 	poll := time.NewTicker(200 * time.Millisecond)
 	defer poll.Stop()
 	for {
 		select {
-		case err := <-exited:
-			p.stop, p.exited = nil, nil
-			cancel()
+		case err := <-p.exited:
+			p.stop()
+			p.cmd, p.stop, p.exited = nil, nil, nil
 			p.t.Fatalf("%s exited during startup: %v\n%s", p.name, err, tail(p.logPath))
 		case <-deadline:
 			p.t.Fatalf("%s did not serve within %s\n%s", p.name, startTimeout, tail(p.logPath))
@@ -117,10 +133,24 @@ func (p *Process) Stop() {
 	}
 	p.stop()
 	err := <-p.exited
-	p.stop, p.exited = nil, nil
+	p.cmd, p.stop, p.exited = nil, nil, nil
 	// exec reports a zero exit after the cancel signal as the context's
 	// error. Anything else is the process's own failure.
 	assert.ErrorIs(p.t, err, context.Canceled, "%s did not shut down cleanly", p.name)
+}
+
+// Kill ends the process with SIGKILL, as a crash does: it gets no chance to
+// finish, record or release anything. A no-op when the process is not
+// running.
+func (p *Process) Kill() {
+	p.t.Helper()
+	if p.stop == nil {
+		return
+	}
+	require.NoError(p.t, p.cmd.Process.Kill(), "kill %s", p.name)
+	<-p.exited
+	p.stop()
+	p.cmd, p.stop, p.exited = nil, nil, nil
 }
 
 // LogOnFailure attaches the end of the process's log to a failed test.

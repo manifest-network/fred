@@ -6,12 +6,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -116,20 +120,32 @@ func dockerClient(t *testing.T, socket string) *client.Client {
 // running or not.
 func (b *Backend) Containers(t *testing.T, leaseUUID string) []container.InspectResponse {
 	t.Helper()
+	inspected, err := b.TryContainers(leaseUUID)
+	require.NoError(t, err)
+	return inspected
+}
+
+// TryContainers is Containers for use off the test's goroutine, where a
+// failure must not end the test: it returns the error.
+func (b *Backend) TryContainers(leaseUUID string) ([]container.InspectResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	listed, err := b.docker.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
 	})
-	require.NoError(t, err)
+	if err != nil {
+		return nil, err
+	}
 	inspected := make([]container.InspectResponse, 0, len(listed))
 	for _, summary := range listed {
 		one, err := b.docker.ContainerInspect(ctx, summary.ID)
-		require.NoError(t, err)
+		if err != nil {
+			return nil, err
+		}
 		inspected = append(inspected, one)
 	}
-	return inspected
+	return inspected, nil
 }
 
 // LoseContainers removes the lease's containers behind the backend's back, the
@@ -201,6 +217,67 @@ func (b *Backend) networkNames(leaseUUID string) []string {
 		names[i] = one.Name
 	}
 	return names
+}
+
+// Started lists the containers of a lease that this backend's daemon has
+// started since the given time, by ID and in order, from the daemon's event
+// stream. A container that ran only for a moment is listed too.
+func (b *Backend) Started(t *testing.T, leaseUUID string, since time.Time) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	messages, errs := b.docker.Events(ctx, events.ListOptions{
+		Since: strconv.FormatInt(since.Unix(), 10),
+		Until: strconv.FormatInt(time.Now().Unix()+1, 10),
+		Filters: filters.NewArgs(
+			filters.Arg("type", string(events.ContainerEventType)),
+			filters.Arg("event", string(events.ActionStart)),
+			filters.Arg("label", labelLeaseUUID+"="+leaseUUID),
+		),
+	})
+	var started []string
+	for {
+		select {
+		case message := <-messages:
+			started = append(started, message.Actor.ID)
+		case err := <-errs:
+			if !errors.Is(err, io.EOF) {
+				require.NoError(t, err, "read the daemon's events")
+			}
+			return started
+		}
+	}
+}
+
+// Leftovers names what the host still holds of a lease: its containers and
+// networks on this backend's daemon, and its volume directories under either
+// name. A failed listing reads as a leftover, so a caller waiting for none
+// keeps waiting.
+func (b *Backend) Leftovers(leaseUUID string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var left []string
+	containers, err := b.docker.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
+	})
+	if err != nil {
+		left = append(left, "containers: "+err.Error())
+	}
+	for _, one := range containers {
+		left = append(left, "container "+strings.Join(one.Names, ","))
+	}
+	for _, name := range b.networkNames(leaseUUID) {
+		left = append(left, "network "+name)
+	}
+	volumes, err := filepath.Glob(filepath.Join(b.VolumePath, "*"+leaseUUID+"*"))
+	if err != nil {
+		left = append(left, "volumes: "+err.Error())
+	}
+	for _, path := range volumes {
+		left = append(left, "volume "+path)
+	}
+	return left
 }
 
 // removeDockerResources removes the containers, image-inspection helpers and

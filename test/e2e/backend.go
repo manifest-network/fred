@@ -115,21 +115,17 @@ func StartBackend(t *testing.T) *Backend {
 // for that key in the backend's configuration file.
 func StartBackendWithConfig(t *testing.T, settings map[string]any) *Backend {
 	t.Helper()
-	return startBackend(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU}, settings)
+	return StartBackendFor(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU}, settings)
 }
 
 // StartBackendFor seals a fresh storage identity and starts docker-backend
 // on it, on the Docker daemon behind dockerSocket, serving the given SKUs.
 // No other backend may use that daemon. Leases created through the backend's
-// Client belong to the given provider. It skips the test when the host cannot
-// run the suite. Cleanup stops the process, removes its Docker resources and
-// unmounts its storage.
-func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs) *Backend {
-	t.Helper()
-	return startBackend(t, dockerSocket, providerUUID, skus, nil)
-}
-
-func startBackend(t *testing.T, dockerSocket, providerUUID string, skus SKUs, settings map[string]any) *Backend {
+// Client belong to the given provider. Each key of settings replaces the
+// fixture's value for that key in the backend's configuration file. It skips
+// the test when the host cannot run the suite. Cleanup stops the process,
+// removes its Docker resources and unmounts its storage.
+func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs, settings map[string]any) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -267,16 +263,32 @@ func startBackend(t *testing.T, dockerSocket, providerUUID string, skus SKUs, se
 // serves. StartBackend calls it; a test calls it again after Stop.
 func (b *Backend) Start() {
 	b.t.Helper()
-	b.process.Start(
-		func(ctx context.Context) *exec.Cmd { return b.command(ctx, "-config", b.config) },
-		func() bool {
-			id, ok := b.servingIdentity()
-			if ok {
-				b.Client.storageID = id
-			}
-			return ok
-		},
-	)
+	b.Launch()
+	b.AwaitServing()
+}
+
+// Launch runs docker-backend and does not wait for it to serve. A test that
+// has something to do while the backend recovers follows it with
+// AwaitServing.
+func (b *Backend) Launch() {
+	b.t.Helper()
+	b.process.Launch(func(ctx context.Context) *exec.Cmd { return b.command(ctx, "-config", b.config) })
+}
+
+// AwaitServing waits until a launched docker-backend serves.
+func (b *Backend) AwaitServing() {
+	b.t.Helper()
+	b.process.AwaitReady(b.Serving)
+}
+
+// Serving reports whether docker-backend answers its health check. It never
+// fails the test.
+func (b *Backend) Serving() bool {
+	id, ok := b.servingIdentity()
+	if ok {
+		b.Client.storageID = id
+	}
+	return ok
 }
 
 // Stop sends SIGTERM and waits for docker-backend to exit. Containers keep
@@ -285,6 +297,13 @@ func (b *Backend) Start() {
 func (b *Backend) Stop() {
 	b.t.Helper()
 	b.process.Stop()
+}
+
+// Kill ends docker-backend with SIGKILL, as a crash does. Containers keep
+// running. A no-op when the process is not running.
+func (b *Backend) Kill() {
+	b.t.Helper()
+	b.process.Kill()
 }
 
 // command runs the binary as the backend account with the production
