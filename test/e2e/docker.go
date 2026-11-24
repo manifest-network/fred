@@ -31,6 +31,8 @@ const (
 	labelLeaseUUID   = "fred.lease_uuid"
 	labelBackendName = "fred.backend_name"
 	labelServiceName = "fred.service_name"
+	// labelInstanceIndex numbers the instances of one service, from zero.
+	labelInstanceIndex = "fred.instance_index"
 	// An image-inspection helper carries none of the labels above. The backend
 	// removes it when admission ends, so one is left behind only when the
 	// process dies during admission.
@@ -72,6 +74,9 @@ const (
 	// /probe, which tries to move a file to another XFS project. It is built
 	// from test/e2e/images/projid-probe.
 	ProjectProbeImage = testImages + "projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
+	// WritablePathImage runs as an account that owns /var/lib/app and
+	// declares no volume: test/e2e/images/writable-path.
+	WritablePathImage = testImages + "writable-path-a32ef8280dcd@sha256:17026bb62210c9a869db160328102cd9a1d6a059130af64d24d43174310406f5"
 )
 
 // containerKinds lists the kinds of container docker-backend creates: the
@@ -197,6 +202,12 @@ func (b *Backend) OccupyContainerName(t *testing.T, name, image string) {
 func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
 	t.Helper()
 	exitCode, output := b.TryExec(t, containerID, cmd...)
+	if exitCode == 137 {
+		// Killed. A process killed for the container's memory limit says
+		// nothing itself; the container's counters do.
+		_, events := b.TryExec(t, containerID, "cat", "/sys/fs/cgroup/memory.events")
+		output += "\nthe container's memory events:\n" + events
+	}
 	require.Zero(t, exitCode, "exec %v: %s", cmd, output)
 	return output
 }

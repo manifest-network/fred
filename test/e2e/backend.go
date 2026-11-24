@@ -42,6 +42,12 @@ const (
 	// with `go build -cover`, one subdirectory per process.
 	CoverDirEnv = "FRED_E2E_COVER_DIR"
 
+	// loopbackSize is the size of the sparse image behind a backend's volume
+	// path. XFS gives a quarter of a filesystem to inodes, and one volume may
+	// hold 262,144 of them: the 512M image of the in-process tests runs out
+	// of inodes before a volume reaches its limit.
+	loopbackSize = "1G"
+
 	// StatelessSKU has no disk: its leases own no volume.
 	StatelessSKU = "5f0c2f0e-6a3b-4e52-9c58-1a2b3c4d5e01"
 	// StatefulSKU has disk: an image VOLUME becomes a quota-capped XFS
@@ -157,7 +163,7 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs,
 
 	// Registered first so it runs last: the mount outlives the process and
 	// the containers that bind into it.
-	mount := testutil.SetupXFSLoopback(t)
+	mount := testutil.SetupXFSLoopbackOfSize(t, loopbackSize)
 	b.VolumePath = filepath.Join(mount, "volumes")
 	state := t.TempDir()
 	b.config = filepath.Join(state, "docker-backend.yaml")
