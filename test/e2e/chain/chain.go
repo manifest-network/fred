@@ -45,6 +45,8 @@ type Chain struct {
 	ID string
 
 	bin, home, rpc, grpc string
+	// node is the running manifestd process.
+	node *os.Process
 	// started is set once the node is about to run, which ends genesis
 	// preparation.
 	started bool
@@ -90,7 +92,7 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 		t.Skipf("%s is not set; point it at the manifestd pinned in .manifestd-version", BinaryEnv)
 	}
 	dir := t.TempDir()
-	c := &Chain{ID: "fred-e2e", bin: bin, rpc: freeAddr(t), grpc: freeAddr(t)}
+	c := &Chain{ID: "fred-e2e", bin: bin}
 	c.run(t, "testnet", "init-files", "--chain-id", c.ID, "--output-dir", dir, "--v", "1",
 		"--keyring-backend", "test", "--commit-timeout", "500ms", "--minimum-gas-prices", "0umfx")
 	c.home = filepath.Join(dir, validatorKey, "manifestd")
@@ -101,14 +103,34 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	if fromEnv := os.Getenv(logDirEnv); fromEnv != "" {
 		logDir = fromEnv
 	}
-	_, port, _ := net.SplitHostPort(c.rpc)
-	logPath := filepath.Join(logDir, "manifestd-"+port+".log")
-	logFile, err := os.Create(logPath) //nolint:gosec // G304: a path under t.TempDir
+	// The node's ports are free when picked, not reserved, and the node binds
+	// them a moment later. A node that lost one to another process is started
+	// again on fresh ports; nothing else has used it yet.
+	for attempt := 1; ; attempt++ {
+		c.rpc, c.grpc = freeAddr(t), freeAddr(t)
+		_, port, _ := net.SplitHostPort(c.rpc)
+		logPath := filepath.Join(logDir, "manifestd-"+port+".log")
+		problem := c.launch(t, logPath)
+		if problem == "" {
+			return c
+		}
+		if attempt == 3 || !strings.Contains(tail(logPath), "address already in use") {
+			t.Fatalf("%s\n%s", problem, tail(logPath))
+		}
+	}
+}
+
+// launch starts the node on the chain's ports and waits for its first block.
+// It returns what went wrong when the node did not get that far, after
+// stopping it, and registers the node's cleanup when it did.
+func (c *Chain) launch(t *testing.T, logPath string) (problem string) {
+	t.Helper()
+	logFile, err := os.Create(logPath) //nolint:gosec // G304: a path under t.TempDir or the suite's log directory
 	if err != nil {
 		t.Fatalf("create node log: %v", err)
 	}
 	defer func() { _ = logFile.Close() }()
-	node := exec.Command(bin, "start", "--home", c.home, //nolint:gosec // G204: the pinned chain binary and fixture-built arguments
+	node := exec.Command(c.bin, "start", "--home", c.home, //nolint:gosec // G204: the pinned chain binary and fixture-built arguments
 		"--rpc.laddr", "tcp://"+c.rpc, "--grpc.address", c.grpc,
 		"--p2p.laddr", "tcp://"+freeAddr(t), "--rpc.pprof_laddr", freeAddr(t),
 		"--api.enable=false", "--minimum-gas-prices", "0umfx")
@@ -118,7 +140,9 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 	}
 	exited := make(chan struct{})
 	go func() { _ = node.Wait(); close(exited) }()
-	t.Cleanup(func() {
+	stop := func() {
+		// A paused node does not see SIGTERM until it continues.
+		_ = node.Process.Signal(syscall.SIGCONT)
 		_ = node.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-exited:
@@ -126,24 +150,29 @@ func Start(t *testing.T, prepare func(genesis *Genesis)) *Chain {
 			_ = node.Process.Kill()
 			<-exited
 		}
-		if t.Failed() {
-			t.Logf("manifestd log (%s):\n%s", logPath, tail(logPath))
-		}
-	})
+	}
 
 	deadline := time.Now().Add(commitTimeout)
 	for c.height() < 1 {
 		select {
 		case <-exited:
-			t.Fatalf("manifestd exited during startup\n%s", tail(logPath))
+			return "manifestd exited during startup"
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("manifestd produced no block within %s\n%s", commitTimeout, tail(logPath))
+			stop()
+			return fmt.Sprintf("manifestd produced no block within %s", commitTimeout)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return c
+	c.node = node.Process
+	t.Cleanup(func() {
+		stop()
+		if t.Failed() {
+			t.Logf("manifestd log (%s):\n%s", logPath, tail(logPath))
+		}
+	})
+	return ""
 }
 
 // AddKey creates a key in the chain's keyring.
@@ -191,6 +220,24 @@ func (g Genesis) requireOpen(t *testing.T) {
 
 // sealed reports whether the chain has started.
 func (g Genesis) sealed() bool { return g.chain.started }
+
+// Pause freezes the node: it stops answering and stops producing blocks, as
+// a chain outage looks from outside. Queries and transactions block until
+// Resume.
+func (c *Chain) Pause(t *testing.T) {
+	t.Helper()
+	if err := c.node.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("pause manifestd: %v", err)
+	}
+}
+
+// Resume lets a paused node continue from where it stopped.
+func (c *Chain) Resume(t *testing.T) {
+	t.Helper()
+	if err := c.node.Signal(syscall.SIGCONT); err != nil {
+		t.Fatalf("resume manifestd: %v", err)
+	}
+}
 
 // Home is the node's home directory. Its keyring-test subdirectory is the
 // keyring every key of this chain lives in.

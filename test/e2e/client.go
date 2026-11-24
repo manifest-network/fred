@@ -21,9 +21,10 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 )
 
-// providerUUID stands in for the on-chain provider. The backend tier has no
-// chain, and the backend only echoes the value.
-const providerUUID = "11111111-1111-4111-8111-111111111111"
+// StandInProviderUUID is the provider of a backend started without a chain.
+// A backend only echoes the value; a providerd ignores leases a backend
+// reports for a provider other than its own.
+const StandInProviderUUID = "11111111-1111-4111-8111-111111111111"
 
 // ErrNotFound is what Get returns for a lease the backend does not know.
 var ErrNotFound = errors.New("lease not found")
@@ -66,11 +67,14 @@ func (e *StatusError) Is(target error) bool {
 // request signed, and every mutation sent on the path bound to the backend's
 // storage identity. It maps onto the 0.14 endpoints.
 type Client struct {
-	http      *http.Client
-	baseURL   string
-	secret    string
-	storageID backendidentity.ID
-	callbacks *placement.CallbackRouteFactory
+	http    *http.Client
+	baseURL string
+	secret  string
+	// providerUUID is the provider every lease this client creates belongs
+	// to. It is fixed when the backend is started.
+	providerUUID string
+	storageID    backendidentity.ID
+	callbacks    *placement.CallbackRouteFactory
 }
 
 // Apply asks the backend to run the lease. The work is asynchronous: poll Get.
@@ -86,7 +90,7 @@ func (c *Client) Apply(ctx context.Context, spec Spec) error {
 	return c.do(ctx, http.MethodPost, "/provision", true, backend.ProvisionRequest{
 		LeaseUUID:            spec.LeaseUUID,
 		Tenant:               spec.Tenant,
-		ProviderUUID:         providerUUID,
+		ProviderUUID:         c.providerUUID,
 		Items:                []backend.LeaseItem{{SKU: spec.SKU, Quantity: 1}},
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,
@@ -143,7 +147,7 @@ func (c *Client) Restore(ctx context.Context, spec Spec, from string) error {
 		LeaseUUID:            spec.LeaseUUID,
 		FromLeaseUUID:        from,
 		Tenant:               spec.Tenant,
-		ProviderUUID:         providerUUID,
+		ProviderUUID:         c.providerUUID,
 		Items:                []backend.LeaseItem{{SKU: spec.SKU, Quantity: 1}},
 		CallbackURL:          operationURL,
 		LifecycleCallbackURL: lifecycleURL,

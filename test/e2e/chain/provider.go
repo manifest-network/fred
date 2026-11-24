@@ -4,12 +4,15 @@ package chain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,29 +39,36 @@ const (
 	insecureChainConfirmation = "I ACCEPT UNAUTHENTICATED CHAIN EVIDENCE FOR LOCAL DEVELOPMENT"
 )
 
-// Provider is a whole provider: a chain, one docker-backend, and the providerd
-// that joins them. Each test starts its own, so tests share only the Docker
-// daemon.
+// Provider is a whole provider: a chain, one or more docker-backends, and the
+// providerd that joins them. Each test starts its own, so tests share only
+// the Docker daemon.
 type Provider struct {
-	Chain   *Chain
-	Backend *e2e.Backend
+	Chain *Chain
+	// Backends are the provider's backends, each on its own loopback with its
+	// own storage identity.
+	Backends []*e2e.Backend
 	// URL is the base URL of providerd's API.
 	URL string
 	// UUID is the provider's UUID on the chain.
 	UUID string
-	// SKUs are the chain's SKUs for the backend's two profiles.
+	// SKUs are served by every backend, so providerd chooses where a lease of
+	// one goes: the least loaded backend. Each backend's own SKUs.Pinned is
+	// served by that backend alone.
 	SKUs e2e.SKUs
 
 	t       *testing.T
+	binDir  string
+	process *e2e.Process
+	command func(ctx context.Context) *exec.Cmd
 	tenants int
 }
 
 // StartProvider starts a chain, registers a provider and its SKUs on it,
-// starts a backend serving those SKUs, and bootstraps providerd as an
-// operator does: create the placement database against the empty backend,
+// starts the given number of backends, and bootstraps providerd as an
+// operator does: create the placement database against the empty backends,
 // then start the daemon. It skips the test when the host cannot run the
-// suite. Cleanup stops providerd first, then the backend, then the chain.
-func StartProvider(t *testing.T) *Provider {
+// suite. Cleanup stops providerd first, then the backends, then the chain.
+func StartProvider(t *testing.T, backends int) *Provider {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and runs the binaries as a service account")
@@ -67,12 +77,19 @@ func StartProvider(t *testing.T) *Provider {
 	if binDir == "" {
 		t.Skipf("%s is not set; run `make test-e2e`", ProviderBinDirEnv)
 	}
-	for _, name := range []string{"providerd", "placement-preflight"} {
+	for _, name := range []string{"providerd", "placement-preflight", "lease-token"} {
 		_, err := os.Stat(filepath.Join(binDir, name))
 		require.NoError(t, err, "%s must hold a %s binary", ProviderBinDirEnv, name)
 	}
 
-	p := &Provider{t: t}
+	// A docker-backend needs a Docker daemon to itself.
+	sockets := e2e.DockerSockets()
+	if len(sockets) < backends {
+		t.Skipf("%d backends need %d Docker daemons, and %s names %d; start more with scripts/e2e-second-dockerd.sh",
+			backends, backends, e2e.DockerSocketsEnv, len(sockets))
+	}
+
+	p := &Provider{t: t, binDir: binDir}
 	var key Key
 	p.Chain = Start(t, func(genesis *Genesis) {
 		// A dedicated provider key, funded for fees and allowed to register a
@@ -88,8 +105,13 @@ func StartProvider(t *testing.T) *Provider {
 	require.Equal(t, key.Address, created["address"])
 	p.UUID = created["provider_uuid"]
 	p.SKUs = e2e.SKUs{Stateless: p.createSKU("e2e-stateless"), Stateful: p.createSKU("e2e-stateful")}
-
-	p.Backend = e2e.StartBackendWithSKUs(t, p.SKUs)
+	for i := range backends {
+		served := p.SKUs
+		served.Pinned = p.createSKU(fmt.Sprintf("e2e-pinned-%d", i))
+		// The backend's own client creates leases for this provider, as
+		// providerd does.
+		p.Backends = append(p.Backends, e2e.StartBackendFor(t, sockets[i], p.UUID, served))
+	}
 
 	// providerd gets its own directory and its own copy of the keyring, both
 	// owned by the service account it runs as. Unlike docker-backend it holds
@@ -123,42 +145,184 @@ func StartProvider(t *testing.T) *Provider {
 	require.NoError(t, os.WriteFile(configPath, encoded, 0o600))
 	e2e.GiveToServiceAccount(t, append(owned, configPath)...)
 
-	process := e2e.NewProcess(t, "providerd-"+p.Backend.Name)
+	p.process = e2e.NewProcess(t, "providerd-"+p.Backends[0].Name)
 	command := func(ctx context.Context, binary string, args ...string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, filepath.Join(state, binary), args...) //nolint:gosec // G204: a binary under test and fixture-built arguments
-		cmd.Env = process.Env()
+		cmd.Env = p.process.Env()
 		e2e.AsServiceAccount(cmd)
 		return cmd
 	}
+	p.command = func(ctx context.Context) *exec.Cmd { return command(ctx, "providerd", "--config", configPath) }
 
 	// providerd never creates its placement database. A new provider's
-	// operator does, once, with the backend running and still empty: the tool
-	// prints an acknowledgement bound to this provider and its backends, and
-	// creates the database only when given it back.
-	roster := `["` + p.Backend.Name + `"]`
+	// operator does, once, with every backend running and still empty: the
+	// tool prints an acknowledgement bound to this provider and its backends,
+	// and creates the database only when given it back.
+	names := make([]string, len(p.Backends))
+	for i, backend := range p.Backends {
+		names[i] = backend.Name
+	}
+	roster, err := json.Marshal(names)
+	require.NoError(t, err)
 	confirmation, err := command(t.Context(), "placement-preflight", "-config", configPath,
-		"-print-fresh-confirmation", "-expected-backends", roster).Output()
+		"-print-fresh-confirmation", "-expected-backends", string(roster)).Output()
 	require.NoError(t, err, "print the fresh-placement confirmation: %s", stderrOf(err))
 	out, err := command(t.Context(), "placement-preflight", "-config", configPath,
-		"-initialize-fresh", "-expected-backends", roster,
+		"-initialize-fresh", "-expected-backends", string(roster),
 		"-confirm-insecure-chain", insecureChainConfirmation,
 		"-confirm-quiesced", strings.TrimSpace(string(confirmation))).CombinedOutput()
 	require.NoError(t, err, "create the placement database: %s", out)
 
 	t.Cleanup(func() {
-		process.Stop()
-		process.LogOnFailure()
+		p.Stop()
+		p.process.LogOnFailure()
 	})
-	process.Start(
-		func(ctx context.Context) *exec.Cmd { return command(ctx, "providerd", "--config", configPath) },
-		func() bool { return p.healthy() },
-	)
+	p.Start()
 	return p
 }
 
+// Start runs providerd and waits until its API answers. StartProvider calls
+// it; a test calls it again after Stop.
+func (p *Provider) Start() {
+	p.t.Helper()
+	p.process.Start(p.command, p.healthy)
+}
+
+// Stop sends providerd SIGTERM and waits for it to exit. Backends and their
+// workloads keep running. A no-op when providerd is not running.
+func (p *Provider) Stop() {
+	p.t.Helper()
+	p.process.Stop()
+}
+
+// Host returns the backend that reports the lease, and fails the test unless
+// exactly one does.
+func (p *Provider) Host(t *testing.T, leaseUUID string) *e2e.Backend {
+	t.Helper()
+	var hosts []*e2e.Backend
+	for _, backend := range p.Backends {
+		_, err := backend.Client.Get(t.Context(), leaseUUID)
+		if errors.Is(err, e2e.ErrNotFound) {
+			continue
+		}
+		require.NoError(t, err, "ask backend %s for lease %s", backend.Name, leaseUUID)
+		hosts = append(hosts, backend)
+	}
+	require.Len(t, hosts, 1, "lease %s must be on exactly one backend", leaseUUID)
+	return hosts[0]
+}
+
+// Metric sums the samples of one of providerd's metrics whose labels include
+// every given `name="value"` pair. A metric that was never written reads 0.
+func (p *Provider) Metric(t *testing.T, name string, labels ...string) float64 {
+	t.Helper()
+	var sum float64
+samples:
+	for _, line := range p.metricLines(t, name) {
+		series, value, _ := strings.Cut(line, " ")
+		for _, label := range labels {
+			if !strings.Contains(series, label) {
+				continue samples
+			}
+		}
+		sample, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		require.NoError(t, err, "metric line %q", line)
+		sum += sample
+	}
+	return sum
+}
+
+// metricLines returns the sample lines of one metric from providerd's
+// /metrics endpoint.
+func (p *Provider) metricLines(t *testing.T, name string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL+"/metrics", nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	var lines []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, name+" ") || strings.HasPrefix(line, name+"{") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// AwaitMetric waits until a counter has grown by at least growth since the
+// call. This is how a test knows providerd looked at something and decided
+// to leave it: a pass that changes nothing shows only in its counters.
+func (p *Provider) AwaitMetric(t *testing.T, growth float64, name string, labels ...string) {
+	t.Helper()
+	start := p.Metric(t, name, labels...)
+	deadline := time.Now().Add(3 * time.Minute)
+	for p.Metric(t, name, labels...) < start+growth {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s%v did not grow by %v within 3 minutes; providerd reports:\n%s",
+				name, labels, growth, strings.Join(p.metricLines(t, name), "\n"))
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// SweepOutcome is how providerd labels a finished reconciliation pass.
+type SweepOutcome string
+
+const (
+	// SweepComplete is a pass that read the chain and every backend and hit
+	// no error on any lease.
+	SweepComplete SweepOutcome = "success"
+	// SweepPartial is a pass that read the chain and every backend and hit
+	// an error on at least one lease.
+	SweepPartial SweepOutcome = "partial"
+	// SweepDegraded is a pass that could not see every backend.
+	SweepDegraded SweepOutcome = "degraded"
+	// SweepFailed is a pass that ended in an error, as when the chain does
+	// not answer. It looked at no backend.
+	SweepFailed SweepOutcome = "error"
+)
+
+// AwaitSweeps waits until that many reconciliation passes with the given
+// outcome have finished since the call. The outcome matters: a failed pass
+// inspects nothing, so it is no evidence that providerd left something
+// alone. Two passes are needed to be sure one started after the call.
+func (p *Provider) AwaitSweeps(t *testing.T, sweeps int, outcome SweepOutcome) {
+	t.Helper()
+	p.AwaitMetric(t, float64(sweeps), "fred_reconciler_runs_total", `outcome="`+string(outcome)+`"`)
+}
+
+// Dispatched counts the requests of one kind that providerd has sent to a
+// backend since it started: "provision", "restore", "deprovision", "restart"
+// or "update". Unlike the backend's own state, the count also shows a
+// request the backend refused.
+func (p *Provider) Dispatched(t *testing.T, backend *e2e.Backend, operation string) float64 {
+	t.Helper()
+	return p.Metric(t, "fred_backend_requests_total", `backend="`+backend.Name+`"`, `operation="`+operation+`"`)
+}
+
 // config is providerd's configuration: the chain, the provider's identity
-// and key, the one backend, and stores under state.
+// and key, the backends, and stores under state.
 func (p *Provider) config(key Key, state, listenAddr string) map[string]any {
+	backends := make([]map[string]any, len(p.Backends))
+	for i, backend := range p.Backends {
+		backends[i] = map[string]any{
+			"name":                 backend.Name,
+			"url":                  backend.URL,
+			"tls_ca_file":          backend.CAFile,
+			"tls_client_cert_file": backend.ClientCertFile,
+			"tls_client_key_file":  backend.ClientKeyFile,
+			"hmac_secret":          backend.HMACSecret,
+			"timeout":              "30s",
+			// A backend takes only the SKUs listed for it.
+			"skus": []string{backend.SKUs.Stateless, backend.SKUs.Stateful, backend.SKUs.Pinned},
+		}
+	}
 	return map[string]any{
 		"production_mode":  false,
 		"chain_id":         p.Chain.ID,
@@ -170,21 +334,13 @@ func (p *Provider) config(key Key, state, listenAddr string) map[string]any {
 		"keyring_dir":      state,
 		"key_name":         key.Name,
 		"api_listen_addr":  listenAddr,
-		"backends": []map[string]any{{
-			"name":                 p.Backend.Name,
-			"url":                  p.Backend.URL,
-			"tls_ca_file":          p.Backend.CAFile,
-			"tls_client_cert_file": p.Backend.ClientCertFile,
-			"tls_client_key_file":  p.Backend.ClientKeyFile,
-			"hmac_secret":          p.Backend.HMACSecret,
-			"timeout":              "30s",
-			"default":              true,
-		}},
+		"backends":         backends,
 		// The backend calls back on this URL.
 		"callback_base_url": "http://" + listenAddr,
-		// A missed chain event is repaired by the next pass. The production
-		// default is five minutes, longer than a test should wait.
-		"reconciliation_interval": "10s",
+		// A missed chain event is repaired by the next pass, and a test that
+		// proves a pass left something alone must wait for passes. The
+		// production default is five minutes.
+		"reconciliation_interval": "5s",
 		"token_tracker_db_path":   filepath.Join(state, "tokens.db"),
 		"payload_store_db_path":   filepath.Join(state, "payloads.db"),
 		"placement_store_db_path": filepath.Join(state, "placements.db"),

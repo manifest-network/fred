@@ -41,14 +41,10 @@ func Main(m *testing.M) {
 func sweepLeftovers(root string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	// Containers first: they hold the bind mounts into the loopbacks. An
-	// unreachable daemon is not an error here; each test skips on it.
-	if docker, err := newDockerClient(); err == nil {
-		defer func() { _ = docker.Close() }()
-		if _, err := docker.Ping(ctx); err == nil {
-			if err := sweepDockerResources(ctx, docker, ownedByThisSuite); err != nil {
-				return fmt.Errorf("remove Docker resources: %w", err)
-			}
+	// Containers first: they hold the bind mounts into the loopbacks.
+	for _, socket := range DockerSockets() {
+		if err := sweepDaemon(ctx, socket); err != nil {
+			return fmt.Errorf("remove Docker resources at %s: %w", socket, err)
 		}
 	}
 	mounts, err := mountsUnder(root)
@@ -65,6 +61,20 @@ func sweepLeftovers(root string) error {
 		return err
 	}
 	return os.MkdirAll(root, 0o755) //nolint:gosec // G301: the service account traverses it to reach its files
+}
+
+// sweepDaemon removes this suite's containers and networks from one daemon.
+// An unreachable daemon is not an error here; each test skips on it.
+func sweepDaemon(ctx context.Context, socket string) error {
+	docker, err := newDockerClient(socket)
+	if err != nil {
+		return nil //nolint:nilerr // an unusable socket has nothing to sweep
+	}
+	defer func() { _ = docker.Close() }()
+	if _, err := docker.Ping(ctx); err != nil {
+		return nil //nolint:nilerr // an unreachable daemon has nothing to sweep
+	}
+	return sweepDockerResources(ctx, docker, ownedByThisSuite)
 }
 
 // mountsUnder lists the mount points below root, deepest first.

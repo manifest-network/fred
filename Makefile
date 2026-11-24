@@ -151,12 +151,15 @@ build-e2e:
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(DOCKER_BINARY_NAME) ./cmd/docker-backend
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(BINARY_NAME) ./cmd/providerd
 	$(GOBUILD) -cover -o $(E2E_DIR)/bin/$(PLACEMENT_PREFLIGHT_BINARY_NAME) ./cmd/placement-preflight
+	$(GOBUILD) -o $(E2E_DIR)/bin/lease-token ./cmd/lease-token
 	$(GOTEST) -tags integration -c -o $(E2E_DIR)/tests/ ./test/e2e/...
 
 # Run the black-box suite (requires sudo, Docker, xfsprogs and capsh).
 # Usage: make test-e2e   (as yourself: only the test binaries run under sudo)
 # The providerd tier also needs MANIFESTD, the path of the manifestd release
-# pinned in .manifestd-version; without it that tier skips.
+# pinned in .manifestd-version; without it that tier skips. Its two-backend
+# tests need a second Docker daemon (scripts/e2e-second-dockerd.sh), named
+# with the system one in FRED_E2E_DOCKER_SOCKETS; without it they skip.
 # One run at a time per Docker daemon: the suite removes a killed run's leftovers.
 test-e2e: build-e2e
 	@set -e; for bin in $(E2E_DIR)/tests/*.test; do \
@@ -165,6 +168,7 @@ test-e2e: build-e2e
 			"FRED_E2E_BACKEND_BIN_DIR=$(abspath $(E2E_DIR)/bin)" \
 			"FRED_E2E_PROVIDER_BIN_DIR=$(abspath $(E2E_DIR)/bin)" \
 			"MANIFESTD=$$MANIFESTD" \
+			"FRED_E2E_DOCKER_SOCKETS=$$FRED_E2E_DOCKER_SOCKETS" \
 			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
 			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
 			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT); \

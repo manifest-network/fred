@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -48,64 +49,97 @@ var containerKinds = []struct{ selector, backendLabel string }{
 	{labelInspectionSchema, labelInspectionBackend},
 }
 
-// newDockerClient connects to the daemon the backends use.
-func newDockerClient() (*client.Client, error) {
-	return client.NewClientWithOpts(client.WithHost("unix://"+dockerSocket), client.WithAPIVersionNegotiation())
+// DockerSocketsEnv lists the Docker daemons the suite may use, as socket
+// paths separated by commas. A docker-backend needs a daemon to itself: it
+// refuses to work beside another backend's containers. A provider with n
+// backends therefore needs n daemons. Unset, the suite has the system daemon
+// alone. scripts/e2e-second-dockerd.sh starts a second one.
+const DockerSocketsEnv = "FRED_E2E_DOCKER_SOCKETS"
+
+const systemDockerSocket = "/var/run/docker.sock"
+
+// DockerSockets returns the sockets of the daemons the suite may use.
+func DockerSockets() []string {
+	var sockets []string
+	for _, socket := range strings.Split(os.Getenv(DockerSocketsEnv), ",") {
+		if socket = strings.TrimSpace(socket); socket != "" {
+			sockets = append(sockets, socket)
+		}
+	}
+	if len(sockets) == 0 {
+		return []string{systemDockerSocket}
+	}
+	return sockets
+}
+
+// newDockerClient connects to the daemon behind a socket.
+func newDockerClient(socket string) (*client.Client, error) {
+	return client.NewClientWithOpts(client.WithHost("unix://"+socket), client.WithAPIVersionNegotiation())
 }
 
 // dockerClient returns a client closed with the test, and skips the test when
 // the daemon does not answer.
-func dockerClient(t *testing.T) *client.Client {
+func dockerClient(t *testing.T, socket string) *client.Client {
 	t.Helper()
-	docker, err := newDockerClient()
+	docker, err := newDockerClient(socket)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = docker.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := docker.Ping(ctx); err != nil {
-		t.Skip("Docker not available:", err)
+		t.Skipf("Docker not available at %s: %v", socket, err)
 	}
 	return docker
 }
 
-// LeaseContainers inspects every container of a lease, running or not.
-func LeaseContainers(t *testing.T, leaseUUID string) []container.InspectResponse {
+// Containers inspects every container of a lease on this backend's daemon,
+// running or not.
+func (b *Backend) Containers(t *testing.T, leaseUUID string) []container.InspectResponse {
 	t.Helper()
-	docker := dockerClient(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	listed, err := docker.ContainerList(ctx, container.ListOptions{
+	listed, err := b.docker.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: filters.NewArgs(filters.Arg("label", labelLeaseUUID+"="+leaseUUID)),
 	})
 	require.NoError(t, err)
 	inspected := make([]container.InspectResponse, 0, len(listed))
 	for _, summary := range listed {
-		one, err := docker.ContainerInspect(ctx, summary.ID)
+		one, err := b.docker.ContainerInspect(ctx, summary.ID)
 		require.NoError(t, err)
 		inspected = append(inspected, one)
 	}
 	return inspected
 }
 
-// Exec runs a command in a container and returns its output. A non-zero exit
-// fails the test.
-func Exec(t *testing.T, containerID string, cmd ...string) string {
+// LoseContainers removes the lease's containers behind the backend's back, the
+// way a host that lost them would have none.
+func (b *Backend) LoseContainers(t *testing.T, leaseUUID string) {
 	t.Helper()
-	docker := dockerClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for _, one := range b.Containers(t, leaseUUID) {
+		require.NoError(t, b.docker.ContainerRemove(ctx, one.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}))
+	}
+}
+
+// Exec runs a command in a container on this backend's daemon and returns its
+// output. A non-zero exit fails the test.
+func (b *Backend) Exec(t *testing.T, containerID string, cmd ...string) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	created, err := docker.ContainerExecCreate(ctx, containerID, container.ExecOptions{
+	created, err := b.docker.ContainerExecCreate(ctx, containerID, container.ExecOptions{
 		Cmd: cmd, AttachStdout: true, AttachStderr: true,
 	})
 	require.NoError(t, err)
-	attached, err := docker.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
+	attached, err := b.docker.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
 	require.NoError(t, err)
 	defer attached.Close()
 	var output bytes.Buffer
 	_, err = stdcopy.StdCopy(&output, &output, attached.Reader)
 	require.NoError(t, err)
-	result, err := docker.ContainerExecInspect(ctx, created.ID)
+	result, err := b.docker.ContainerExecInspect(ctx, created.ID)
 	require.NoError(t, err)
 	require.Zero(t, result.ExitCode, "exec %v: %s", cmd, output.String())
 	return output.String()
