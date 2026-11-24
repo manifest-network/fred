@@ -24,8 +24,9 @@ import (
 
 // Link is the connection from providerd to one backend, with the test in the
 // middle of it. It forwards every request and response unchanged, until a
-// test asks it to lose a response: the backend then receives the request and
-// does the work, and its caller never hears back.
+// test asks it to lose some. A lost response: the backend receives the request
+// and does the work, and its caller never hears back. A lost request: the
+// backend never receives it, and its caller cannot tell the two apart.
 //
 // The link ends the caller's TLS with a certificate of its own, and calls the
 // backend as providerd would, with the backend's client certificate. Request
@@ -39,9 +40,10 @@ type Link struct {
 	target    *url.URL
 	transport http.RoundTripper
 
-	mu   sync.Mutex
-	lose *LostResponse
-	sent map[string]Command
+	mu           sync.Mutex
+	lose         *LostResponse
+	loseRequests *LostRequests
+	sent         map[string]Command
 }
 
 // Command is one request a caller sent through a Link, kept as it was sent.
@@ -60,6 +62,14 @@ type LostResponse struct {
 
 	done    chan struct{}
 	reached bool
+}
+
+// LostRequests is the requests for one operation that a Link loses until it
+// is told to deliver them again.
+type LostRequests struct {
+	link      *Link
+	operation string
+	lost      bool
 }
 
 // errLost marks a response the link discards.
@@ -102,7 +112,7 @@ func StartLink(t *testing.T, b *Backend) *Link {
 	key, err := x509.ParseECPrivateKey(keyDER)
 	require.NoError(t, err)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !link.record(r) {
+		if !link.record(r) || link.drops(r) {
 			panic(http.ErrAbortHandler)
 		}
 		proxy.ServeHTTP(w, r)
@@ -128,6 +138,47 @@ func (l *Link) LoseResponse(operation string, settled func() bool) *LostResponse
 	defer l.mu.Unlock()
 	l.lose = lost
 	return lost
+}
+
+// LoseRequests makes the link lose every request the caller sends for an
+// operation, named as in LoseResponse, until Deliver. The backend receives
+// none of them, and each time the caller's connection ends without an answer.
+// It is every request and not one, because a caller that got no answer sends
+// the request again when it likes.
+func (l *Link) LoseRequests(operation string) *LostRequests {
+	lost := &LostRequests{link: l, operation: operation}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.loseRequests = lost
+	return lost
+}
+
+// drops reports whether the request is one the link was asked to lose.
+func (l *Link) drops(r *http.Request) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lost := l.loseRequests
+	if lost == nil || r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/"+lost.operation) {
+		return false
+	}
+	lost.lost = true
+	return true
+}
+
+// Lost reports whether the link has lost at least one request.
+func (r *LostRequests) Lost() bool {
+	r.link.mu.Lock()
+	defer r.link.mu.Unlock()
+	return r.lost
+}
+
+// Deliver makes the link forward the operation's requests again.
+func (r *LostRequests) Deliver() {
+	r.link.mu.Lock()
+	defer r.link.mu.Unlock()
+	if r.link.loseRequests == r {
+		r.link.loseRequests = nil
+	}
 }
 
 // intercept discards the response the link was asked to lose, and lets every
