@@ -164,9 +164,12 @@ func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	// project. A tenant may not rewrite the flags of anything in its volume,
 	// whichever flag it is after, so what it creates stays charged to it.
 	b.Exec(t, c.ID, "mkdir", "/data/dir")
-	exitCode, out = b.TryExec(t, c.ID, "chattr", "+A", "/data/dir")
-	require.NotZero(t, exitCode, "the tenant must not be able to rewrite the flags of its directory: %s", out)
-	require.Contains(t, strings.ToLower(out), "operation not permitted", "the change itself must be what is refused")
+	flags := b.Exec(t, c.ID, "lsattr", "-d", "/data/dir")
+	// busybox's chattr reports a refused change and still exits 0, so the
+	// refusal is read from what it prints and from the flags afterwards.
+	_, out = b.TryExec(t, c.ID, "chattr", "+A", "/data/dir")
+	require.Contains(t, strings.ToLower(out), "operation not permitted", "the tenant must not be able to rewrite the flags of its directory")
+	require.Equal(t, flags, b.Exec(t, c.ID, "lsattr", "-d", "/data/dir"), "the directory's flags must be as they were")
 	b.Exec(t, c.ID, "sh", "-c", "echo data > /data/dir/child")
 	hostDir := filepath.Join(volumeSource(t, c, "/data"), "dir")
 	require.Equal(t, before, ProjectID(t, hostDir), "the directory must still belong to the volume's project")

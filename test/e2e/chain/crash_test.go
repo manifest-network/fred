@@ -420,8 +420,14 @@ func TestCrash_ProviderdDuringUpdate(t *testing.T) {
 		held = one
 		return true
 	})
+	// A request that arrives while providerd takes stock of its backends is
+	// refused before anything is sent, and is sent again.
 	sent := time.Now()
-	unanswered := update()
+	var unanswered Answer
+	eventually(t, "providerd sends the update of lease "+lease+" to its backend", func() bool {
+		unanswered = update()
+		return unanswered.Status != http.StatusServiceUnavailable || unanswered.Reason != "inventory_reconciling"
+	})
 	lost.Require(t)
 	require.Equal(t, http.StatusServiceUnavailable, unanswered.Status, "providerd cannot say that an update it got no answer to was taken: %s", unanswered.Body)
 
