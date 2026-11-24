@@ -18,6 +18,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // replaceWithLegacyRuntimeContainer swaps the lease's only container for one
@@ -63,7 +64,7 @@ func replaceWithLegacyRuntimeContainer(t *testing.T, ctx context.Context, leaseU
 }
 
 func TestIntegration_Docker_RuntimeRefreshMovesALegacyLeaseToItsOwnNetwork(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	callbackServer, callbackCh := startCallbackServer(t)
 	b := testBackendWithRealDocker(t, func(cfg *Config) {
 		cfg.NetworkIsolation = ptrBool(true)

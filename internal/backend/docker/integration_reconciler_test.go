@@ -33,6 +33,7 @@ import (
 	"github.com/manifest-network/fred/internal/provisioner/payload"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 // integrationAcknowledger wraps a chain client as an Acknowledger for integration tests.
@@ -1279,7 +1280,7 @@ func TestIntegration_Reconciler_DetectsFailureWithoutRecoverState(t *testing.T) 
 }
 
 func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small" // stateful: DiskMB=1024
@@ -1411,7 +1412,7 @@ func TestIntegration_Reconciler_RetainRestoreLifecycle(t *testing.T) {
 // active release and re-provision the lease onto the same data, instead of
 // retrying "payload not available" forever.
 func TestIntegration_Reconciler_RestoredLeaseReprovisionsAfterContainerLoss(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	sourceLease := newIntegrationLeaseUUID()
 	restoredLease := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
@@ -1607,7 +1608,7 @@ func testManagerSetup(t *testing.T, mockChain *chaintest.MockClient, extraCfg ..
 }
 
 func TestIntegration_Manager_CloseEvent_RealSoftDelete(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	leaseUUID := newIntegrationLeaseUUID()
 	tenant := "test-tenant"
 	const sku = "docker-small"

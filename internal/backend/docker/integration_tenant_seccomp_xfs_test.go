@@ -29,6 +29,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend/docker/imageexec"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
+	"github.com/manifest-network/fred/internal/testutil"
 )
 
 type integrationXFSVolume struct {
@@ -136,7 +137,7 @@ func waitXFSProjectIDProbe(t *testing.T, ctx context.Context, sdk *client.Client
 // non-root, capability-free owner; EPERM in the tenant cases must therefore
 // come from the new policy, not from an unwritable mount or invalid ioctl.
 func TestIntegration_Docker_XFS_TenantCannotChangeProjectID(t *testing.T) {
-	mountPath := setupXFSLoopback(t)
+	mountPath := testutil.SetupXFSLoopback(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
 	docker := newIntegrationDockerClient(t, ctx)
