@@ -1,8 +1,11 @@
 # Images built for the black-box suite
 
-Most tests run public images pinned by digest. A test that needs something no
-public image has (a particular `VOLUME` list, say) gets an image built from a
-directory here.
+Every image the suite runs is built from a directory here and pinned by
+digest. Some are a Docker Official Image republished unchanged (`busybox`,
+`redis`): a backend pulls without credentials, once per image
+for every test, and Docker Hub refuses a client that asks that often. The
+others are built for a test that needs something no public image has, a
+particular `VOLUME` list, say.
 
 - One directory per image, holding a `Dockerfile` and whatever it copies. Base
   images are pinned by digest.

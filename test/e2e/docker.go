@@ -36,18 +36,30 @@ const (
 // The workload images, pinned by digest so that a run never depends on what a
 // floating tag points at that day. The tag is for the reader: Docker pulls by
 // the digest. integration.yml pre-pulls the same references.
+//
+// All of them come from the suite's own repository, the Docker Official
+// Images among them, which test/e2e/images republishes unchanged. Every test
+// starts a backend, and a backend asks the registry for the manifest of each
+// image it has not seen. It can send no credentials, and Docker Hub and ECR
+// Public both refuse clients without credentials once they have asked as
+// often as this suite does.
 const (
-	BusyboxImage = "busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
-	// RedisImage declares VOLUME /data.
-	RedisImage = "redis:7.4.12@sha256:2e3eb11462c4e3759e6972678dd051d150ff54b1e60714b3c33b701260172a90"
+	// testImages is the repository the suite's images are published to.
+	testImages = "ghcr.io/manifest-network/fred-e2e:"
+
+	// BusyboxImage is busybox 1.37.0: test/e2e/images/busybox.
+	BusyboxImage = testImages + "busybox-6fb94d8d9227@sha256:b66abc847a308ea12831a6c12cb6f3920cfb99400d92b951c52bc4d914cf48b2"
+	// RedisImage is redis 7.4.12, which declares VOLUME /data:
+	// test/e2e/images/redis.
+	RedisImage = testImages + "redis-5612f20db1e9@sha256:abb96089ca435b3d656fa453f155ec3aa54dd757cbe3f3d42fc2eabd8cbbbf03"
 	// NestedVolumesImage declares VOLUME /data/b and VOLUME /data/a/c, sets no
 	// user, and owns those directories as root, so its workload runs as
 	// root. It is built from test/e2e/images/nested-volumes.
-	NestedVolumesImage = "ghcr.io/manifest-network/fred-e2e:nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00"
+	NestedVolumesImage = testImages + "nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00"
 	// ProjectProbeImage declares VOLUME /data, runs as root, and carries
 	// /probe, which tries to move a file to another XFS project. It is built
 	// from test/e2e/images/projid-probe.
-	ProjectProbeImage = "ghcr.io/manifest-network/fred-e2e:projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
+	ProjectProbeImage = testImages + "projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
 )
 
 // containerKinds lists the kinds of container docker-backend creates: the

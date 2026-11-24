@@ -184,6 +184,7 @@ The providerd tier skips unless `MANIFESTD` names a `manifestd` binary. `.manife
 - The suite uses the `integration` build tag and no `-run` filter, so every test in the package runs. A test whose prerequisite is missing skips, and CI fails on any skip.
 - Run one e2e test binary at a time per Docker daemon; `make test-e2e` runs them in turn. `TestMain` first removes what a killed run left behind: the containers and networks of every backend named `e2e-*` on every daemon in `FRED_E2E_DOCKER_SOCKETS`, and every mount under `$TMPDIR/fred-e2e`.
 - Workload images are pinned by digest (the constants in `test/e2e/docker.go`). Never use `:latest` or another floating tag; when a pin changes, change the pre-pull list in `integration.yml` with it.
+- Every image comes from `ghcr.io/manifest-network/fred-e2e`, the Docker Official Images (busybox, redis) included: `test/e2e/images/` republishes them unchanged. A backend pulls without credentials, once per image for every test, and Docker Hub and ECR Public both refuse a client that asks that often.
 - A test that needs an image no public one provides gets one built from a directory under `test/e2e/images/` and published to `ghcr.io/manifest-network/fred-e2e` by `e2e-images.yml`. See `test/e2e/images/README.md`.
 - The harness is one fixture (`Backend`) and one client (`Client`: `Apply`, `Get`, `List`, `Close`, `Restore`). The providerd tier adds `Provider`, built on that fixture, and `Tenant`. A new feature adds a test, not harness code, and production code carries no hook for the suite.
 
