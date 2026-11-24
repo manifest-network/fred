@@ -107,7 +107,15 @@ type Backend struct {
 // StatelessSKU and StatefulSKU, for tests that drive the backend themselves.
 func StartBackend(t *testing.T) *Backend {
 	t.Helper()
-	return StartBackendFor(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU})
+	return StartBackendWithConfig(t, nil)
+}
+
+// StartBackendWithConfig is StartBackend with docker-backend settings of the
+// test's own, such as retention caps. Each key replaces the fixture's value
+// for that key in the backend's configuration file.
+func StartBackendWithConfig(t *testing.T, settings map[string]any) *Backend {
+	t.Helper()
+	return startBackend(t, DockerSockets()[0], StandInProviderUUID, SKUs{Stateless: StatelessSKU, Stateful: StatefulSKU}, settings)
 }
 
 // StartBackendFor seals a fresh storage identity and starts docker-backend
@@ -117,6 +125,11 @@ func StartBackend(t *testing.T) *Backend {
 // run the suite. Cleanup stops the process, removes its Docker resources and
 // unmounts its storage.
 func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs) *Backend {
+	t.Helper()
+	return startBackend(t, dockerSocket, providerUUID, skus, nil)
+}
+
+func startBackend(t *testing.T, dockerSocket, providerUUID string, skus SKUs, settings map[string]any) *Backend {
 	t.Helper()
 	if os.Getuid() != 0 {
 		t.Skip("e2e needs root: it mounts an XFS loopback and drops docker-backend to a non-root account")
@@ -225,6 +238,9 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs)
 	// and the backend must be told where (see integration.yml).
 	if path := os.Getenv("FRED_TEST_IMAGE_DATA_PATH"); path != "" {
 		config["image_data_path"] = path
+	}
+	for key, value := range settings {
+		config[key] = value
 	}
 	encoded, err := yaml.Marshal(config)
 	require.NoError(t, err)
