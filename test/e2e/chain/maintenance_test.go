@@ -427,14 +427,20 @@ func TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload(t *testing.T
 				require.Equal(t, "kept\n", backend.Exec(t, restored.ID, "cat", "/data/sentinel"))
 			}
 
-			logs := readLogs(t, tenant, lease)
-			require.Contains(t, logs["app/0"], "source-is-up", "logs: %v", logs)
+			// The backend publishes the failed workload's output a moment
+			// after it reports the previous workload ready again.
+			var logs map[string]string
 			var failedOutput []string
-			for key, lines := range logs {
-				if strings.HasPrefix(key, "failed/") {
-					failedOutput = append(failedOutput, lines)
+			eventually(t, "the provider serves the failed workload's output of lease "+lease, func() bool {
+				logs, failedOutput = readLogs(t, tenant, lease), nil
+				for key, lines := range logs {
+					if strings.HasPrefix(key, "failed/") {
+						failedOutput = append(failedOutput, lines)
+					}
 				}
-			}
+				return len(failedOutput) > 0
+			})
+			require.Contains(t, logs["app/0"], "source-is-up", "logs: %v", logs)
 			require.Contains(t, strings.Join(failedOutput, "\n"), "target-is-up", "the failed workload's output must stay readable: %v", logs)
 			require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 		})
