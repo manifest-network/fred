@@ -84,6 +84,10 @@ func (s Spec) items() []backend.LeaseItem {
 	return items
 }
 
+// VerdictRetry is the budget verdict of a lease the backend has not closed
+// for failing: its provider may run it again.
+const VerdictRetry = "retry"
+
 // Lease is a lease as the backend reports it.
 type Lease struct {
 	UUID   string
@@ -101,8 +105,12 @@ type Lease struct {
 	Message string
 	// ConsecutiveFailures is how many failures in a row count towards
 	// closing the lease, and BudgetExhausted whether they have closed it.
+	// BudgetVerdict is the backend's verdict as it words it: VerdictRetry
+	// for a lease it tracks and has not closed, and empty when it reports
+	// no budget, as for a retained lease.
 	ConsecutiveFailures int
 	BudgetExhausted     bool
+	BudgetVerdict       string
 	// RetainedUntil is when the backend will destroy a retained lease's
 	// data. Zero for a lease that is not retained, and for one a backend
 	// keeps without an age limit.
@@ -278,6 +286,7 @@ func leaseOf(info backend.ProvisionInfo) Lease {
 	if budget := info.TerminalBudget; budget != nil {
 		lease.ConsecutiveFailures = budget.ConsecutiveFailures
 		lease.BudgetExhausted = budget.Verdict == backend.TerminalVerdictExhausted
+		lease.BudgetVerdict = string(budget.Verdict)
 	}
 	return lease
 }

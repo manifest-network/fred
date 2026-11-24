@@ -57,10 +57,12 @@ func TestReconcile_DeadWorkloadIsRunAgain(t *testing.T) {
 	backend.KillContainers(t, lease)
 	second := replaced(t, backend, lease, first)
 	requireImage(t, second, e2e.BusyboxImage)
+	requireReachable(t, tenant, backend, lease)
 
 	backend.LoseContainers(t, lease)
 	third := replaced(t, backend, lease, second)
 	require.NotEqual(t, first.ID, third.ID)
+	requireReachable(t, tenant, backend, lease)
 	requireStaysActive(t, p, backend, lease, third)
 }
 
@@ -93,7 +95,7 @@ func TestReconcile_CrashLoopIsCountedAndRunAgain(t *testing.T) {
 		counted := reported(t, backend, lease)
 		require.GreaterOrEqual(t, counted.ConsecutiveFailures, starts-1, "an exit was not counted: %d containers were started", starts)
 		require.LessOrEqual(t, counted.ConsecutiveFailures, starts, "an exit was counted twice: %d containers were started", starts)
-		require.False(t, counted.BudgetExhausted, "%d failures are within the first half hour", counted.ConsecutiveFailures)
+		require.Equal(t, e2e.VerdictRetry, counted.BudgetVerdict, "%d failures are within the first half hour", counted.ConsecutiveFailures)
 		return starts > crashes
 	})
 	require.Equal(t, crashes+1, starts, "one container for the deploy, and one for each time the lease was run again")
@@ -103,9 +105,9 @@ func TestReconcile_CrashLoopIsCountedAndRunAgain(t *testing.T) {
 }
 
 // TestReconcile_KillsFromOutsideAreNeverCounted kills an active lease's
-// container three times from outside. A workload that somebody else killed
-// has not failed, so none of the kills may count against the lease, however
-// many there are. The provider runs it again each time.
+// container three times from outside, and then removes it. A workload that
+// somebody else killed has not failed, so none of the kills may count against
+// the lease, however many there are. The provider runs it again each time.
 func TestReconcile_KillsFromOutsideAreNeverCounted(t *testing.T) {
 	p := StartProviderWith(t, 1, eventsOnly)
 	backend, tenant := p.Backends[0], p.NewTenant(t)
@@ -118,8 +120,15 @@ func TestReconcile_KillsFromOutsideAreNeverCounted(t *testing.T) {
 		workload = replaced(t, backend, lease, workload)
 		after := reported(t, backend, lease)
 		require.Zero(t, after.ConsecutiveFailures, "kill %d must not count", kill)
-		require.False(t, after.BudgetExhausted)
+		require.Equal(t, e2e.VerdictRetry, after.BudgetVerdict, "after kill %d the lease may be run again", kill)
 	}
+
+	// A container removed outright leaves the same trace, an event, and no
+	// container to look at afterwards. The backend's periodic pass is an
+	// hour away, so the event alone must be enough to have the lease run
+	// again.
+	backend.LoseContainers(t, lease)
+	workload = replaced(t, backend, lease, workload)
 	requireStaysActive(t, p, backend, lease, workload)
 }
 
@@ -192,12 +201,21 @@ func TestReconcile_DataOfALeaseClosedWhileTheProviderWasDownIsRestorable(t *test
 	p.Start()
 	requireStatus(t, backend, source, "retained")
 	require.Empty(t, backend.Containers(t, source))
+	// What was leased is told with it: a tenant builds the lease it restores
+	// into from that.
 	var provision struct {
 		Status string `json:"status"`
+		Items  []struct {
+			SKU      string `json:"sku"`
+			Quantity int    `json:"quantity"`
+		} `json:"items"`
 	}
 	eventually(t, "the provider tells the tenant that lease "+source+" is retained", func() bool {
 		return tenant.Read(t, source, "provision", &provision) == 200 && provision.Status == "retained"
 	})
+	require.Len(t, provision.Items, 1, "the items of the retained lease: %+v", provision)
+	require.Equal(t, p.SKUs.Stateful, provision.Items[0].SKU)
+	require.Equal(t, 1, provision.Items[0].Quantity)
 
 	target := tenant.Restore(t, p.SKUs.Stateful, source, manifest)
 	requireActive(t, p.Chain, target)

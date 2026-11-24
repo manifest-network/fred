@@ -293,8 +293,16 @@ func TestBackend_RestoreIntoAnotherTier(t *testing.T) {
 	t.Run("into less disk than the data takes", func(t *testing.T) {
 		lease, _ := filled(t, b, largeStatefulSKU, between)
 		source := retired(t, b, lease)
+		// The counter says why: the backend measured the data and found it
+		// larger than the tier. A refusal because it could not measure
+		// answers the same way and counts under another reason.
+		const refusals = "fred_docker_backend_restore_demote_refused_total"
+		measured := []string{`backend="xfs"`, `reason="measured_exceeds"`}
+		refusedBefore, measuredBefore := b.Metric(t, refusals), b.Metric(t, refusals, measured...)
 		refused, err := restore(t, source, StatefulSKU)
 		requireRefused(t, b, refused, err, http.StatusUnprocessableEntity, CodeDemoteExceedsTier)
+		require.Equal(t, measuredBefore+1, b.Metric(t, refusals, measured...), "one refusal, for data measured larger than the tier")
+		require.Equal(t, refusedBefore+1, b.Metric(t, refusals), "the refusal must count under no other reason")
 		_, err = b.Client.Get(t.Context(), refused.LeaseUUID)
 		require.ErrorIs(t, err, ErrNotFound, "the backend must know nothing of the refused lease")
 		ofRefused, err := volumeRoots(b, refused.LeaseUUID)

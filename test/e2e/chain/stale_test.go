@@ -115,7 +115,7 @@ func TestReplayedCommand_AcrossABackendRestartChangesNothing(t *testing.T) {
 
 // TestRestart_AfterABackendRestart restarts a lease after its backend was
 // restarted: what the backend keeps about a lease across its own restart
-// must be enough to restart the lease.
+// must be enough to tell its tenant where to reach it, and to restart it.
 func TestRestart_AfterABackendRestart(t *testing.T) {
 	p := StartProvider(t, 1)
 	backend, tenant := p.Backends[0], p.NewTenant(t)
@@ -126,6 +126,7 @@ func TestRestart_AfterABackendRestart(t *testing.T) {
 	backend.Start()
 	requireStatus(t, backend, lease, "ready")
 	requireUntouched(t, backend, lease, first)
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Restart(t, lease)
 	restarted := replaced(t, backend, lease, first)

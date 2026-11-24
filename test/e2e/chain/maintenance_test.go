@@ -23,9 +23,12 @@ import (
 // had. What an interrupted restart or update does is in crash_test.go,
 // lost_response_test.go and stale_test.go.
 
-// imageReferenceLabel is the label docker-backend puts on a container with
-// the image its manifest names.
-const imageReferenceLabel = "fred.image_reference"
+// The labels docker-backend puts on a container: the image its manifest
+// names, and the service of the lease it runs.
+const (
+	imageReferenceLabel = "fred.image_reference"
+	serviceNameLabel    = "fred.service_name"
+)
 
 // What a backend reports for a replacement whose image cannot be pulled.
 const (
@@ -70,10 +73,13 @@ func replacedAll(t *testing.T, backend *e2e.Backend, leaseUUID string, before []
 	return now
 }
 
-// requireImage asserts that a container runs the image a manifest names.
+// requireImage asserts that a container runs the image a manifest names, and
+// that it was created from that image's identity, which a tag moved since
+// cannot change.
 func requireImage(t *testing.T, c container.InspectResponse, image string) {
 	t.Helper()
 	require.Equal(t, image, c.Config.Labels[imageReferenceLabel], "container %s must run the manifest's image", c.Name)
+	require.Equal(t, c.Image, c.Config.Image, "container %s must be created from an image's identity, not from a tag", c.Name)
 }
 
 // release is one entry of a lease's release history, as a tenant reads it.
@@ -131,16 +137,52 @@ func awaitFailedRelease(t *testing.T, tenant *Tenant, leaseUUID string) []releas
 	return history
 }
 
-// connection is where a lease can be reached, as a tenant reads it.
+// instance is one container of a lease, as its tenant is told of it.
+type instance struct {
+	ContainerID string `json:"container_id"`
+	Image       string `json:"image"`
+	Status      string `json:"status"`
+}
+
+// connection is where a lease can be reached, as a tenant reads it: every
+// instance under its service, and all of them once more in one list.
 type connection struct {
 	Connection struct {
-		Host     string `json:"host"`
-		Services map[string]struct {
-			Instances []struct {
-				Status string `json:"status"`
-			} `json:"instances"`
+		Host      string     `json:"host"`
+		Instances []instance `json:"instances"`
+		Services  map[string]struct {
+			Instances []instance `json:"instances"`
 		} `json:"services"`
 	} `json:"connection"`
+}
+
+// requireReachable reads where a lease can be reached, as its tenant, and
+// checks the answer against the lease's containers. It must name the host,
+// and each running container exactly once under its service and once in the
+// list of all instances: by its ID, as running, on the image its manifest
+// names. An answer that still named a container since replaced would differ.
+func requireReachable(t *testing.T, tenant *Tenant, backend *e2e.Backend, leaseUUID string) {
+	t.Helper()
+	var told connection
+	require.Equal(t, http.StatusOK, tenant.Read(t, leaseUUID, "connection", &told), "the connection of lease %s", leaseUUID)
+	require.Equal(t, "127.0.0.1", told.Connection.Host)
+	var all []instance
+	byService := map[string][]instance{}
+	for _, c := range backend.Containers(t, leaseUUID) {
+		require.True(t, c.State.Running, "container %s is %s", c.Name, c.State.Status)
+		// The provider names a container by the first twelve characters
+		// of its ID, as Docker does.
+		one := instance{ContainerID: c.ID[:12], Image: c.Config.Labels[imageReferenceLabel], Status: c.State.Status}
+		all = append(all, one)
+		service := c.Config.Labels[serviceNameLabel]
+		byService[service] = append(byService[service], one)
+	}
+	require.NotEmpty(t, all, "lease %s runs no container", leaseUUID)
+	require.ElementsMatch(t, all, told.Connection.Instances, "the instances of lease %s: %+v", leaseUUID, told)
+	require.Len(t, told.Connection.Services, len(byService), "the services of lease %s: %+v", leaseUUID, told)
+	for service, instances := range byService {
+		require.ElementsMatch(t, instances, told.Connection.Services[service].Instances, "service %q of lease %s: %+v", service, leaseUUID, told)
+	}
 }
 
 // readLogs reads the last lines of a lease's logs as its tenant, by
@@ -175,9 +217,7 @@ func TestMaintenance_RestartAndUpdateKeepTheData(t *testing.T) {
 		require.Equal(t, volume, inode(t, dataDir(t, now)), "after %s the volume must be the same directory, not a copy", after)
 	}
 
-	var reachable connection
-	require.Equal(t, http.StatusOK, tenant.Read(t, lease, "connection", &reachable))
-	require.Equal(t, "127.0.0.1", reachable.Connection.Host)
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Restart(t, lease)
 	restarted := replaced(t, backend, lease, first)
@@ -185,12 +225,14 @@ func TestMaintenance_RestartAndUpdateKeepTheData(t *testing.T) {
 	require.Equal(t, first.Image, restarted.Image, "a restart runs the same image")
 	require.Equal(t, command(first), command(restarted))
 	requireData(restarted, "a restart")
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Update(t, lease, runs(e2e.RedisAlpineImage))
 	updated := replaced(t, backend, lease, restarted)
 	requireImage(t, updated, e2e.RedisAlpineImage)
 	require.NotEqual(t, restarted.Image, updated.Image, "an update to another image runs that image")
 	requireData(updated, "an update")
+	requireReachable(t, tenant, backend, lease)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 }
 
@@ -244,24 +286,27 @@ func TestMaintenance_EveryInstanceIsReplaced(t *testing.T) {
 	requireActive(t, p.Chain, lease)
 	describeOnFailure(t, backend, lease)
 	first := replacedAll(t, backend, lease, nil, 2)
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Restart(t, lease)
 	restarted := replacedAll(t, backend, lease, first, 2)
 	for _, one := range restarted {
 		requireImage(t, one, e2e.BusyboxImage)
 	}
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Update(t, lease, runs(e2e.RedisImage))
 	for _, one := range replacedAll(t, backend, lease, restarted, 2) {
 		requireImage(t, one, e2e.RedisImage)
 	}
+	requireReachable(t, tenant, backend, lease)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 }
 
-// TestMaintenance_Stack runs a stack of two services through a restart, an
-// update and a close. The tenant must be able to reach and read each service,
-// a restart and an update must replace the containers of both, and a close
-// must leave nothing.
+// TestMaintenance_Stack runs a stack of two services, one of them in two
+// instances, through a restart, an update and a close. The tenant must be
+// able to reach and read every instance of each service, a restart and an
+// update must replace the containers of both, and a close must leave nothing.
 func TestMaintenance_Stack(t *testing.T) {
 	p := StartProvider(t, 1)
 	backend, tenant := p.Backends[0], p.NewTenant(t)
@@ -271,34 +316,35 @@ func TestMaintenance_Stack(t *testing.T) {
 			"db":  says(image, "db-is-up"),
 		}}
 	}
-	lease := tenant.DeployItems(t, stack(e2e.BusyboxImage), p.SKUs.Stateless+":1:web", p.SKUs.Stateless+":1:db")
+	lease := tenant.DeployItems(t, stack(e2e.BusyboxImage), p.SKUs.Stateless+":2:web", p.SKUs.Stateless+":1:db")
 	requireActive(t, p.Chain, lease)
 	describeOnFailure(t, backend, lease)
-	first := replacedAll(t, backend, lease, nil, 2)
+	const containers = 3
+	first := replacedAll(t, backend, lease, nil, containers)
 
-	var reachable connection
-	require.Equal(t, http.StatusOK, tenant.Read(t, lease, "connection", &reachable))
-	require.Equal(t, "127.0.0.1", reachable.Connection.Host)
-	require.Len(t, reachable.Connection.Services, 2, "connection: %+v", reachable)
-	for _, service := range []string{"web", "db"} {
-		instances := reachable.Connection.Services[service].Instances
-		require.Len(t, instances, 1, "service %s", service)
-		require.Equal(t, "running", instances[0].Status, "service %s", service)
-	}
+	requireReachable(t, tenant, backend, lease)
+	var told connection
+	require.Equal(t, http.StatusOK, tenant.Read(t, lease, "connection", &told))
+	require.Len(t, told.Connection.Services["web"].Instances, 2, "connection: %+v", told)
+	require.Len(t, told.Connection.Services["db"].Instances, 1, "connection: %+v", told)
 	logs := readLogs(t, tenant, lease)
-	require.Contains(t, logs["web/0"], "web-is-up", "logs: %v", logs)
+	for _, key := range []string{"web/0", "web/1"} {
+		require.Contains(t, logs[key], "web-is-up", "logs: %v", logs)
+	}
 	require.Contains(t, logs["db/0"], "db-is-up", "logs: %v", logs)
 
 	tenant.Restart(t, lease)
-	restarted := replacedAll(t, backend, lease, first, 2)
+	restarted := replacedAll(t, backend, lease, first, containers)
 	for _, one := range restarted {
 		requireImage(t, one, e2e.BusyboxImage)
 	}
+	requireReachable(t, tenant, backend, lease)
 
 	tenant.Update(t, lease, stack(e2e.RedisImage))
-	for _, one := range replacedAll(t, backend, lease, restarted, 2) {
+	for _, one := range replacedAll(t, backend, lease, restarted, containers) {
 		requireImage(t, one, e2e.RedisImage)
 	}
+	requireReachable(t, tenant, backend, lease)
 	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
 
 	tenant.Close(t, lease)
@@ -419,6 +465,7 @@ func TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload(t *testing.T
 			lease := deployActive(t, p, tenant, sku, source)
 			describeOnFailure(t, backend, lease)
 			before := running(t, backend, lease)
+			require.Equal(t, "999:999", before.Config.User, "the workload must run as the user its manifest names")
 			var volume uint64
 			if stateful {
 				backend.Exec(t, before.ID, "sh", "-c", "echo kept > /data/sentinel")
@@ -436,6 +483,7 @@ func TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload(t *testing.T
 			restored := replaced(t, backend, lease, before)
 			requireImage(t, restored, e2e.RedisImage)
 			require.Equal(t, before.Image, restored.Image)
+			require.Equal(t, before.Config.Image, restored.Config.Image)
 			require.Equal(t, command(before), command(restored))
 			require.Equal(t, before.Config.User, restored.Config.User)
 			require.Equal(t, before.Config.Env, restored.Config.Env)
@@ -450,22 +498,34 @@ func TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload(t *testing.T
 				require.Equal(t, "kept\n", backend.Exec(t, restored.ID, "cat", "/data/sentinel"))
 			}
 
+			// The tenant is told to reach the lease in that container, not
+			// in the one that failed or the one it replaced.
+			requireReachable(t, tenant, backend, lease)
+
 			// The backend publishes the failed workload's output a moment
-			// after it reports the previous workload ready again.
+			// after it reports the previous workload ready again. It is
+			// served beside the running workload's, under the same service
+			// and instance.
+			const failedKey = "failed/app/0"
 			var logs map[string]string
-			var failedOutput []string
 			eventually(t, "the provider serves the failed workload's output of lease "+lease, func() bool {
-				logs, failedOutput = readLogs(t, tenant, lease), nil
-				for key, lines := range logs {
-					if strings.HasPrefix(key, "failed/") {
-						failedOutput = append(failedOutput, lines)
-					}
-				}
-				return len(failedOutput) > 0
+				logs = readLogs(t, tenant, lease)
+				_, served := logs[failedKey]
+				return served
 			})
 			require.Contains(t, logs["app/0"], "source-is-up", "logs: %v", logs)
-			require.Contains(t, strings.Join(failedOutput, "\n"), "target-is-up", "the failed workload's output must stay readable: %v", logs)
+			require.Contains(t, logs[failedKey], "target-is-up", "the failed workload's output must stay readable: %v", logs)
 			require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
+
+			// A lease that was put back closes like any other: nothing is
+			// left running, and a volume is kept as a close keeps it.
+			tenant.Close(t, lease)
+			if stateful {
+				requireStatus(t, backend, lease, "retained")
+				require.Empty(t, backend.Containers(t, lease))
+			} else {
+				requireGone(t, backend, lease)
+			}
 		})
 	}
 }

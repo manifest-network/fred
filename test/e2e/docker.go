@@ -414,19 +414,24 @@ func (b *Backend) networkNames(leaseUUID string) []string {
 
 // Started lists the containers of a lease that this backend's daemon has
 // started since the given time, by ID and in order, from the daemon's event
-// stream. A container that ran only for a moment is listed too.
+// stream. A container that ran only for a moment is listed too. Without a
+// lease it lists every container the daemon started, the ones the backend
+// inspects images in among them.
 func (b *Backend) Started(t *testing.T, leaseUUID string, since time.Time) []string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	selected := filters.NewArgs(
+		filters.Arg("type", string(events.ContainerEventType)),
+		filters.Arg("event", string(events.ActionStart)),
+	)
+	if leaseUUID != "" {
+		selected.Add("label", labelLeaseUUID+"="+leaseUUID)
+	}
 	messages, errs := b.docker.Events(ctx, events.ListOptions{
-		Since: strconv.FormatInt(since.Unix(), 10),
-		Until: strconv.FormatInt(time.Now().Unix()+1, 10),
-		Filters: filters.NewArgs(
-			filters.Arg("type", string(events.ContainerEventType)),
-			filters.Arg("event", string(events.ActionStart)),
-			filters.Arg("label", labelLeaseUUID+"="+leaseUUID),
-		),
+		Since:   strconv.FormatInt(since.Unix(), 10),
+		Until:   strconv.FormatInt(time.Now().Unix()+1, 10),
+		Filters: selected,
 	})
 	var started []string
 	for {

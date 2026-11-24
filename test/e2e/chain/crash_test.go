@@ -3,13 +3,17 @@
 package chain
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/manifest-network/fred/test/e2e"
@@ -370,6 +374,80 @@ func TestCrash_BackendDuringUpdate(t *testing.T) {
 	openGate(t, backend, again)
 	require.Equal(t, []string{"sleep", "7200"}, command(requireSettled(t, p, backend, lease, again)), "the lease must run the updated workload")
 	requireNothingLeft(t, tenant, backend, lease)
+}
+
+// TestCrash_ProviderdDuringUpdate kills providerd while an update is under
+// way that it never got its backend's answer to. The backend has the update
+// and is starting the new workload; providerd told the tenant it could not
+// say whether the update was taken, and then died. The restarted providerd
+// must take the update up again and not run it twice: the tenant's same
+// request is accepted, the lease becomes ready in the one container the
+// update started, and the update is what the provider keeps for the lease.
+// So when the lease later loses its container, it comes back on the update's
+// image and not on the image it was first deployed with (ENG-619).
+func TestCrash_ProviderdDuringUpdate(t *testing.T) {
+	options := heldSettings(nil)
+	options.Links = true
+	p := StartProviderWith(t, 1, options)
+	backend, link, tenant := p.Backends[0], p.Links[0], p.NewTenant(t)
+	lease := deployActive(t, p, tenant, p.SKUs.Stateless, runs(e2e.BusyboxImage))
+	previous := running(t, backend, lease)
+	describeOnFailure(t, backend, lease)
+
+	// One idempotency key, so the request sent again names the same update.
+	key := uuid.NewString()
+	updated := gated(runs(e2e.RedisImage))
+	update := func() Answer {
+		return tenant.Ask(t, http.MethodPost, lease, "update", map[string]string{"Idempotency-Key": key}, UpdateTo(t, updated))
+	}
+
+	// The backend's answer is lost once the update is under way: the new
+	// container runs and has not passed its health check.
+	var held container.InspectResponse
+	lost := link.LoseResponse("update", func() bool {
+		reported, err := backend.Client.Get(context.Background(), lease)
+		if err != nil || reported.Status != "updating" {
+			return false
+		}
+		containers, err := backend.TryContainers(lease)
+		if err != nil || len(containers) != 1 {
+			return false
+		}
+		one := containers[0]
+		if one.ID == previous.ID || !one.State.Running || one.State.Health == nil || one.State.Health.Status != container.Starting {
+			return false
+		}
+		held = one
+		return true
+	})
+	sent := time.Now()
+	unanswered := update()
+	lost.Require(t)
+	require.Equal(t, http.StatusServiceUnavailable, unanswered.Status, "providerd cannot say that an update it got no answer to was taken: %s", unanswered.Body)
+
+	p.Kill()
+	requireStillHeld(t, backend, lease, held)
+	openGate(t, backend, held)
+	requireStatus(t, backend, lease, "ready")
+	p.Start()
+
+	accepted(t, "the same update, asked again", update, http.StatusServiceUnavailable)
+	settled := requireSettled(t, p, backend, lease, held)
+	requireImage(t, settled, e2e.RedisImage)
+	p.AwaitSweeps(t, 2, SweepComplete)
+	requireUntouched(t, backend, lease, settled)
+	require.Equal(t, []string{held.ID}, backend.Started(t, lease, sent), "the update must have started one container, once")
+
+	// The lease loses its container. What the provider runs again is the
+	// update, in a new container that waits for its own gate.
+	backend.LoseContainers(t, lease)
+	again := requireHeld(t, backend, lease, "provisioning")
+	require.NotEqual(t, settled.ID, again.ID)
+	requireImage(t, again, e2e.RedisImage)
+	openGate(t, backend, again)
+	requireSettled(t, p, backend, lease, again)
+	onChain := p.Chain.Lease(t, lease)
+	require.Equal(t, LeaseActive, onChain.State, "the provider closed the lease: %q", onChain.ClosureReason)
 }
 
 // TestCrash_BackendDuringRestart kills the backend while a restarted
