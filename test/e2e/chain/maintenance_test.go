@@ -519,12 +519,12 @@ func TestMaintenance_UnhealthyReplacementReturnsThePreviousWorkload(t *testing.T
 
 			// A lease that was put back closes like any other: nothing is
 			// left running, and a volume is kept as a close keeps it.
-			tenant.Close(t, lease)
 			if stateful {
+				tenant.Close(t, lease)
 				requireStatus(t, backend, lease, "retained")
 				require.Empty(t, backend.Containers(t, lease))
 			} else {
-				requireGone(t, backend, lease)
+				requireNothingLeft(t, tenant, backend, lease)
 			}
 		})
 	}
