@@ -200,7 +200,8 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs)
 			"e2e-stateless": map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 0},
 			"e2e-stateful":  map[string]any{"cpu_cores": 0.25, "memory_mb": 128, "disk_mb": 64},
 		},
-		"allowed_registries":  []string{"docker.io"},
+		// GHCR, for the images published from test/e2e/images.
+		"allowed_registries":  []string{"ghcr.io"},
 		"callback_secret":     secret,
 		"callback_db_path":    filepath.Join(state, "callbacks.db"),
 		"diagnostics_db_path": filepath.Join(state, "diagnostics.db"),
@@ -216,6 +217,9 @@ func StartBackendFor(t *testing.T, dockerSocket, providerUUID string, skus SKUs)
 		"container_stop_timeout":  "1s",
 		"startup_verify_duration": "1s",
 		"provision_timeout":       "2m",
+		// The periodic pass removes what a close leaves for it, such as the
+		// lease's network. The production default is five minutes.
+		"reconcile_interval": "10s",
 	}
 	// A containerd image store keeps its content outside Docker's data root,
 	// and the backend must be told where (see integration.yml).
