@@ -30,6 +30,14 @@ func requireRefused(t *testing.T, answer Answer, status int, reason, what string
 	require.NotEmpty(t, answer.Error, "%s: a refusal says what is wrong: %s", what, answer.Body)
 }
 
+// passHoldsLease is what the provider answers a restart or an update with
+// while one of its own passes is at work on the lease: 409, "lease is already
+// undergoing a lifecycle operation". A pass holds each lease for a moment, so
+// a request can meet one at any time, and most likely just after a pass that
+// was held open, when the next one starts at once. Nothing has been sent to
+// the backend, and the same request goes through a moment later.
+const passHoldsLease = http.StatusConflict
+
 // accepted sends a request until the provider accepts it, and fails the test
 // when the provider answers with anything but an acceptance or one of the
 // statuses a tenant is told to retry.
@@ -116,10 +124,10 @@ func TestRefusal_WhileTheProviderTakesStock(t *testing.T) {
 	lost.Require(t)
 
 	// The same requests, after the pass.
-	accepted(t, "the restart", restart, http.StatusServiceUnavailable)
+	accepted(t, "the restart", restart, http.StatusServiceUnavailable, passHoldsLease)
 	restarted := replaced(t, home, lease, workload)
 	requireImage(t, restarted, e2e.BusyboxImage)
-	accepted(t, "the update", update, http.StatusServiceUnavailable)
+	accepted(t, "the update", update, http.StatusServiceUnavailable, passHoldsLease)
 	updated := replaced(t, home, lease, restarted)
 	requireImage(t, updated, e2e.RedisImage)
 	require.Equal(t, []string{restarted.ID, updated.ID}, home.Started(t, lease, sent), "the restart and the update must each have run once")

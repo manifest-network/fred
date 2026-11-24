@@ -139,8 +139,9 @@ build-e2e:
 # tests need a second Docker daemon (scripts/e2e-second-dockerd.sh), named
 # with the system one in FRED_E2E_DOCKER_SOCKETS; without it they skip.
 # One run at a time per Docker daemon: the suite removes a killed run's leftovers.
+# Every test binary runs, so a failure in one tier does not hide the other's.
 test-e2e: build-e2e
-	@set -e; for bin in $(E2E_DIR)/tests/*.test; do \
+	@failed=0; for bin in $(E2E_DIR)/tests/*.test; do \
 		echo "Running $$bin..."; \
 		sudo env "PATH=$$PATH" \
 			"FRED_E2E_BACKEND_BIN_DIR=$(abspath $(E2E_DIR)/bin)" \
@@ -149,8 +150,8 @@ test-e2e: build-e2e
 			"FRED_E2E_DOCKER_SOCKETS=$$FRED_E2E_DOCKER_SOCKETS" \
 			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
 			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
-			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT); \
-	done
+			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT) || failed=1; \
+	done; exit $$failed
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:

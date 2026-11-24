@@ -420,13 +420,15 @@ func TestCrash_ProviderdDuringUpdate(t *testing.T) {
 		held = one
 		return true
 	})
-	// A request that arrives while providerd takes stock of its backends is
-	// refused before anything is sent, and is sent again.
+	// A request that arrives while providerd takes stock of its backends, or
+	// while a pass of its own is at work on the lease, is refused before
+	// anything is sent, and is sent again.
 	sent := time.Now()
 	var unanswered Answer
 	eventually(t, "providerd sends the update of lease "+lease+" to its backend", func() bool {
 		unanswered = update()
-		return unanswered.Status != http.StatusServiceUnavailable || unanswered.Reason != "inventory_reconciling"
+		takingStock := unanswered.Status == http.StatusServiceUnavailable && unanswered.Reason == "inventory_reconciling"
+		return !takingStock && unanswered.Status != passHoldsLease
 	})
 	lost.Require(t)
 	require.Equal(t, http.StatusServiceUnavailable, unanswered.Status, "providerd cannot say that an update it got no answer to was taken: %s", unanswered.Body)
@@ -437,7 +439,7 @@ func TestCrash_ProviderdDuringUpdate(t *testing.T) {
 	requireStatus(t, backend, lease, "ready")
 	p.Start()
 
-	accepted(t, "the same update, asked again", update, http.StatusServiceUnavailable)
+	accepted(t, "the same update, asked again", update, http.StatusServiceUnavailable, passHoldsLease)
 	settled := requireSettled(t, p, backend, lease, held)
 	requireImage(t, settled, e2e.RedisImage)
 	p.AwaitSweeps(t, 2, SweepComplete)
