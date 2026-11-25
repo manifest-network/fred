@@ -1,4 +1,4 @@
-.PHONY: all build build-mock build-docker build-placement-preflight build-placement-repair install clean deps test test-volume test-integration test-integration-stack test-integration-restart-update test-integration-volume test-integration-restore build-e2e test-e2e test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
+.PHONY: all build build-mock build-docker build-placement-preflight build-placement-repair install clean deps test test-volume test-integration build-e2e test-e2e test-coverage test-coverage-all lint run run-mock run-mock-delay run-docker fmt generate verify help
 
 # Binary names
 BINARY_NAME=providerd
@@ -115,28 +115,6 @@ test-integration:
 	@echo "Running Docker integration tests..."
 	$(GOTEST) -tags integration -v ./internal/backend/docker/ ./internal/fstree/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
 
-# Run stack integration tests (requires Docker daemon)
-test-integration-stack:
-	@echo "Running stack integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run TestIntegration_Stack -timeout 15m
-
-# Run restart, update, and releases integration tests (requires Docker daemon)
-test-integration-restart-update:
-	@echo "Running restart/update/releases integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(RestartLifecycle|UpdateLifecycle|GetReleases_History|UpdateFromFailed|RestartFromFailed|FullLifecycle|MultiContainer(Restart|Update)|UpdateBadImage|SequentialUpdates)" -timeout 10m
-
-# Run volume integration tests (requires root + Docker + xfsprogs)
-# Usage: sudo -E env "PATH=$PATH" make test-integration-volume
-test-integration-volume:
-	@echo "Running volume integration tests (requires root + Docker + xfsprogs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_Docker_(Stateful|VolumePersists|EphemeralVolume|MultiInstanceVolume|OrphanedVolume|VolumeQuota|RestartPreservesVolumes|UpdatePreservesVolumes)" -timeout 10m
-
-# Run retain/restore integration tests (requires root + Docker + xfsprogs)
-# Usage: sudo -E env "PATH=$PATH" make test-integration-restore
-test-integration-restore:
-	@echo "Running retain/restore integration tests (requires root + Docker + xfsprogs)..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ -run "TestIntegration_(Docker_Retain|Docker_RenameVolume_PreservesNestedMetadata|Reconciler_RetainRestore|Manager_CloseEvent)" -timeout 20m
-
 # Black-box suite (test/e2e): the real binaries run as separate processes.
 E2E_DIR=$(BUILD_DIR)/e2e
 E2E_TIMEOUT ?= 45m
@@ -161,8 +139,9 @@ build-e2e:
 # tests need a second Docker daemon (scripts/e2e-second-dockerd.sh), named
 # with the system one in FRED_E2E_DOCKER_SOCKETS; without it they skip.
 # One run at a time per Docker daemon: the suite removes a killed run's leftovers.
+# Every test binary runs, so a failure in one tier does not hide the other's.
 test-e2e: build-e2e
-	@set -e; for bin in $(E2E_DIR)/tests/*.test; do \
+	@failed=0; for bin in $(E2E_DIR)/tests/*.test; do \
 		echo "Running $$bin..."; \
 		sudo env "PATH=$$PATH" \
 			"FRED_E2E_BACKEND_BIN_DIR=$(abspath $(E2E_DIR)/bin)" \
@@ -171,8 +150,8 @@ test-e2e: build-e2e
 			"FRED_E2E_DOCKER_SOCKETS=$$FRED_E2E_DOCKER_SOCKETS" \
 			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
 			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
-			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT); \
-	done
+			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT) || failed=1; \
+	done; exit $$failed
 
 # Run tests with coverage (integration tests skip volume tests without root)
 test-coverage:
@@ -271,10 +250,6 @@ help:
 	@echo "  test-models             - Run the pinned Quint simulation suite"
 	@echo "  test-volume             - Run volume unit tests"
 	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, xfsprogs)"
-	@echo "  test-integration-stack         - Run stack integration tests (requires Docker)"
-	@echo "  test-integration-restart-update - Run restart/update/releases integration tests (requires Docker)"
-	@echo "  test-integration-volume        - Run volume integration tests (sudo, Docker, xfsprogs)"
-	@echo "  test-integration-restore       - Run retain/restore integration tests (sudo, Docker, xfsprogs)"
 	@echo "  test-e2e                - Run the black-box suite in test/e2e (sudo, Docker, xfsprogs, capsh)"
 	@echo "  test-coverage           - Run tests with coverage report"
 	@echo "  test-coverage-all       - Full coverage including volume tests (sudo)"

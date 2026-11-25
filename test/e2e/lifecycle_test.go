@@ -51,6 +51,23 @@ func requireFailed(t *testing.T, b *Backend, leaseUUID string) Lease {
 	return lease
 }
 
+// requireListedFailed asserts that the backend still lists a failed lease, as
+// failed. Asking for a lease by its UUID is not enough to know that: the
+// backend answers for a lease it no longer lists from what it recorded when
+// the lease failed (TestBackend_FailedDeployStaysExplained).
+func requireListedFailed(t *testing.T, b *Backend, leaseUUID string) {
+	t.Helper()
+	listed, err := b.Client.List(t.Context())
+	require.NoError(t, err)
+	for _, lease := range listed {
+		if lease.UUID == leaseUUID {
+			require.Equal(t, statusFailed, lease.Status, "lease %s as the backend lists it", leaseUUID)
+			return
+		}
+	}
+	require.Failf(t, "lease not listed", "the backend must still list failed lease %s: %+v", leaseUUID, listed)
+}
+
 // requireNotListed asserts that the backend lists none of the leases.
 func requireNotListed(t *testing.T, b *Backend, leaseUUIDs ...string) {
 	t.Helper()
@@ -154,6 +171,7 @@ func TestBackend_KilledContainerFailsTheLease(t *testing.T) {
 	b.KillContainers(t, lease.LeaseUUID)
 	failed := requireFailed(t, b, lease.LeaseUUID)
 	require.Equal(t, 1, failed.FailCount, "one death is one failure")
+	requireListedFailed(t, b, lease.LeaseUUID)
 }
 
 // TestBackend_OneKilledInstanceFailsTheLease kills one of a lease's two
@@ -169,14 +187,16 @@ func TestBackend_OneKilledInstanceFailsTheLease(t *testing.T) {
 
 	b.KillContainer(t, instances[0].ID)
 	requireFailed(t, b, lease.LeaseUUID)
+	requireListedFailed(t, b, lease.LeaseUUID)
 }
 
 // TestBackend_ContainerThatDiedWhileTheBackendWasDownFailsTheLease kills a
 // lease's container while docker-backend is stopped. The backend was not
 // there to see the death, so at its next start it must find the lease's
-// container dead, report the lease failed, and count one failure.
+// container dead, report the lease failed, and count one failure. It must do
+// so at its start: the periodic pass is an hour away.
 func TestBackend_ContainerThatDiedWhileTheBackendWasDownFailsTheLease(t *testing.T) {
-	b := StartBackend(t)
+	b := StartBackendWithConfig(t, withoutPeriodicPass)
 	lease := stateless("tenant-a")
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
@@ -194,6 +214,7 @@ func TestBackend_ContainerThatDiedWhileTheBackendWasDownFailsTheLease(t *testing
 	b.Start()
 	failed := requireFailed(t, b, lease.LeaseUUID)
 	require.Equal(t, 1, failed.FailCount, "one death is one failure")
+	requireListedFailed(t, b, lease.LeaseUUID)
 }
 
 // TestBackend_RefusesALeaseItCannotRun sends leases a backend can tell at

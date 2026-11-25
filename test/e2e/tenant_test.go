@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,12 +42,13 @@ func volumeSource(t *testing.T, c container.InspectResponse, destination string)
 	return ""
 }
 
-// ownerUID is the account that owns a host path.
-func ownerUID(t *testing.T, path string) uint32 {
+// ownerOf is the account and the group that own a host path, as "uid:gid".
+func ownerOf(t *testing.T, path string) string {
 	t.Helper()
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	return info.Sys().(*syscall.Stat_t).Uid
+	stat := info.Sys().(*syscall.Stat_t)
+	return fmt.Sprintf("%d:%d", stat.Uid, stat.Gid)
 }
 
 // TestBackend_LeasesOfOneTenantAreIsolated runs the same two-service stack in
@@ -121,36 +123,56 @@ func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 	}, 2*time.Minute, time.Second)
 }
 
-// TestBackend_TenantCannotChangeProjectID has a tenant try to move one of its
-// own files to another XFS project. A volume's quota counts the files of its
-// project, so a tenant that could retag a file would put its usage on another
-// volume's quota. The kernel lets a file's owner do it, with no capability:
-// the backend's seccomp profile is what refuses it. The attempt must fail,
-// and the file must stay where it was (ENG-1118).
+// TestBackend_TenantCannotChangeProjectID has a tenant try to take its own
+// data out of its volume's XFS project. A volume's quota counts the files of
+// its project, so a tenant that could retag a file would put its usage on
+// another volume's quota, or on none. The kernel lets a file's owner do it,
+// with no capability: the backend's seccomp profile is what refuses it. Each
+// attempt must fail and change nothing (ENG-1118).
 //
-// The image's probe issues the project change alone. chattr rewrites the
-// file's flags first, which the profile also refuses, so a test using it
-// passes whether or not the project change is refused.
+// There are two ways out. One is to move a file to another project. The
+// other is through a directory: it hands its project to what is created in
+// it, until it is told not to, and there are two commands to tell it. The
+// image's probe issues one changing command per run, so each answer is that
+// command's. The chattr tool rewrites a file's flags before it changes the
+// project, which hides the answer to the change, and has no letter for what
+// a directory hands down.
 //
-// Guard: the FS_IOC_FSSETXATTR entry of deniedIoctlCubes,
-// internal/backend/docker/tenantseccomp/profile_linux.go. Proof: without it
-// the probe prints "changed".
+// Guard: the FS_IOC_FSSETXATTR and FS_IOC_SETFLAGS entries of
+// deniedIoctlCubes, internal/backend/docker/tenantseccomp/profile_linux.go.
+// Proof: without the first the probe prints "changed" for the project;
+// without the second, for the flag.
 func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(ProjectProbeImage)}
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	c := requireOneRunningContainer(t, b, lease.LeaseUUID)
+	volume := volumeSource(t, c, "/data")
 
 	b.Exec(t, c.ID, "sh", "-c", "echo data > /data/file")
-	hostFile := filepath.Join(volumeSource(t, c, "/data"), "file")
+	hostFile := filepath.Join(volume, "file")
 	before := ProjectID(t, hostFile)
 	require.NotZero(t, before, "a file in a stateful volume is charged to the volume's project")
 
-	exitCode, out := b.TryExec(t, c.ID, "/probe", "/data/file", strconv.Itoa(before+1))
-	require.NotZero(t, exitCode, "the tenant must not be able to change the project of its file: %s", out)
-	require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
-	require.Equal(t, before, ProjectID(t, hostFile))
+	// To another project, and to none, which no quota counts.
+	for _, project := range []int{before + 1, 0} {
+		exitCode, out := b.TryExec(t, c.ID, "/probe", "project", "/data/file", strconv.Itoa(project))
+		require.NotZero(t, exitCode, "the tenant must not be able to move its file to project %d: %s", project, out)
+		require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
+		require.Equal(t, before, ProjectID(t, hostFile), "after the attempt to move the file to project %d", project)
+	}
+
+	for _, command := range []string{"attribute", "flag"} {
+		dir := "by-" + command
+		b.Exec(t, c.ID, "mkdir", "/data/"+dir)
+		exitCode, out := b.TryExec(t, c.ID, "/probe", command, "/data/"+dir)
+		require.NotZero(t, exitCode, "the tenant must not be able to stop its directory handing its project down (%s): %s", command, out)
+		require.Contains(t, out, "clear "+command+": operation not permitted", "the change itself must be what is refused")
+		b.Exec(t, c.ID, "sh", "-c", "echo data > /data/"+dir+"/child")
+		require.Equal(t, before, ProjectID(t, filepath.Join(volume, dir)), "the directory must still belong to the volume's project")
+		require.Equal(t, before, ProjectID(t, filepath.Join(volume, dir, "child")), "a file created in the directory afterwards must be charged to the volume's project")
+	}
 }
 
 // TestBackend_RootContainerWritesItsVolume runs a workload as root on a
@@ -174,7 +196,7 @@ func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	first := requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.Equal(t, "0\n", b.Exec(t, first.ID, "id", "-u"), "the workload must be running as root")
 	source := volumeSource(t, first, "/data/b")
-	require.Zero(t, ownerUID(t, source), "the volume directory must belong to the container's user")
+	require.Equal(t, "0:0", ownerOf(t, source), "the volume directory must belong to the container's user and group")
 	b.Exec(t, first.ID, "touch", "/data/b/first")
 	require.FileExists(t, filepath.Join(source, "first"))
 
@@ -189,7 +211,7 @@ func TestBackend_RootContainerWritesItsVolume(t *testing.T) {
 	second := requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.NotEqual(t, first.ID, second.ID)
 	require.Equal(t, source, volumeSource(t, second, "/data/b"))
-	require.Zero(t, ownerUID(t, source), "the next deploy must hand the directory back to root")
+	require.Equal(t, "0:0", ownerOf(t, source), "the next deploy must hand the directory back to root, group included")
 	b.Exec(t, second.ID, "touch", "/data/b/second")
 	require.FileExists(t, filepath.Join(source, "first"), "the data of the first deploy must still be there")
 }
@@ -229,20 +251,48 @@ func TestBackend_SymlinkedVolumeDirectoryIsRefused(t *testing.T) {
 
 	const refusals = "fred_docker_backend_volume_bind_symlink_rejected_total"
 	refusedBefore := b.Metric(t, refusals)
+	applied := time.Now()
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		assert.Greater(collect, b.metricOrZero(refusals), refusedBefore, "the backend must refuse the linked directory")
 	}, 2*time.Minute, time.Second)
 
-	for _, one := range b.Containers(t, lease.LeaseUUID) {
-		require.False(t, one.State.Running, "no container may run on a refused volume: %s", one.ID)
+	// The lease has no container: not a running one, and not one that was
+	// created on the linked directory and left stopped.
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		containers, err := b.TryContainers(lease.LeaseUUID)
+		if assert.NoError(collect, err) {
+			assert.Empty(collect, containers, "no container may be left on a refused volume")
+		}
+	}, 30*time.Second, 500*time.Millisecond)
+	for _, created := range b.Created(t, applied) {
+		require.True(t, InspectionHelper(created), "the backend must refuse before it asks Docker for the workload's container: %s", created.Attributes["name"])
 	}
-	kept, err := os.ReadFile(filepath.Join(moved, "sentinel"))
-	require.NoError(t, err)
-	require.Equal(t, "kept\n", string(kept), "the tenant's data must be untouched")
-	info, err = os.Lstat(source)
-	require.NoError(t, err)
-	require.NotZero(t, info.Mode()&os.ModeSymlink, "the backend refuses the link; it does not remove it")
+	require.Equal(t, refusedBefore+1, b.Metric(t, refusals), "one deploy is one refusal")
+	requireUntouched := func(when string) {
+		t.Helper()
+		kept, err := os.ReadFile(filepath.Join(moved, "sentinel"))
+		require.NoError(t, err, when)
+		require.Equal(t, "kept\n", string(kept), "the tenant's data must be untouched %s", when)
+		info, err := os.Lstat(source)
+		require.NoError(t, err, when)
+		require.NotZero(t, info.Mode()&os.ModeSymlink, "the backend refuses the link; it does not remove it (%s)", when)
+	}
+	requireUntouched("after the refusal")
+
+	// The refusal is about this lease. The backend goes on serving: it runs
+	// another tenant's lease. After a restart it reports this one failed,
+	// and accepts its close. A running backend may take its deploy timeout
+	// to settle a deploy that ended this way.
+	other := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-b", SKU: StatefulSKU, Manifest: sleeper(RedisImage)}
+	require.NoError(t, b.Client.Apply(t.Context(), other))
+	requireStatus(t, b, other.LeaseUUID, statusReady)
+	b.Stop()
+	b.Start()
+	requireStatus(t, b, lease.LeaseUUID, statusFailed)
+	requireStatus(t, b, other.LeaseUUID, statusReady)
+	requireUntouched("after a restart")
+	closeLease(t, b, lease.LeaseUUID)
 }
 
 // TestBackend_LinkedVolumeDoesNotBlockOtherLeases has one tenant arrange links

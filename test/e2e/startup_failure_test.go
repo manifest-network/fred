@@ -37,13 +37,15 @@ var failsAtStartup = map[string]any{"provision_timeout": "10m"}
 
 // requireStartupFailure waits until the backend reports the lease failed for
 // the given reason, within a minute of when it was applied, and checks that
-// no container of the lease is left, running or not.
+// the backend still lists the lease and that no container of it is left,
+// running or not.
 func requireStartupFailure(t *testing.T, b *Backend, leaseUUID string, applied time.Time, reason, message string) Lease {
 	t.Helper()
 	failed := requireFailed(t, b, leaseUUID)
 	require.Less(t, time.Since(applied), time.Minute, "the backend must settle a startup failure itself, not wait for a timeout")
 	require.Equal(t, reason, failed.Reason)
 	require.Equal(t, message, failed.Message)
+	requireListedFailed(t, b, leaseUUID)
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
 		containers, err := b.TryContainers(leaseUUID)
 		if assert.NoError(collect, err) {
@@ -113,7 +115,7 @@ func TestBackend_WorkloadThatExitsWhileWatchedCountsEveryTime(t *testing.T) {
 		require.Equal(t, attempt, failed.ConsecutiveFailures, "attempt %d counts towards closing the lease", attempt)
 		// Three failures within minutes are far from the half hour a lease
 		// must keep failing for before it is closed.
-		require.False(t, failed.BudgetExhausted, "attempt %d", attempt)
+		require.Equal(t, VerdictRetry, failed.BudgetVerdict, "attempt %d", attempt)
 	}
 }
 
@@ -135,6 +137,7 @@ func TestBackend_UnhealthyWorkloadFailsTheLease(t *testing.T) {
 	require.NoError(t, b.Client.Apply(t.Context(), alone))
 	failed := requireStartupFailure(t, b, alone.LeaseUUID, applied, reasonHealthCheckFailed, messageUnhealthy)
 	require.Zero(t, failed.ConsecutiveFailures, "a health check that never passed does not count")
+	require.Equal(t, VerdictRetry, failed.BudgetVerdict, "a failed lease the backend tracks reports its budget")
 
 	stack := Spec{
 		LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Services: []string{"web", "db"},

@@ -21,10 +21,9 @@ make lint                    # go vet + golangci-lint
 
 ```bash
 sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m  # full Docker suite, slow
-sudo -E env "PATH=$PATH" make test-integration-volume   # provision-path subset on an XFS loopback, NOT the XFS quota tests
 ```
 
-`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. Both suites need root — without it the volume subset silently `t.Skip`s almost everything and still exits green. The full suite additionally needs Docker + xfsprogs + capsh (libcap2-bin), and the 15m default timeout is now too tight. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one in those packages `TestIntegration_…`.
+`sudo -E` alone does not restore `PATH` (`secure_path`) — hence the `env`. The suite needs root — without it most tests `t.Skip`, which CI's SKIP guard fails. It also needs Docker + xfsprogs + capsh (libcap2-bin), and its 15m default timeout is tight. It is what is left in-process after the black-box suite took over the lifecycle, stack, restart/update, volume, restore and image tests: kernel, Docker and image-store contracts of single components, and tests of mechanisms that 0.15 removes. It selects with `-run Integration`, so a `//go:build integration` test whose *name* lacks "Integration" never runs and never trips the SKIP guard — a filtered test emits neither `--- SKIP:` nor `--- PASS:`, so CI stays green. Name every new one in those packages `TestIntegration_…`.
 
 ```bash
 make test-e2e   # black-box suite (test/e2e): run as yourself, it calls sudo only for the test binaries

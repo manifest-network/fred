@@ -142,3 +142,17 @@ func describeOnFailure(t *testing.T, backend *e2e.Backend, leaseUUID string) {
 		}
 	})
 }
+
+// reconcilerPasses counts providerd's finished reconciliation passes.
+const reconcilerPasses = "fred_reconciler_runs_total"
+
+// awaitStartupPass waits until providerd has finished the pass it makes at
+// startup. providerd serves before that pass is over, so a test that puts an
+// hour between passes, to keep providerd from acting by itself, must first
+// let this one end.
+func awaitStartupPass(t *testing.T, p *Provider) {
+	t.Helper()
+	eventually(t, "providerd finishes its pass at startup", func() bool {
+		return p.Metric(t, reconcilerPasses, `outcome="`+string(SweepComplete)+`"`) >= 1
+	})
+}

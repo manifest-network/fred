@@ -3,10 +3,14 @@
 package chain
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/test/e2e"
 )
 
 // The tests in this file pin that a close, once asked for, runs to its end.
@@ -57,4 +61,62 @@ func TestClose_DuringAStartedRestartOrUpdate(t *testing.T) {
 	requireNothingLeft(t, tenant, backend, restarting)
 	requireNothingLeft(t, tenant, backend, updating)
 	p.AwaitSweeps(t, 2, SweepComplete)
+}
+
+// TestClose_LeaseTheProviderNeverPlacedKeepsItsData closes a lease that runs
+// on a backend the provider has no record of sending it to. For a lease it
+// deployed, the provider knows which backend to ask. For this one it knows
+// nothing, so the close must still reach the backend that holds the lease,
+// and that backend must keep the data as it does for any closed lease.
+//
+// No lease gets into that state through the provider. The test puts the
+// workload on the backend itself and acknowledges the lease on the chain with
+// the provider's key, as its operator could.
+//
+// A pass of the provider that found the workload on the backend would record
+// where it is, and the close would go the ordinary way. So the test lets the
+// pass at startup finish before the workload exists, puts the next one an
+// hour away, and checks at the end that none has run in between.
+func TestClose_LeaseTheProviderNeverPlacedKeepsItsData(t *testing.T) {
+	p := StartProviderWith(t, 1, Options{ProviderSettings: map[string]any{"reconciliation_interval": "1h"}})
+	backend, tenant := p.Backends[0], p.NewTenant(t)
+	awaitStartupPass(t, p)
+	passesBefore := p.Metric(t, reconcilerPasses)
+
+	manifest := runs(e2e.RedisImage)
+	// No manifest is uploaded, so the provider deploys nothing.
+	lease := tenant.CreateLease(t, manifest, p.SKUs.Stateful+":1")
+	describeOnFailure(t, backend, lease)
+	require.NoError(t, backend.Client.Apply(t.Context(), e2e.Spec{
+		LeaseUUID: lease, Tenant: tenant.Address(), SKU: p.SKUs.Stateful, Manifest: manifest,
+	}))
+	requireStatus(t, backend, lease, "ready")
+	workload := running(t, backend, lease)
+	backend.Exec(t, workload.ID, "sh", "-c", "echo kept > /data/sentinel")
+	// The one directory on the backend's volume path that carries the
+	// lease's name, under its live name and later under its retained one.
+	volumeRoot := func() string {
+		roots, err := filepath.Glob(filepath.Join(backend.VolumePath, "*"+lease+"*"))
+		require.NoError(t, err)
+		require.Len(t, roots, 1, "lease %s must hold exactly one volume directory", lease)
+		return roots[0]
+	}
+	data, err := filepath.Rel(volumeRoot(), dataDir(t, workload))
+	require.NoError(t, err)
+	kept := inode(t, dataDir(t, workload))
+
+	p.Chain.Tx(t, providerKey, "billing", "acknowledge-lease", lease)
+	require.Equal(t, LeaseActive, p.Chain.Lease(t, lease).State)
+	require.Zero(t, p.Dispatched(t, backend, "provision"), "the provider must not have deployed the lease itself")
+
+	tenant.Close(t, lease)
+	requireStatus(t, backend, lease, "retained")
+	require.Equal(t, passesBefore, p.Metric(t, reconcilerPasses), "no pass of the provider may have seen the workload on the backend before the close reached it")
+	require.Empty(t, backend.Containers(t, lease))
+	retained := filepath.Join(volumeRoot(), data)
+	require.Equal(t, kept, inode(t, retained), "the retained data must be the volume's own directory")
+	sentinel, err := os.ReadFile(filepath.Join(retained, "sentinel"))
+	require.NoError(t, err)
+	require.Equal(t, "kept\n", string(sentinel))
+	require.Equal(t, LeaseClosed, p.Chain.Lease(t, lease).State)
 }

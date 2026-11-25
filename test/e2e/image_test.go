@@ -213,6 +213,10 @@ func TestBackend_LeaseKeepsItsImageWhenItsTagMoves(t *testing.T) {
 	now = requireOneRunningContainer(t, b, lease.LeaseUUID)
 	require.NotEqual(t, original.ID, now.ID)
 	requireRuns(t, b, now, first)
+	require.Equal(t, "first", now.Config.Labels["app.release"])
+	for key := range refusedLabel {
+		require.NotContains(t, now.Config.Labels, key, "the new container carries a label of the image the tag names now")
+	}
 	require.Equal(t, "kept\n", b.Exec(t, now.ID, "cat", "/data/sentinel"))
 
 	// So is the container of the lease its data is restored into.
@@ -240,11 +244,16 @@ func TestBackend_MultiPlatformImageRunsTheLeafThatWasChecked(t *testing.T) {
 		// refuses, and comes first in the index.
 		refused := foreign
 		refused.Labels = refusedLabel
-		pushed := b.Registry.PushIndex(t, "multi:v1", refused, native)
+		// The volume gives the backend a reason to inspect the image in a
+		// container of its own.
+		inspected := native
+		inspected.Volumes = []string{"/data"}
+		pushed := b.Registry.PushIndex(t, "multi:v1", refused, inspected)
 		other, own := pushed[0], pushed[1]
 
 		lease := stateless("tenant-a")
 		lease.Manifest = sleeper(own.Reference)
+		applied := time.Now()
 		require.NoError(t, b.Client.Apply(t.Context(), lease))
 		requireStatus(t, b, lease.LeaseUUID, statusReady)
 		workload := requireOneRunningContainer(t, b, lease.LeaseUUID)
@@ -254,6 +263,21 @@ func TestBackend_MultiPlatformImageRunsTheLeafThatWasChecked(t *testing.T) {
 			require.NotContains(t, workload.Config.Labels, key, "the workload carries a label of the other architecture's image")
 		}
 		require.False(t, b.Registry.Requested(other.Config), "the backend has no use for the other architecture's image")
+
+		// The containers the backend inspected the image in were created
+		// from the same image as the workload, and none was ever started.
+		started := b.Started(t, "", applied)
+		helpers := 0
+		for _, created := range b.Created(t, applied) {
+			if !InspectionHelper(created) {
+				continue
+			}
+			helpers++
+			require.Equal(t, b.ImageID(t, own), created.Attributes["image"], "the image container %s was created from", created.Attributes["name"])
+			require.NotContains(t, started, created.ID, "container %s only holds an image to read; it must never run", created.Attributes["name"])
+		}
+		require.NotZero(t, helpers, "the backend inspects an image it has not seen in containers of its own")
+		require.Contains(t, started, workload.ID, "the workload's start is among the daemon's events")
 	})
 
 	t.Run("this host's image is the one checked", func(t *testing.T) {

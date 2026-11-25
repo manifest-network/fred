@@ -79,7 +79,7 @@ func TestBackend_Lifecycle(t *testing.T) {
 
 	leases, err := b.Client.List(ctx)
 	require.NoError(t, err)
-	require.Equal(t, []Lease{{UUID: lease.LeaseUUID, Status: statusReady, Tenant: lease.Tenant}}, leases)
+	require.Equal(t, []Lease{{UUID: lease.LeaseUUID, Status: statusReady, Tenant: lease.Tenant, BudgetVerdict: VerdictRetry}}, leases)
 
 	closeLease(t, b, lease.LeaseUUID)
 	requireGone(t, b, lease.LeaseUUID)
@@ -121,11 +121,20 @@ func TestBackend_RetainAndRestore(t *testing.T) {
 	requireStatus(t, b, target.LeaseUUID, statusRetained)
 }
 
+// withoutPeriodicPass puts a backend's periodic pass an hour away, for a test
+// of what the backend does at its start or on a Docker event: with the
+// fixture's ten seconds, a pass would put the same things right a moment
+// later and the test could not tell which did.
+var withoutPeriodicPass = map[string]any{"reconcile_interval": "1h"}
+
 // TestBackend_GracefulRestartKeepsLease stops and starts docker-backend under
 // a running lease. The container must outlive the process, and the restarted
 // backend must report the same lease on the same container.
+//
+// The backend's periodic pass is an hour away, so it is what the backend
+// finds at its start that makes the lease ready again, and not a later pass.
 func TestBackend_GracefulRestartKeepsLease(t *testing.T) {
-	b := StartBackend(t)
+	b := StartBackendWithConfig(t, withoutPeriodicPass)
 	ctx := t.Context()
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatelessSKU, Manifest: sleeper(BusyboxImage)}
 
