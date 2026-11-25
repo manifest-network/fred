@@ -140,8 +140,8 @@ func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 //
 // Guard: the FS_IOC_FSSETXATTR and FS_IOC_SETFLAGS entries of
 // deniedIoctlCubes, internal/backend/docker/tenantseccomp/profile_linux.go.
-// Proof: without the first the probe prints "changed" for the project. The
-// second was not part of that proof run.
+// Proof: without the first the probe prints "changed" for the project;
+// without the second, for the flag.
 func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(ProjectProbeImage)}
