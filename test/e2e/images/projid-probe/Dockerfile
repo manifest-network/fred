@@ -1,5 +1,5 @@
-# Carries /probe, which asks the kernel to move a file to another XFS project,
-# and a /data volume to try it on. It sets no user and its volume belongs to
+# Carries /probe, which asks the kernel to take a file or a directory out of
+# its XFS project, and a /data volume to try it on. It sets no user and its volume belongs to
 # root, so the workload runs as root: the owner of its files, with no
 # capability, which is all the kernel asks for. TestBackend_TenantCannotChangeProjectID
 # runs it (ENG-1118).
