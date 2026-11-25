@@ -80,12 +80,8 @@ func TestClose_DuringAStartedRestartOrUpdate(t *testing.T) {
 func TestClose_LeaseTheProviderNeverPlacedKeepsItsData(t *testing.T) {
 	p := StartProviderWith(t, 1, Options{ProviderSettings: map[string]any{"reconciliation_interval": "1h"}})
 	backend, tenant := p.Backends[0], p.NewTenant(t)
-	// The provider serves before its pass at startup is over.
-	const passes = "fred_reconciler_runs_total"
-	eventually(t, "providerd finishes its pass at startup", func() bool {
-		return p.Metric(t, passes, `outcome="`+string(SweepComplete)+`"`) >= 1
-	})
-	passesBefore := p.Metric(t, passes)
+	awaitStartupPass(t, p)
+	passesBefore := p.Metric(t, reconcilerPasses)
 
 	manifest := runs(e2e.RedisImage)
 	// No manifest is uploaded, so the provider deploys nothing.
@@ -115,7 +111,7 @@ func TestClose_LeaseTheProviderNeverPlacedKeepsItsData(t *testing.T) {
 
 	tenant.Close(t, lease)
 	requireStatus(t, backend, lease, "retained")
-	require.Equal(t, passesBefore, p.Metric(t, passes), "no pass of the provider may have seen the workload on the backend before the close reached it")
+	require.Equal(t, passesBefore, p.Metric(t, reconcilerPasses), "no pass of the provider may have seen the workload on the backend before the close reached it")
 	require.Empty(t, backend.Containers(t, lease))
 	retained := filepath.Join(volumeRoot(), data)
 	require.Equal(t, kept, inode(t, retained), "the retained data must be the volume's own directory")

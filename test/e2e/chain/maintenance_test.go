@@ -362,6 +362,7 @@ func TestMaintenance_Stack(t *testing.T) {
 // only be the tenant's command.
 func TestMaintenance_FromAFailedLease(t *testing.T) {
 	p := StartProviderWith(t, 1, Options{ProviderSettings: map[string]any{"reconciliation_interval": "1h"}})
+	awaitStartupPass(t, p)
 	backend, tenant := p.Backends[0], p.NewTenant(t)
 	lease := deployActive(t, p, tenant, p.SKUs.Stateless, runs(e2e.BusyboxImage))
 	describeOnFailure(t, backend, lease)
