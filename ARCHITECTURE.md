@@ -2370,7 +2370,6 @@ The full developer-facing test reference (commands, prerequisites, conventions) 
 |---|---|---|---|
 | Unit | `_test.go` next to each file | Single function / type behavior. Mock interfaces for chain, backends, etc. | `make test` |
 | Race | Same files, `-race -short` | Concurrency invariants — actor messages, operation registry, signer pool. Stress tests skip via `testing.Short()` because they OOM under `-race`. | `go test -race -short ./...` |
-| Integration (provisioner) | `_test.go` with no build tag | Full event flow with the in-memory mock backend. Watermill GoChannel transport. | `make test` |
 | Integration (Docker) | `_test.go` with `//go:build integration` | Real Docker daemon and XFS: the kernel, Docker and image-store contracts of single components (quotas, deep-tree deletion, image import, container create and remove), `internal/fstree`'s mount-boundary tests, and tests of mechanisms the black-box suite cannot reach. Lease lifecycle, stacks, restart and update, volumes, restore and images are tested from outside, in `test/e2e`. | `sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m` (root, Docker, the filesystem tools, `capsh` and `FRED_TEST_IMAGE_STORE`; see CONTRIBUTING.md) |
 | Stress | `manager_stress_test.go` | 10K–1M event burst tests, sustained-load tests. | See [PERFORMANCE.md](PERFORMANCE.md#running-benchmarks); 500K/1M gated by `STRESS_TEST_LARGE=1` |
 | Bench | `*_bench_test.go` | Throughput and latency profiling. | `go test -bench=.` |
