@@ -123,57 +123,56 @@ func TestBackend_LeasesOfOneTenantAreIsolated(t *testing.T) {
 	}, 2*time.Minute, time.Second)
 }
 
-// TestBackend_TenantCannotChangeProjectID has a tenant try to move one of its
-// own files to another XFS project. A volume's quota counts the files of its
-// project, so a tenant that could retag a file would put its usage on another
-// volume's quota. The kernel lets a file's owner do it, with no capability:
-// the backend's seccomp profile is what refuses it. The attempt must fail,
-// and the file must stay where it was (ENG-1118).
+// TestBackend_TenantCannotChangeProjectID has a tenant try to take its own
+// data out of its volume's XFS project. A volume's quota counts the files of
+// its project, so a tenant that could retag a file would put its usage on
+// another volume's quota, or on none. The kernel lets a file's owner do it,
+// with no capability: the backend's seccomp profile is what refuses it. Each
+// attempt must fail and change nothing (ENG-1118).
 //
-// The image's probe issues the project change alone. chattr rewrites the
-// file's flags first, which the profile also refuses, so a test using it
-// passes whether or not the project change is refused.
-//
-// The test then uses chattr for exactly that: rewriting a directory's flags
-// is the profile's second rule, and what a directory hands to the files
-// created in it is one of those flags.
+// There are two ways out. One is to move a file to another project. The
+// other is through a directory: it hands its project to what is created in
+// it, until it is told not to, and there are two commands to tell it. The
+// image's probe issues one changing command per run, so each answer is that
+// command's. The chattr tool rewrites a file's flags before it changes the
+// project, which hides the answer to the change, and has no letter for what
+// a directory hands down.
 //
 // Guard: the FS_IOC_FSSETXATTR and FS_IOC_SETFLAGS entries of
 // deniedIoctlCubes, internal/backend/docker/tenantseccomp/profile_linux.go.
-// Proof: without the first the probe prints "changed". The second was not
-// part of that proof run.
+// Proof: without the first the probe prints "changed" for the project. The
+// second was not part of that proof run.
 func TestBackend_TenantCannotChangeProjectID(t *testing.T) {
 	b := StartBackend(t)
 	lease := Spec{LeaseUUID: uuid.NewString(), Tenant: "tenant-a", SKU: StatefulSKU, Manifest: sleeper(ProjectProbeImage)}
 	require.NoError(t, b.Client.Apply(t.Context(), lease))
 	requireStatus(t, b, lease.LeaseUUID, statusReady)
 	c := requireOneRunningContainer(t, b, lease.LeaseUUID)
+	volume := volumeSource(t, c, "/data")
 
 	b.Exec(t, c.ID, "sh", "-c", "echo data > /data/file")
-	hostFile := filepath.Join(volumeSource(t, c, "/data"), "file")
+	hostFile := filepath.Join(volume, "file")
 	before := ProjectID(t, hostFile)
 	require.NotZero(t, before, "a file in a stateful volume is charged to the volume's project")
 
-	exitCode, out := b.TryExec(t, c.ID, "/probe", "/data/file", strconv.Itoa(before+1))
-	require.NotZero(t, exitCode, "the tenant must not be able to change the project of its file: %s", out)
-	require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
-	require.Equal(t, before, ProjectID(t, hostFile))
+	// To another project, and to none, which no quota counts.
+	for _, project := range []int{before + 1, 0} {
+		exitCode, out := b.TryExec(t, c.ID, "/probe", "project", "/data/file", strconv.Itoa(project))
+		require.NotZero(t, exitCode, "the tenant must not be able to move its file to project %d: %s", project, out)
+		require.Contains(t, out, "change project: operation not permitted", "the change itself must be what is refused")
+		require.Equal(t, before, ProjectID(t, hostFile), "after the attempt to move the file to project %d", project)
+	}
 
-	// The other way out of a project is through a directory's flags: one of
-	// them makes what is created in the directory belong to the directory's
-	// project. A tenant may not rewrite the flags of anything in its volume,
-	// whichever flag it is after, so what it creates stays charged to it.
-	b.Exec(t, c.ID, "mkdir", "/data/dir")
-	flags := b.Exec(t, c.ID, "lsattr", "-d", "/data/dir")
-	// busybox's chattr reports a refused change and still exits 0, so the
-	// refusal is read from what it prints and from the flags afterwards.
-	_, out = b.TryExec(t, c.ID, "chattr", "+A", "/data/dir")
-	require.Contains(t, strings.ToLower(out), "operation not permitted", "the tenant must not be able to rewrite the flags of its directory")
-	require.Equal(t, flags, b.Exec(t, c.ID, "lsattr", "-d", "/data/dir"), "the directory's flags must be as they were")
-	b.Exec(t, c.ID, "sh", "-c", "echo data > /data/dir/child")
-	hostDir := filepath.Join(volumeSource(t, c, "/data"), "dir")
-	require.Equal(t, before, ProjectID(t, hostDir), "the directory must still belong to the volume's project")
-	require.Equal(t, before, ProjectID(t, filepath.Join(hostDir, "child")), "a file created in the directory afterwards must be charged to the volume's project")
+	for _, command := range []string{"attribute", "flag"} {
+		dir := "by-" + command
+		b.Exec(t, c.ID, "mkdir", "/data/"+dir)
+		exitCode, out := b.TryExec(t, c.ID, "/probe", command, "/data/"+dir)
+		require.NotZero(t, exitCode, "the tenant must not be able to stop its directory handing its project down (%s): %s", command, out)
+		require.Contains(t, out, "clear "+command+": operation not permitted", "the change itself must be what is refused")
+		b.Exec(t, c.ID, "sh", "-c", "echo data > /data/"+dir+"/child")
+		require.Equal(t, before, ProjectID(t, filepath.Join(volume, dir)), "the directory must still belong to the volume's project")
+		require.Equal(t, before, ProjectID(t, filepath.Join(volume, dir, "child")), "a file created in the directory afterwards must be charged to the volume's project")
+	}
 }
 
 // TestBackend_RootContainerWritesItsVolume runs a workload as root on a

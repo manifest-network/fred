@@ -77,9 +77,9 @@ const (
 	// root. It is built from test/e2e/images/nested-volumes.
 	NestedVolumesImage = testImages + "nested-volumes-ac191cead6d9@sha256:73e8285a3e87689fdf7ca9a8b6a3617239ff3da75d90e9122e48075c7e7dff00"
 	// ProjectProbeImage declares VOLUME /data, runs as root, and carries
-	// /probe, which tries to move a file to another XFS project. It is built
-	// from test/e2e/images/projid-probe.
-	ProjectProbeImage = testImages + "projid-probe-8bd9cd6c79a8@sha256:00877d22f67cf71f211aed949c3a8f238755690f0a35a7bc712685ad876eb396"
+	// /probe, which tries to take a file or a directory out of its XFS
+	// project. It is built from test/e2e/images/projid-probe.
+	ProjectProbeImage = testImages + "projid-probe-0932432dc7d5@sha256:2e490f6cc3bb4b49bb3e484daff72ab04f18bf7de753a4ba84b4d3da8b7941ab"
 	// WritablePathImage runs as an account that owns /var/lib/app and
 	// declares no volume: test/e2e/images/writable-path.
 	WritablePathImage = testImages + "writable-path-a32ef8280dcd@sha256:17026bb62210c9a869db160328102cd9a1d6a059130af64d24d43174310406f5"
