@@ -24,6 +24,9 @@ func TestProviderd_Lifecycle(t *testing.T) {
 	requireActive(t, p.Chain, lease)
 	requireStatus(t, backend, lease, "ready")
 	running(t, backend, lease)
+	deployed, err := backend.Client.Get(t.Context(), lease)
+	require.NoError(t, err)
+	require.Equal(t, tenant.Address(), deployed.Tenant, "the backend must hold the lease for its tenant")
 
 	tenant.Close(t, lease)
 	require.Equal(t, LeaseClosed, p.Chain.Lease(t, lease).State)
