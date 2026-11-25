@@ -35,7 +35,7 @@ func requireRefused(t *testing.T, answer Answer, status int, reason, what string
 // undergoing a lifecycle operation". A pass holds each lease for a moment, so
 // a request can meet one at any time, and most likely just after a pass that
 // was held open, when the next one starts at once. Nothing has been sent to
-// the backend, and the same request goes through a moment later.
+// the backend, and the same request goes through a moment later (ENG-2214).
 const passHoldsLease = http.StatusConflict
 
 // accepted sends a request until the provider accepts it, and fails the test
