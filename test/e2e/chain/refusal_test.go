@@ -3,6 +3,8 @@
 package chain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"slices"
 	"sync/atomic"
@@ -10,8 +12,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manifest-network/fred/internal/testutil"
 	"github.com/manifest-network/fred/test/e2e"
 )
 
@@ -238,4 +242,51 @@ func TestBillingOnly_LeaseIsAcknowledgedAndNeverDeployed(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, listed, "the backend must hold no lease")
 	require.Empty(t, backend.Created(t, started), "no container may be created for a billing-only lease")
+}
+
+// TestRefusal_ManifestTheBackendCannotRunRejectsTheLease uploads what is not
+// a manifest: bytes that are not JSON, and JSON that names no image. The
+// provider checks an upload against the hash the lease records and nothing
+// else, so it accepts both. The backend is what reads a manifest, and it
+// refuses these. The provider must then reject the lease on the chain, saying
+// why in its fixed words, with nothing deployed, and go on serving.
+func TestRefusal_ManifestTheBackendCannotRunRejectsTheLease(t *testing.T) {
+	p := StartProvider(t, 1)
+	backend, tenant := p.Backends[0], p.NewTenant(t)
+
+	for _, c := range []struct {
+		what    string
+		payload []byte
+	}{
+		{"bytes that are not JSON", []byte("not valid json")},
+		{"a manifest without an image", []byte(`{"image":"","command":["sleep","3600"]}`)},
+	} {
+		hash := sha256.Sum256(c.payload)
+		hashHex := hex.EncodeToString(hash[:])
+		lease := tenant.createLease(t, hashHex, p.SKUs.Stateless+":1")
+		// As in DeployItems: the upload is repeated until providerd takes
+		// payloads, and a token is good for one request.
+		require.EventuallyWithT(t, func(collect *assert.CollectT) {
+			token := testutil.CreateTestPayloadToken(tenant.signer, lease, hashHex, time.Now())
+			status, body, err := tenant.request(t.Context(), http.MethodPost, "/v1/leases/"+lease+"/data", token,
+				map[string]string{"Content-Type": "application/octet-stream"}, c.payload)
+			if assert.NoError(collect, err) {
+				assert.Equal(collect, http.StatusAccepted, status, "upload of %s answered: %s", c.what, body)
+			}
+		}, time.Minute, time.Second)
+
+		eventually(t, "the provider rejects lease "+lease+" for "+c.what, func() bool {
+			onChain := p.Chain.Lease(t, lease)
+			if onChain.State == LeaseRejected {
+				require.Equal(t, "invalid manifest", onChain.RejectionReason, c.what)
+				return true
+			}
+			require.Equal(t, LeasePending, onChain.State, "%s: the lease left pending without being rejected: %+v", c.what, onChain)
+			return false
+		})
+		requireAbsent(t, backend, lease)
+	}
+
+	after := deployActive(t, p, tenant, p.SKUs.Stateless, sleeper("3600"))
+	running(t, backend, after)
 }
