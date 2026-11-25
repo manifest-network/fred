@@ -71,12 +71,22 @@ func TestClose_DuringAStartedRestartOrUpdate(t *testing.T) {
 //
 // No lease gets into that state through the provider. The test puts the
 // workload on the backend itself and acknowledges the lease on the chain with
-// the provider's key, as its operator could. The provider's periodic pass is
-// an hour away, so it cannot have learned of the workload from the backend
-// before the close.
+// the provider's key, as its operator could.
+//
+// A pass of the provider that found the workload on the backend would record
+// where it is, and the close would go the ordinary way. So the test lets the
+// pass at startup finish before the workload exists, puts the next one an
+// hour away, and checks at the end that none has run in between.
 func TestClose_LeaseTheProviderNeverPlacedKeepsItsData(t *testing.T) {
 	p := StartProviderWith(t, 1, Options{ProviderSettings: map[string]any{"reconciliation_interval": "1h"}})
 	backend, tenant := p.Backends[0], p.NewTenant(t)
+	// The provider serves before its pass at startup is over.
+	const passes = "fred_reconciler_runs_total"
+	eventually(t, "providerd finishes its pass at startup", func() bool {
+		return p.Metric(t, passes, `outcome="`+string(SweepComplete)+`"`) >= 1
+	})
+	passesBefore := p.Metric(t, passes)
+
 	manifest := runs(e2e.RedisImage)
 	// No manifest is uploaded, so the provider deploys nothing.
 	lease := tenant.CreateLease(t, manifest, p.SKUs.Stateful+":1")
@@ -105,6 +115,7 @@ func TestClose_LeaseTheProviderNeverPlacedKeepsItsData(t *testing.T) {
 
 	tenant.Close(t, lease)
 	requireStatus(t, backend, lease, "retained")
+	require.Equal(t, passesBefore, p.Metric(t, passes), "no pass of the provider may have seen the workload on the backend before the close reached it")
 	require.Empty(t, backend.Containers(t, lease))
 	retained := filepath.Join(volumeRoot(), data)
 	require.Equal(t, kept, inode(t, retained), "the retained data must be the volume's own directory")
