@@ -426,8 +426,8 @@ volume is durably gone. Only a contradiction of the authority itself, or an
 outcome that cannot be classified, latches the backend. Offline proof refuses
 the private authority rather than turning it into mutation permission.
 
-The stopped preflight and initializer
-reject either XFS stage form without mutation. Failure or ambiguity preserves the evidence
+The storage-identity initializer
+rejects either XFS stage form without mutation. Failure or ambiguity preserves the evidence
 and prevents readiness.
 
 Bundled backends retain old HMAC-authenticated, identity-unbound mutation paths

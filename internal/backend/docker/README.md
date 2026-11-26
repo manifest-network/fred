@@ -582,8 +582,8 @@ check recorded in ENG-1051 found no untagged descendants requiring legacy healin
 Startup quota backfill uses each generation's immutable effective authority:
 durable `disk_mb` for stateful volumes and pinned scratch for a physically
 present diskless writable-path volume. Mutable config is consulted only for a
-true v0.13 row whose entire profile snapshot is absent, then the result is
-persisted once. Scratch remains excluded from retention caps; an exact scratch
+live provision that no durable record sizes, and nothing is persisted from it;
+an active release that records no profiles stops recovery before this point. Scratch remains excluded from retention caps; an exact scratch
 name conservatively present in a retention row stays physically counted and
 re-capped only until it is destroyed.
 
@@ -1382,7 +1382,7 @@ select these production defaults.
 9. **Detect ready-to-failed transitions** -- if a provision was in-memory as `ready` but Docker shows a container as exited/dead, or if its exact durable cohort diverges, the lease is marked for the typed state-machine transition, which fires last (step 15): it marks the lease `failed`, increments `FailCount`, and emits the lifecycle callback. A death found this way has no live event provenance and never counts against the terminal budget. Every rebuilt entry that replaces a non-in-flight projection carries that projection's terminal budget.
 10. **Cold-start FailCount correction** -- provisions recovered as `failed` with no prior in-memory state have their `FailCount` incremented by 1. The label value was written at creation time (before the crash), so the increment accounts for the observed failure. Such a failure (typically a host reboot) never counts against the terminal budget, which starts fresh.
 11. **Preserve in-flight provisions** -- Pending operation state and its resource reservation survive an inventory rebuild. A Pending provision remains excluded from ordinary inference and is settled by the later startup operation phase. Succeeded/Failed operation rows are durable decisions, not in-flight work.
-12. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration is used only while explicitly upgrading supported v0.13 evidence.
+12. **Reset resource accounting** -- allocations are rebuilt atomically from operation-intent, active-release, restore-finalizer, and close snapshots while reservations for every still-tracked lease are preserved. Docker uses durable `disk_mb` or its mutually exclusive pinned scratch allowance; mutable configuration sizes only a recovered container that no durable record covers.
 13. **Remove late containers of closed leases** -- a permanent closed-lease receipt authorizes removing managed containers that still carry that lease's UUID; a principal-bound receipt also requires matching tenant and provider labels.
 14. **Resume admitted closes** -- after conservative projections and reservations are visible and the recovery guard is released, retry each close under its per-lease command fence after re-reading the durable journal. A close waiting only on held volume deletions is skipped; the deletion-hold executor resumes it. Transient failures retain the journal and durable execution generation for the next level-triggered pass.
 15. **Fire the deferred state-machine transitions** -- the cohort-divergence and ready-to-failed transitions found in step 9 go to each lease's actor, which serializes them with any live command.
