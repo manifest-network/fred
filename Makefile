@@ -111,9 +111,13 @@ test-volume:
 # SKIP guard covers both. Requires root, Docker, xfsprogs
 # and capsh, plus FRED_TEST_IMAGE_STORE (see CONTRIBUTING.md).
 # Usage: sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m
+# INTEGRATION_COVERPROFILE, when set, names a statement coverage profile of
+# every internal and cmd package, written when the run ends.
+INTEGRATION_COVERPROFILE ?=
+comma := ,
 test-integration:
 	@echo "Running Docker integration tests..."
-	$(GOTEST) -tags integration -v ./internal/backend/docker/ ./internal/fstree/ -run Integration -timeout $(INTEGRATION_TIMEOUT)
+	$(GOTEST) -tags integration -v ./internal/backend/docker/ ./internal/fstree/ -run Integration -timeout $(INTEGRATION_TIMEOUT) $(if $(INTEGRATION_COVERPROFILE),-coverpkg=./internal/...$(comma)./cmd/... -coverprofile=$(INTEGRATION_COVERPROFILE))
 
 # Black-box suite (test/e2e): the real binaries run as separate processes.
 E2E_DIR=$(BUILD_DIR)/e2e
@@ -122,7 +126,8 @@ E2E_TIMEOUT ?= 45m
 # Build the binaries under test and the e2e test binaries as the invoking user,
 # so the privileged run never writes root-owned files into the Go caches. The
 # binaries carry coverage instrumentation; the harness gives each process a
-# GOCOVERDIR.
+# GOCOVERDIR, under FRED_E2E_COVER_DIR when the caller sets it and in a
+# throwaway directory otherwise.
 build-e2e:
 	@echo "Building e2e binaries..."
 	@mkdir -p $(E2E_DIR)/bin $(E2E_DIR)/tests $(E2E_DIR)/logs
@@ -149,6 +154,7 @@ test-e2e: build-e2e
 			"MANIFESTD=$$MANIFESTD" \
 			"FRED_E2E_DOCKER_SOCKETS=$$FRED_E2E_DOCKER_SOCKETS" \
 			"FRED_E2E_LOG_DIR=$(abspath $(E2E_DIR)/logs)" \
+			"FRED_E2E_COVER_DIR=$$FRED_E2E_COVER_DIR" \
 			"FRED_TEST_IMAGE_DATA_PATH=$$FRED_TEST_IMAGE_DATA_PATH" \
 			"$$bin" -test.v -test.timeout $(E2E_TIMEOUT) || failed=1; \
 	done; exit $$failed

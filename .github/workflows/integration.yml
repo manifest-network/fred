@@ -339,7 +339,8 @@ jobs:
         # also carries FRED_TEST_IMAGE_STORE and FRED_TEST_IMAGE_DATA_PATH.
         run: |
           set -o pipefail
-          sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m 2>&1 | tee integration.log
+          sudo -E env "PATH=$PATH" make test-integration INTEGRATION_TIMEOUT=30m \
+            INTEGRATION_COVERPROFILE=suite-coverage.out 2>&1 | tee integration.log
 
       - name: Install the pinned manifestd
         if: matrix.suite == 'e2e'
@@ -378,7 +379,7 @@ jobs:
         # reads it.
         run: |
           set -o pipefail
-          make test-e2e 2>&1 | tee integration.log
+          FRED_E2E_COVER_DIR="$PWD/build/e2e/cover" make test-e2e 2>&1 | tee integration.log
 
       - name: Guard — fail if any integration test was SKIPPED
         # A green-but-skipped run is the exact failure mode ENG-330 exists to kill.
@@ -398,6 +399,28 @@ jobs:
             echo "::error::No integration tests executed (0 PASS lines) — check the build tag / -run pattern."
             exit 1
           fi
+
+      # Each e2e process writes its coverage counters when it exits; a process
+      # the suite killed writes none. The directories belong to the service
+      # account, so they are made readable before the runner account converts
+      # them to one text profile.
+      - name: Convert e2e coverage to a statement profile
+        if: always() && matrix.suite == 'e2e'
+        run: |
+          sudo chmod -R a+rX build/e2e/cover 2>/dev/null || true
+          dirs=$(find build/e2e/cover -name 'covmeta.*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd, -)
+          if [ -n "$dirs" ]; then
+            go tool covdata textfmt -i="$dirs" -o suite-coverage.out
+          fi
+
+      - name: Preserve the suite's coverage profile
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: suite-coverage-${{ matrix.suite }}-${{ matrix.image_store }}
+          path: suite-coverage.out
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Collect the second Docker daemon's log
         if: failure() && matrix.suite == 'e2e'
