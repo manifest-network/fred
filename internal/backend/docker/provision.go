@@ -206,8 +206,9 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 		return fmt.Errorf("plan provision ingress: %w", err)
 	}
 	req.Items = ingress.effectiveItems()
-	// Refusal must be representable before accepting a successor. An unfrozen
-	// legacy predecessor cannot supply failure lineage after Pending is written.
+	// Refusal must be representable before accepting a successor. A predecessor
+	// that records no runtime authority cannot supply failure lineage after
+	// Pending is written.
 	prepared, err := b.prepareProvisionOperation(req, desiredItems, ingress, resourceProfiles, healthCheckServices, manifestAdmission)
 	if err != nil {
 		return err

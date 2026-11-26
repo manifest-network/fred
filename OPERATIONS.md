@@ -2400,14 +2400,12 @@ For an ordinary full close, recovery reconstructs a conservative
 per-SKU CPU/memory/durable-disk/scratch snapshot. A later SKU resize, removal,
 or `container_tmpfs_size_mb` change therefore cannot
 shrink the reservation for bytes or containers already owned by the close.
-Retained/reaping rows created by this release carry the same snapshot. Older
-(v0.13) retention rows get it at startup: before anything sizes a retained
-footprint, docker-backend resolves each such row's SKUs against the current
-configuration once and freezes the result onto the row. From then on a SKU
-resize or removal cannot reprice the row or block a restart. If an old row's SKU
-no longer resolves at that point, startup fails closed with
-`freeze retained resource sizing`, naming the lease and SKU; restore that profile
-for one start so the row freezes, then remove it again. For a cleanup-only close, no tenant
+Retained/reaping rows carry the same snapshot, so a SKU resize or removal
+cannot reprice a row or block a restart. The 0.14 line recorded it on rows
+retained under v0.13. A row that still records none stops startup with
+`retained resource sizing`, counting such rows and naming up to eight leases:
+start the final 0.14 release once, with the SKU profiles those rows were
+retained under, so it records their sizing. For a cleanup-only close, no tenant
 projection is published: the fenced release still authorizes exact cleanup,
 retention is forced off, and the row retries without an arbitrary give-up because
 no safe tenant/reaping tombstone exists. A principal-bound cleanup-only receipt

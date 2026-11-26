@@ -364,10 +364,10 @@ none of them from an observed cohort: recovery refuses to start on an active
 release that lacks its `Items` (unless a pending operation supersedes it), its
 profiles, or the runtime authority of a cohort that still carries a callback
 pair, and the error names the lease. A service-name-less pre-stack cohort is
-unsupported and startup refuses it before any substrate mutation. Startup
-still freezes the sizing of a v0.13 retention row onto the row, so after it a
-SKU profile change can neither reprice a retained footprint nor block a
-restart.
+unsupported and startup refuses it before any substrate mutation. A retention
+row is sized only by the snapshot recorded on it, so a SKU profile change can
+neither reprice a retained footprint nor block a restart; startup refuses a
+row that records none.
 
 Each encoded per-lease history is capped at 32 MiB. Before a provision or
 restore mutates substrate, the backend proves that the exact terminal release

@@ -125,10 +125,8 @@ var forbidigoExemptions = map[string]struct {
 	"[live-sizing]": {
 		patterns: []string{`resolveResourceProfiles(ForConfig)?$`},
 		files: []string{
-			"internal/backend/docker/backend.go",
 			"internal/backend/docker/recover.go",
 			"internal/backend/docker/resource_profiles.go",
-			"internal/backend/docker/retained_sizing.go",
 		},
 	},
 }

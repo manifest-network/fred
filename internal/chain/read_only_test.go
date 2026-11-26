@@ -10,8 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
-
-	"github.com/manifest-network/fred/internal/backend"
 )
 
 const (
@@ -101,9 +99,6 @@ func TestReadOnlyClientSnapshotProviderLeasesPinsAllPagesAndFailsClosedOnStates(
 	assert.Equal(t, readOnlyProviderUUID, snapshot.ProviderUUID())
 	assert.Equal(t, int64(42), snapshot.BlockHeight())
 	assert.Equal(t, 4, snapshot.TotalLeases())
-	assert.Equal(t, []string{
-		readOnlyLeaseOne, readOnlyLeaseTwo, readOnlyLeaseThree, readOnlyLeaseFour,
-	}, snapshot.LeaseUUIDs())
 	assert.Equal(t, []BlockingProviderLease{
 		{LeaseUUID: readOnlyLeaseTwo, State: billingtypes.LEASE_STATE_PENDING},
 		{LeaseUUID: readOnlyLeaseThree, State: billingtypes.LEASE_STATE_ACTIVE},
@@ -131,17 +126,6 @@ func TestReadOnlyClientSnapshotProviderLeasesPinsAllPagesAndFailsClosedOnStates(
 	blockingLeaseUUIDs := snapshot.BlockingLeaseUUIDs()
 	blockingLeaseUUIDs[0] = "mutated"
 	assert.Equal(t, readOnlyLeaseTwo, snapshot.BlockingLeaseUUIDs()[0])
-	leaseUUIDs := snapshot.LeaseUUIDs()
-	leaseUUIDs[0] = "mutated"
-	assert.Equal(t, readOnlyLeaseOne, snapshot.LeaseUUIDs()[0])
-	assert.Equal(t, []backend.LeaseItem{{
-		SKU: "sku-a", Quantity: 2, ServiceName: "web", CustomDomain: "tenant.example",
-	}}, snapshot.LeaseItems()[readOnlyLeaseOne])
-	leaseItems := snapshot.LeaseItems()
-	leaseItems[readOnlyLeaseOne][0].SKU = "mutated"
-	delete(leaseItems, readOnlyLeaseTwo)
-	assert.Equal(t, "sku-a", snapshot.LeaseItems()[readOnlyLeaseOne][0].SKU)
-	assert.Contains(t, snapshot.LeaseItems(), readOnlyLeaseTwo)
 }
 
 func TestReadOnlyClientSnapshotProviderLeasesAcceptsTerminalOnlyEmptyProof(t *testing.T) {
@@ -164,9 +148,6 @@ func TestReadOnlyClientSnapshotProviderLeasesAcceptsTerminalOnlyEmptyProof(t *te
 	assert.True(t, snapshot.Valid())
 	assert.Empty(t, snapshot.BlockingLeases())
 	assert.Equal(t, 3, snapshot.TotalLeases())
-	assert.Equal(t, []string{
-		readOnlyLeaseOne, readOnlyLeaseTwo, readOnlyLeaseThree,
-	}, snapshot.LeaseUUIDs())
 }
 
 func TestReadOnlyClientSnapshotProviderLeasesRejectsInconsistentEvidence(t *testing.T) {
@@ -234,17 +215,6 @@ func TestReadOnlyClientSnapshotProviderLeasesRejectsInconsistentEvidence(t *test
 				Leases: []billingtypes.Lease{{Uuid: "not-a-uuid", ProviderUuid: readOnlyProviderUUID, State: billingtypes.LEASE_STATE_CLOSED}},
 			}}},
 			wantErr: "non-canonical lease UUID",
-		},
-		{
-			name: "quantity cannot fit int",
-			results: []providerLeasePageResult{{height: 42, response: &billingtypes.QueryLeasesByProviderResponse{
-				Leases: []billingtypes.Lease{{
-					Uuid: readOnlyLeaseOne, ProviderUuid: readOnlyProviderUUID,
-					State: billingtypes.LEASE_STATE_CLOSED,
-					Items: []billingtypes.LeaseItem{{SkuUuid: "sku", Quantity: ^uint64(0)}},
-				}},
-			}}},
-			wantErr: "larger than int",
 		},
 	}
 
