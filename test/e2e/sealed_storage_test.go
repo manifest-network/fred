@@ -185,9 +185,10 @@ func TestBackend_SealRefusesABackendThatIsNotEmpty(t *testing.T) {
 	require.Equal(t, roots, after, "the volume must be left in place")
 }
 
-// rewriteJournalRow rewrites one row of a stopped backend's journal, as JSON,
-// and returns the row as it was so the test can put it back.
-func rewriteJournalRow(t *testing.T, path, bucket, key string, edit func(row map[string]any)) (original []byte) {
+// rewriteJournalRow rewrites one row of a stopped backend's journal, as JSON.
+// It returns the row as it was, so the test can put it back, and as written,
+// so the test can tell whether a refused start changed it.
+func rewriteJournalRow(t *testing.T, path, bucket, key string, edit func(row map[string]any)) (original, rewritten []byte) {
 	t.Helper()
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second})
 	require.NoError(t, err, "open %s: is the backend stopped?", path)
@@ -204,11 +205,25 @@ func rewriteJournalRow(t *testing.T, path, bucket, key string, edit func(row map
 		var row map[string]any
 		require.NoError(t, decoder.Decode(&row))
 		edit(row)
-		rewritten, encodeErr := json.Marshal(row)
+		var encodeErr error
+		rewritten, encodeErr = json.Marshal(row)
 		require.NoError(t, encodeErr)
 		return rows.Put([]byte(key), rewritten)
 	}))
-	return original
+	return original, rewritten
+}
+
+// readJournalRow reads one row of a stopped backend's journal.
+func readJournalRow(t *testing.T, path, bucket, key string) (stored []byte) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second, ReadOnly: true})
+	require.NoError(t, err, "open %s: is the backend stopped?", path)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		stored = bytes.Clone(tx.Bucket([]byte(bucket)).Get([]byte(key)))
+		return nil
+	}))
+	return stored
 }
 
 // restoreJournalRow puts a row back as rewriteJournalRow found it.
@@ -259,7 +274,7 @@ func TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted(t *testi
 			running := requireOneRunningContainer(t, b, lease.LeaseUUID)
 			b.Stop()
 			releases := journals(b)[1]
-			original := rewriteJournalRow(t, releases, "releases", lease.LeaseUUID, func(row map[string]any) {
+			original, stripped := rewriteJournalRow(t, releases, "releases", lease.LeaseUUID, func(row map[string]any) {
 				history, ok := row["releases"].([]any)
 				require.True(t, ok, "a release row wraps its history")
 				require.NotEmpty(t, history)
@@ -279,6 +294,8 @@ func TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted(t *testi
 			require.Contains(t, out, "the release predates the first 0.14 start")
 			still := requireOneRunningContainer(t, b, lease.LeaseUUID)
 			require.Equal(t, running.ID, still.ID, "a refused start must leave the workload running")
+			require.Equal(t, stripped, readJournalRow(t, releases, "releases", lease.LeaseUUID),
+				"a refused start must leave the release as it found it")
 
 			restoreJournalRow(t, releases, "releases", lease.LeaseUUID, original)
 			b.Start()
