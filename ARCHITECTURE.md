@@ -1508,9 +1508,9 @@ For Docker, an already-active Release with durable runtime authority is itself
 exact recovery evidence even when containers are exited or entirely absent.
 Current releases carry an immutable nested typed authority that binds the same
 valid operation UUID to tenant, canonical provider UUID, and the current
-operation/lifecycle callback pair. A fully inspected callback-bearing v0.13
-cohort instead gets a separately typed `LegacyRuntimeAuthority`: it freezes the
-exact principal and tokenless callback pair without inventing an operation
+operation/lifecycle callback pair. A lease adopted from v0.13
+instead carries the separately typed `LegacyRuntimeAuthority` the 0.14 line
+recorded: the exact principal and tokenless callback pair, without an operation
 capability the old provider never issued. Both forms also bind the exact
 manifest, emitted items, and resource profiles. Invalid, mixed, or partial
 forms are unrepresentable through their constructors and rejected on decode.

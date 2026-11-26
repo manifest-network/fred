@@ -269,8 +269,7 @@ Reference: [config.example.yaml](config.example.yaml), [docker-backend.example.y
 - `sku_profiles` CPU values and `total_cpu_cores` must be finite and positive;
   YAML `.nan`, `.inf`, and `-.inf` are rejected. Memory totals/profile values
   must be positive, while a profile's `disk_mb` may be zero for stateless work
-- SKU configuration resolves new generations and freezes supported stack-form
-  v0.13 release evidence during the stopped upgrade; it is not a live repricing
+- SKU configuration resolves new generations; it is not a live repricing
   mechanism. Admitted generations persist immutable
   CPU/memory/durable-disk/scratch profiles through operation, release, close,
   and retention authority. For every Docker `disk_mb: 0` row, the positive
@@ -1776,13 +1775,12 @@ matching typed route from that operation URL. “Tokenless” describes absent
 callback identity, not absent authentication: HMAC verification remains
 required throughout.
 
-Before any action may remove the last container in a complete callback-bearing
-v0.13 cohort,
-docker-backend CAS-persists a separately typed `LegacyRuntimeAuthority` on its
-active Release. It freezes the canonical tenant/provider principal, tokenless
-callback pair, exact emitted items, manifest, and resource profiles; it never
-manufactures an operation ID. This makes zero-survivor crash recovery and the
-post-cutover maintenance path safe. The first and every subsequent restart,
+The active Release of a lease adopted from v0.13 carries a separately typed
+`LegacyRuntimeAuthority`, recorded by the 0.14 line. It holds the canonical
+tenant/provider principal, tokenless callback pair, exact emitted items,
+manifest, and resource profiles, and no operation ID. That record is what makes
+zero-survivor crash recovery and maintenance safe for these leases. This line
+never records one from an observed cohort; it refuses a Release that lacks it. The first and every subsequent restart,
 update, or custom-domain replacement stays legacy and tokenless;
 `maintenance_id` is exact replacement journal/cohort/rollback identity, not
 provider callback authority. A callback-base change commits only with the

@@ -2142,7 +2142,7 @@ Fred uses bbolt (an embedded key-value store) for several persistent structures:
 | `placement_store_db_path` | Provider-bound durable confirmed and attempted lease→backend ownership, ordinary and rejected-positive (`untrusted_positive`) quarantine, immutable name→storage UUID history, and the topology-bound inventory baseline | Critical, non-derivable, and not hot-swappable. Normal startup refuses an absent, empty, unprepared, or differently provider-bound file and performs no creation or migration. Restore the exact database only while stopped; fresh initialization is only for a genuinely new provider with zero total chain lease history, never recovery after loss |
 | `<docker>/callbacks.db` | Durable provision/restore operation rows (Pending/Succeeded/Failed) with exact resource profiles (including Docker's pinned diskless scratch), exact restart/update/custom-domain maintenance intents, non-expiring Docker close intents, the pending callback FIFO, immutable maintenance source plans, unresolved physical-volume launches, and exact image-inspection cleanup obligations. A terminal operation row remains after callback delivery until an authorized successor atomically retires it. Causal/close rows and exact operation/maintenance completions do not age out; typed lifecycle observations age out at `callback_max_age`. Pre-identity v0.13 callback rows are a stopped-upgrade condition, never runtime queue entries | Accepted and terminal operation decisions, replacement and destructive-cleanup authority, immutable sizing, and queued callback evidence are not recreated. Loss can hide a substrate mutation, erase the exact outcome required to finish a restore handback, make a partial replacement or close indistinguishable from unexplained cohort loss, or strand a provider-side placement attempt; restore it with the matching release/retention stores and backend substrate |
 | `<docker>/diagnostics.db` | Exact-attempt captures and published lease failure diagnostics (last_error, bounded logs) | Existing captures are lost after stopped recreation; new failures can record again. Capture write failures retain failed containers and pending failure publication for retry. Open/create requires an unsymlinked, single-link regular file with exact mode `0600`, but diagnostics is not storage-identity authority and is not continuously re-attested |
-| `<docker>/releases.db` | Per-lease immutable deployment topology/resource authority, tenant/provider identity, and current callback route: either typed operation lineage plus matching runtime authority, or a separately typed tokenless `LegacyRuntimeAuthority` frozen from a complete callback-bearing v0.13 cohort. An active callbackless pre-label cohort was rejected by the 0.14 line's stopped adoption because provider callback authority cannot be minted safely; only historical cleanup/close evidence remains readable, without zero-survivor or maintenance authority. The store also holds the exact generation checked when a present history is retired by close finalization. Encoded history is capped at 32 MiB per lease | Active release authority is not reconstructed from container survivors. Loss can erase the only identity and callback authority for a committed generation with zero survivors. A pending close remains resumable because its non-expiring callback-store row contains the complete cleanup snapshot and blocks newer operations; an absent release key is already retired. Treat the database and every backup as sensitive causal evidence |
+| `<docker>/releases.db` | Per-lease immutable deployment topology/resource authority, tenant/provider identity, and current callback route: either typed operation lineage plus matching runtime authority, or the separately typed tokenless `LegacyRuntimeAuthority` of a lease adopted from v0.13. An active callbackless pre-label cohort was rejected by the 0.14 line's stopped adoption because provider callback authority cannot be minted safely; only historical cleanup/close evidence remains readable, without zero-survivor or maintenance authority. The store also holds the exact generation checked when a present history is retired by close finalization. Encoded history is capped at 32 MiB per lease | Active release authority is not reconstructed from container survivors. Loss can erase the only identity and callback authority for a committed generation with zero survivors. A pending close remains resumable because its non-expiring callback-store row contains the complete cleanup snapshot and blocks newer operations; an absent release key is already retired. Treat the database and every backup as sensitive causal evidence |
 | `<docker>/retention.db` | Retained-volume ownership, restore CAS generation, destination operation ID/callback pair/manifest/items, and immutable resource profiles | Losing or mismatching this file can orphan retained data or erase restore/finalizer lifecycle authority. Restore it with the matching callbacks/releases databases and substrate |
 
 The database classes deliberately have different filesystem contracts. Backend
@@ -2235,12 +2235,21 @@ queue, or retry from an assumed rollback.
 
 ### An unsized legacy predecessor blocks Docker recovery
 
-An `unsized pending provision predecessor` error, or a refusal stating that a
-predecessor has no durable runtime authority, means recovery cannot attribute
-the old generation's complete resource and cleanup authority. This is not
-ordinary young-operation or cleanup-retry uncertainty. Startup fails on that
-backend; a running backend aborts that recovery pass before the
-operation-recovery phase. Other configured backends remain independent.
+An `unsized pending provision predecessor` error means recovery cannot
+attribute the old generation's complete resource and cleanup authority: the
+predecessor of a pending provision records no items. This is not ordinary
+young-operation or cleanup-retry uncertainty. Startup fails on that backend; a
+running backend aborts that recovery pass before the operation-recovery phase.
+Other configured backends remain independent.
+
+A warning `operation recovery retained unresolved lease authority` whose error
+says a predecessor `has no durable runtime authority`, or that container
+substrate `exists without exact predecessor authority`, is narrower. The
+predecessor is sized, so state recovery succeeds. Operation recovery then
+defers that one lease before any teardown, keeps its intent and reservation,
+counts it in `fred_docker_backend_operation_recovery_deferred_total`, and
+continues with the other leases. The lease stays deferred on every pass until
+it is repaired; startup and the rest of the pass are not stopped.
 
 The first 0.14 start recorded the items, sizing and runtime authority of every
 lease adopted from v0.13, and this line records none of them from an observed
