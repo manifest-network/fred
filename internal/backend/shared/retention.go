@@ -134,8 +134,8 @@ type RetentionEntry struct {
 	ProviderUUID string              `json:"provider_uuid"`
 	Items        []backend.LeaseItem `json:"items"`
 	// ResourceProfiles is the immutable sizing authority captured when the
-	// footprint became retained. It is optional for backward compatibility with
-	// records written before exact profile snapshots existed.
+	// footprint became retained. Every close records it. A row retained under
+	// v0.13 may lack it; Docker startup refuses such a row.
 	ResourceProfiles []SKUResourceSnapshot `json:"resource_profiles,omitempty"`
 	// DestinationItems and DestinationResourceProfiles are the immutable
 	// ownership authority for a restore destination. RestoreSettlement writes
