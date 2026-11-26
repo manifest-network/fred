@@ -442,8 +442,9 @@ Reconciler interplay (level-triggered backstop):
   case aliases, duplicate keys, unknown fields, future schemas, and trailing
   values recursively. Runtime Open and health verification require that exact
   structural boundary, so a future or malformed authority row cannot be
-  silently ignored after a downgrade. Only the stopped v0.13 preparation path
-  accepts the historical raw/backend-object placement grammar. A structurally
+  silently ignored after a downgrade. Nothing on this line accepts the
+  historical v0.13 raw/backend-object placement grammar: the final 0.14 release
+  converted it. A structurally
   current placement whose cross-field authority is contradictory remains
   unusable evidence for that lease and requires exact recovery or operator
   repair.
@@ -1506,9 +1507,9 @@ For Docker, an already-active Release with durable runtime authority is itself
 exact recovery evidence even when containers are exited or entirely absent.
 Current releases carry an immutable nested typed authority that binds the same
 valid operation UUID to tenant, canonical provider UUID, and the current
-operation/lifecycle callback pair. A fully inspected callback-bearing v0.13
-cohort instead gets a separately typed `LegacyRuntimeAuthority`: it freezes the
-exact principal and tokenless callback pair without inventing an operation
+operation/lifecycle callback pair. A lease adopted from v0.13
+instead carries the separately typed `LegacyRuntimeAuthority` the 0.14 line
+recorded: the exact principal and tokenless callback pair, without an operation
 capability the old provider never issued. Both forms also bind the exact
 manifest, emitted items, and resource profiles. Invalid, mixed, or partial
 forms are unrepresentable through their constructors and rejected on decode.
@@ -1682,8 +1683,7 @@ directory capabilities for both marker parents and every authoritative journal
 parent. They bind the physical device/inode and make all later inspection,
 creation, and publication descriptor-relative; a rename, unmount, or same-path
 directory recreation cannot redirect the transaction. A pending anchor first
-records both the chosen storage UUID and whether the input is a wholly fresh set
-or a complete existing v0.13 set. Only after that anchor is durable does the
+records the chosen storage UUID and that the seal is a fresh one. Only after that anchor is durable does the
 marker coordinator mint the opaque `PendingStorage` capability accepted by
 authoritative-store preparation; a parsed or caller-supplied UUID cannot bind a
 store. Every capability copy shares one revocation state. The coordinator
@@ -1695,15 +1695,16 @@ cross-store evidence, publishes the primary marker, and finally commits the
 anchor. It returns `VerifiedStorage` only after final committed-marker and
 read-only store verification. This ordering is crash-resumable and idempotent:
 a rerun must use the
-persisted profile and exact identity, while a committed pair is
-verification-only and never repairs a missing or unbound store. Fresh input
-means every required store is absent; existing input means every required store
-is present. A mixed set is not guessed or completed. Existing adoption
-additionally requires a stopped backend, a drained legacy callback outbox,
-valid release/retention rows, and substrate evidence that agrees with the active
-releases.
+persisted exact identity, while a committed pair is
+verification-only and never repairs a missing or unbound store. Initialization
+seals only an empty backend: every required store is absent, and no managed
+container, managed volume, retention row or active release exists. A journal
+that exists without a storage identity is refused, as is a pending anchor
+written by a v0.13 adoption: only the final 0.14 release adopts a v0.13
+lineage. A journal that is already identity-bound while its marker pair is
+missing is refused too; the pair must be restored instead.
 
-That substrate evidence is concrete rather than name-based. Every managed name
+Managed-volume evidence is concrete rather than name-based. Every managed name
 first becomes one canonical typed component and must then be a real directory on the configured XFS root with a regular no-follow
 nonzero project-ID marker.
 Container evidence separately proves the label-derived volume and exact
@@ -1844,27 +1845,28 @@ Tracks which backend serves each lease (bbolt + in-memory cache):
 - The database is authority for exactly one canonical provider UUID. Production
   startup supplies the configured UUID to a strict open and rejects a database
   prepared for another provider before using any placement fact. That open
-  never creates the file, initializes buckets, or migrates schema: v0.13
-  adoption and genuinely fresh initialization are explicit offline workflows.
-  Legacy preparation installs provider authority only after a read-only
-  three-source proof: exact stopped-database ownership, complete identity-bearing
-  backend inventory (including each provision's reported provider), and exact
-  membership in a signer-free all-state provider query pinned to one block
-  height. Retention-only survivors must be present in that chain snapshot too.
-  Because membership mints durable provider authority, the offline tool refuses
+  never creates the file, initializes buckets, or migrates schema. Genuinely
+  fresh initialization is an explicit offline workflow, and a v0.13 database
+  is converted by the final 0.14 release, not by this line.
+  `placement-preflight -initialize-fresh` installs provider authority only
+  after a read-only proof: every configured backend returns complete, empty
+  provision and retention inventories under a unique storage identity, and a
+  signer-free all-state provider query pinned to one block height shows no
+  lease history at all, terminal history included.
+  Because that proof mints durable provider authority, the offline tool refuses
   chain evidence that did not come over certificate-verified gRPC TLS. The
   `grpc_tls_enabled` key defaults to false, so a provider config must enable it.
   Only `-confirm-insecure-chain`, an exact operator attestation for an
   intentionally local development chain, can consume plaintext or skip-verify
   evidence, even when a shared template sets `production_mode: true`; verified
   TLS rejects that stale override. Before collecting any remote proof, mutating
-  preflight/repair modes bind the mandatory backup target's physical parent
+  `placement-repair` modes bind the mandatory backup target's physical parent
   device/inode. Backup I/O remains descriptor-relative, publication is an
   atomic `renameat2(RENAME_NOREPLACE)`, and the exact published inode plus parent,
   SHA-256 bytes, length, `0600` mode, and single-link status are re-attested
   before and after mutation and before a success verdict. A
   pre-commit failure after publication is `BACKUP PUBLISHED`; a later failure
-  after a definite mutation is `PREPARED:` or `COMMITTED:`; a failure after
+  after a definite repair mutation is `COMMITTED:`; a failure after
   `-initialize-fresh` has published the new database is `INITIALIZED:`; an
   indeterminate bbolt commit is `OUTCOME UNKNOWN`
 - Retains a descriptor for the exact regular-file inode opened at

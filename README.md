@@ -1412,9 +1412,10 @@ Every authoritative database must be an unsymlinked, single-link regular file
 with exact mode `0600`; initialization and normal startup reject an insecure
 restore, and runtime re-attestation withdraws the whole backend lineage on
 path/inode, link-count, or permission drift.
-Initialization accepts only an all-absent fresh set or a complete, valid,
-stopped and drained v0.13 set, records that choice in a crash-resumable pending
-anchor, and never completes a mixed set. Before evidence inspection it binds the
+Initialization seals only an empty backend: no authoritative journal, managed
+container or managed volume. It records the new identity in a crash-resumable
+pending anchor and refuses a journal that exists without a storage identity; a
+v0.13 lineage is adopted by the final 0.14 release. Before evidence inspection it binds the
 physical parent of both markers and every authoritative journal; subsequent I/O
 is descriptor-relative, so a parent rename, unmount, or same-path recreation
 cannot redirect initialization. Normal startup is verification-only: it will

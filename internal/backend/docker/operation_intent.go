@@ -1643,9 +1643,6 @@ func (b *Backend) validatePredecessorProvisionSubset(
 		if !release.OperationID.IsZero() {
 			return nil, errors.New("predecessor active release has partial runtime authority")
 		}
-		if release.LegacyRuntimeAuthority == nil {
-			return nil, errors.New("predecessor active release has no durable runtime authority")
-		}
 	} else {
 		if !release.OperationID.Valid() || release.OperationID != release.RuntimeAuthority.OperationID() {
 			return nil, errors.New("predecessor active release has inconsistent operation identity")
