@@ -1794,7 +1794,7 @@ replacement Release; failure retains the previous route. The legacy lifecycle
 class rotates to typed only when a later genuine provision or restore supplies
 an operation-scoped callback capability that providerd also persists. An
 active callbackless pre-label cohort cannot be assigned provider callback
-authority safely and is rejected by the mandatory stopped adoption preflight;
+authority safely and was rejected by the 0.14 line's stopped adoption;
 callbackless historical cleanup/close evidence remains readable but never
 authorizes zero-survivor recovery or maintenance.
 
@@ -1836,8 +1836,7 @@ fail-closed residual authority: it cannot publish runtime success or failure,
 be reissued for maintenance, or mutate placement or chain state, and passive
 inventory cannot rotate it. Do not delete it merely because inventory is absent;
 it preserves authorization for a delayed exact deprovision observation.
-Tokenless decoding is confined to stopped adoption and authenticated callback
-ingress; no current provision, restore, maintenance, or reconciliation workflow
+Tokenless decoding is confined to authenticated callback ingress; no current provision, restore, maintenance, or reconciliation workflow
 can mint an empty operation or lifecycle identity.
 Complete backend inventory and
 level-triggered reconciliation recover only from positive backend evidence;
@@ -2176,15 +2175,11 @@ volumes, containers, and storage identity.
 Schema compatibility is store-specific; the bbolt files carry no single global
 schema version or automatic downgrade guard. Current release histories and
 retention entries each carry a strict `schema_version: 1` envelope, and their
-stores reject unknown top-level buckets. The stopped Existing-profile adoption
-transaction is the only path that accepts their exact versionless v0.13 wire
-shapes; it validates every row before atomically rewriting the complete bucket
-and binding it to the storage lineage. Ordinary startup and committed-marker
-verification reject versionless, unknown, case-aliased, duplicate, future, and
-trailing data rather than silently discarding authority. A pending-marker replay
-can also finish upgrading the exact versionless identity-bound shape written by
-an interrupted earlier development build, but that compatibility reader is not
-available to a live store. Placement and lifecycle-capability rows likewise
+stores reject unknown top-level buckets. Nothing on this line accepts their
+versionless v0.13 wire shapes; the 0.14 line's stopped adoption rewrote them.
+Initialization, ordinary startup and committed-marker verification reject
+versionless, unknown, case-aliased, duplicate, future, and trailing data rather
+than silently discarding authority. Placement and lifecycle-capability rows likewise
 carry explicit current schemas. Runtime Open and health checks reject raw or
 versionless placement rows, case aliases, duplicate or unknown fields, future
 schemas, trailing values, and malformed lifecycle capabilities. Nothing on

@@ -1312,19 +1312,12 @@ tenant/provider, item shape, manifest topology, resource profiles, and source
 generation and CAS-deletes that row. Failure returns before teardown; success
 leaves the close intent as the sole durable cleanup and identity owner.
 
-Historical v0.13 release histories can contain more than one Active row.
+Historical v0.13 release histories could contain more than one Active row:
 `RecordMigration` and every successful provision appended an active row without
-superseding the older one. That includes the re-provision of a lease whose
-containers died at runtime or across a reboot. v0.13 appended each row only
-after replacing the previous containers, so its LatestActive is the running
-generation. Only the stopped adoption path accepts these histories, and only
-from the bare v0.13 array: the `v013ReleaseHistory` type is minted solely by
-that decoder, and the v0.13 recognizers accept nothing else. One parser,
-`adoptV013ReleaseHistory`, produces the strict history that readiness
-inspection, the capacity proof and the binding transaction all consume. Binding
-rewrites the older active rows, and equivalent deploying retries after the
-latest active row, to `superseded` before a current store opens the history.
-The runtime decoder rejects any history with more than one active row. This
+superseding the older one. The 0.14 line's stopped adoption normalized those
+histories when it bound the store. This line reads only the result: nothing
+here accepts the bare v0.13 array, and the runtime decoder rejects any history
+with more than one active row. This
 release does not write a
 migration marker or attempt a live single-container-to-Compose conversion.
 Only an already stack-form v0.13 cohort can be adopted: strict inventory and
@@ -1460,15 +1453,11 @@ level-triggered recovery pass; no restart has to infer whether teardown happened
 
 Release histories and retention entries have the same explicit current-row
 boundary: each is wrapped in a `schema_version: 1` envelope and rejects unknown,
-case-aliased, duplicate, future, or trailing data recursively. Their exact
-versionless v0.13 wire shapes are accepted only by stopped-process code: the
-read-only upgrade inspectors decode them, and the
-`InitializationProfileExisting` adoption transaction validates every row
-before rewriting any row or publishing the storage binding. A versionless
-identity-bound shape from an interrupted upgrade of an earlier development build
-is handled only while replaying that same pending marker transaction. Ordinary
-Open, Check, Verify, and runtime reads require the versioned form; they never
-reinterpret a versionless authority row as legacy data. Unknown top-level release
+case-aliased, duplicate, future, or trailing data recursively. Nothing on this line
+accepts their versionless v0.13 wire shapes: the 0.14 line's stopped adoption
+rewrote them. Initialization, Open, Check, Verify, and runtime reads all require
+the versioned form; they never reinterpret a versionless authority row as
+legacy data. Unknown top-level release
 or retention buckets likewise refuse startup.
 
 Docker recovery deliberately uses lease-isolated evidence rather than one
@@ -1553,7 +1542,7 @@ cannot expose phantom capacity or over-admit after a restart. This fail-closed
 leak is intentional: operator-visible over-counting is safer than reconstructing
 absence into permission to reuse tenant capacity.
 An active callbackless pre-label cohort cannot be assigned provider callback
-authority safely and is rejected by the mandatory stopped adoption preflight.
+authority safely and was rejected by the 0.14 line's stopped adoption.
 Callbackless historical cleanup/close evidence remains readable, but never
 authorizes zero-survivor recovery or maintenance.
 
@@ -1708,7 +1697,7 @@ non-regular file, or mode other than exact `0600`, but diagnostics is not bound
 to the storage UUID and is not re-attested at every transaction.
 
 Initialization is the only code path allowed to create or bind authoritative
-stores. Before reading fresh/existing evidence, the initializer retains typed
+stores. Before reading any evidence, the initializer retains typed
 directory capabilities for both marker parents and every authoritative journal
 parent. They bind the physical device/inode and make all later inspection,
 creation, and publication descriptor-relative; a rename, unmount, or same-path
