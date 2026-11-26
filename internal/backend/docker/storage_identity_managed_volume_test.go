@@ -129,3 +129,46 @@ func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testi
 		})
 	}
 }
+
+// A mount source that reaches another lease's volume through a symlinked
+// component is not a subtree of the exact managed volume.
+func TestRequireManagedVolumeMountSourceRejectsCrossVolumeSymlink(t *testing.T) {
+	const (
+		leaseA = "11111111-1111-4111-8111-111111111111"
+		leaseB = "22222222-2222-4222-8222-222222222222"
+	)
+	root := t.TempDir()
+	volumeA := canonicalVolumeName(leaseA, "app", 0)
+	volumeB := canonicalVolumeName(leaseB, "app", 0)
+	require.NoError(t, os.Mkdir(filepath.Join(root, volumeA), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, volumeB, "data"), 0o700))
+	require.NoError(t, os.Symlink(
+		filepath.Join("..", volumeB, "data"),
+		filepath.Join(root, volumeA, "data"),
+	))
+	nameA, err := parseManagedVolumeName(volumeA)
+	require.NoError(t, err)
+	nameB, err := parseManagedVolumeName(volumeB)
+	require.NoError(t, err)
+
+	err = requireManagedVolumeMountSource(root, filepath.Join(root, volumeA, "data"), nameA, "/data")
+	require.ErrorContains(t, err, "is not a real directory")
+	require.NoError(t,
+		requireManagedVolumeMountSource(root, filepath.Join(root, volumeB, "data"), nameB, "/data"),
+		"the real directory of the other volume is its own valid source")
+}
+
+// A mount source inside the right volume but under another subtree than the
+// one its container target derives is refused.
+func TestRequireManagedVolumeMountSourceRejectsWrongSourceSubtree(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	root := t.TempDir()
+	volume := canonicalVolumeName(leaseUUID, "app", 0)
+	wrongSource := filepath.Join(root, volume, "other")
+	require.NoError(t, os.MkdirAll(wrongSource, 0o700))
+	name, err := parseManagedVolumeName(volume)
+	require.NoError(t, err)
+
+	err = requireManagedVolumeMountSource(root, wrongSource, name, "/data")
+	require.ErrorContains(t, err, "does not match target-derived subtree")
+}

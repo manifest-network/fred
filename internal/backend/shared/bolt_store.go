@@ -541,7 +541,6 @@ func initializeIdentityBoundBoltStoreBound(
 	label string,
 	kind authoritativeStoreKind,
 	storageID backendidentity.ID,
-	allowCreate bool,
 	validate func(*bolt.Tx) error,
 ) error {
 	file, err := boundAuthoritativeStoreFile(path)
@@ -549,7 +548,7 @@ func initializeIdentityBoundBoltStoreBound(
 		return fmt.Errorf("initialize %s db: %w", label, err)
 	}
 	return initializeIdentityBoundBoltStoreFile(
-		file, bucketName, label, kind, storageID, allowCreate, validate,
+		file, bucketName, label, kind, storageID, validate,
 	)
 }
 
@@ -559,7 +558,6 @@ func initializeIdentityBoundBoltStoreFile(
 	label string,
 	kind authoritativeStoreKind,
 	storageID backendidentity.ID,
-	allowCreate bool,
 	validate func(*bolt.Tx) error,
 ) error {
 	if !storageID.Valid() {
@@ -573,9 +571,6 @@ func initializeIdentityBoundBoltStoreFile(
 			return fmt.Errorf("%s database: %w", label, err)
 		}
 	case errors.Is(err, os.ErrNotExist):
-		if !allowCreate {
-			return fmt.Errorf("%s database is missing during v0.13 adoption: %w", label, ErrStoreIdentityUnbound)
-		}
 		created, createErr := file.OpenFile(os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 		if createErr != nil {
 			return fmt.Errorf("create %s database: %w", label, createErr)
@@ -593,9 +588,6 @@ func initializeIdentityBoundBoltStoreFile(
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
 		if tx.Bucket(bucketName) == nil {
-			if !allowCreate {
-				return fmt.Errorf("v0.13 %s bucket %q is missing", label, bucketName)
-			}
 			if _, createErr := tx.CreateBucket(bucketName); createErr != nil {
 				return fmt.Errorf("create %s bucket: %w", label, createErr)
 			}
