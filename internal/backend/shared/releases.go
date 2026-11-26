@@ -75,10 +75,9 @@ type Release struct {
 	// disk for releases written by older binaries.
 	Items []backend.LeaseItem `json:"items,omitempty"`
 	// ResourceProfiles is the immutable resource authority paired with Items.
-	// New writers always persist it before reporting success. It remains
-	// optional only for release rows written by v0.13 and older binaries; Docker
-	// recovery snapshots the then-current configuration when migrating those
-	// rows so subsequent restarts and closes cannot reprice a live lease.
+	// New writers always persist it before reporting success, so later
+	// restarts and closes cannot reprice a live lease. A row written by v0.13
+	// may lack it; Docker recovery refuses an active one.
 	ResourceProfiles []SKUResourceSnapshot `json:"resource_profiles,omitempty"`
 	// RuntimeAuthority is the current non-expiring identity needed to reconstruct a
 	// terminal lease projection when an exact committed generation has no

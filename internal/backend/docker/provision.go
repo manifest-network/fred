@@ -386,12 +386,6 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 				"failed provision predecessor changed during read-only validation",
 			))
 		}
-		if !predecessorUnchanged() {
-			return b.refuseOperationIntent(intent, errors.New(
-				"failed provision predecessor changed before teardown",
-			))
-		}
-
 	}
 	// One atomic, claim-bound reservation covers both fresh and replacement
 	// work. Its conservative envelope retains predecessor capacity until exact
