@@ -583,7 +583,8 @@ Startup quota backfill uses each generation's immutable effective authority:
 durable `disk_mb` for stateful volumes and pinned scratch for a physically
 present diskless writable-path volume. Mutable config is consulted only for a
 live provision that no durable record sizes, and nothing is persisted from it;
-an active release that records no profiles stops recovery before this point. Scratch remains excluded from retention caps; an exact scratch
+an active release or a retention row that records no profiles stops startup
+before this point. Scratch remains excluded from retention caps; an exact scratch
 name conservatively present in a retention row stays physically counted and
 re-capped only until it is destroyed.
 
