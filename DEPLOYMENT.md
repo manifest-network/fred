@@ -1752,16 +1752,15 @@ topology using backend stats, and records its exact write-ahead attempt before
 dispatch. Inventory silence never clears an attempt or conflict in either path.
 
 The callback protocol can preserve state inherited from v0.13.0, but this does
-not make a mixed-version rollout supported. During the stopped cutover, upgrade
-every backend before providerd while all old processes remain fenced. Each new
-backend requires a drained legacy callback outbox and sealed storage identity,
-then recovers the operationless `callback_url` already embedded in a v0.13
-workload, derives its tokenless lifecycle route, and reports its generation
-class in internal provision inventory without exposing the URL. Mandatory
-offline preparation migrates the matching confirmed placement as an explicitly
-legacy owner before the new provider starts. Stack-form workloads keep reporting
-lifecycle observations without replacement. An absent or rebuilt placement
-database is never a recovery path for those workloads.
+not make a mixed-version rollout supported. The stopped cutover to 0.14 sealed
+each backend's storage identity over a drained legacy callback outbox and
+migrated each confirmed placement as an explicitly legacy owner. A backend on
+this line still serves a workload adopted that way: it reads the operationless
+`callback_url` embedded in the workload, derives its tokenless lifecycle route,
+and reports its generation class in internal provision inventory without
+exposing the URL. Stack-form workloads keep reporting lifecycle observations
+without replacement. An absent or rebuilt placement database is never a
+recovery path for those workloads.
 
 Compatibility preserves existing containers, reads, legacy lifecycle
 observations, and identity-preserving maintenance; it does not admit new

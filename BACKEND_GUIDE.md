@@ -1232,11 +1232,10 @@ this recovery compatibility never authorizes a new tokenless provision or
 restore. External backends should use the shared boundary parser or consume
 the explicit pair, not reconstruct URLs independently.
 
-During the stopped cutover, install and start the upgraded backends before the
-upgraded provider, but never run an old provider against them: its tokenless new
-provision/restore requests are rejected. A new backend can recover the
-operationless route already embedded by v0.13.0 and continue using
-it after Fred migrates that owner as legacy. Starting a new provider against an
+Never run a v0.13 provider against a current backend: its tokenless new
+provision/restore requests are rejected. A current backend keeps using the
+operationless route embedded by v0.13.0 in a workload whose owner the 0.14
+cutover migrated as legacy. Starting a new provider against an
 old backend is not lifecycle-compatible: a v0.13.0 backend ignores
 `lifecycle_callback_url` and later reuses the expired operation-scoped URL. A
 new providerd refuses those callbacks with `400` (or `429` once the
@@ -1280,7 +1279,7 @@ its `admitted_at` matches.
   when the backend effect occurred. It is HMAC-covered and must be preserved on
   replay rather than replaced with the current process identity. An upgraded
   Fred rejects a missing/mismatched value before settlement. The additive wire
-  field does not make a mixed-version rollout safe; use the stopped cutover.
+  field does not make a mixed-version rollout safe.
 - `operation_id` in the JSON body, if supplied, is untrusted metadata and is overwritten at Fred's ingress. Only the HMAC-authenticated URL query grants exact-operation authority.
 - `lifecycle_id` in the JSON body is likewise overwritten. Only the authenticated URL query and Fred's current durable per-lease capability authorize a lifecycle observation.
 
@@ -1490,7 +1489,7 @@ maintenance completions likewise may be the only causal result for a replacement
 already committed on the substrate. Both are permanent FIFO barriers until
 delivered or explicitly repaired. Typed lifecycle observations may expire at
 `callback_max_age`. Pre-identity v0.13 rows never enter the current runtime
-queue: the stopped upgrade inspection requires that legacy bucket to be empty.
+queue: a current store opens only while that legacy bucket is empty.
 
 The outbox alone is not enough for an asynchronous backend: persist an immutable
 per-lease **operation intent** in the same database before the first external
