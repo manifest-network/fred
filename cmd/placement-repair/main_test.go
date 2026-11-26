@@ -457,9 +457,15 @@ func TestRun_ClassifyUnsafeAuthorityStillEmitsJSONAndFails(t *testing.T) {
 
 func TestRun_ClassifyPreparedCurrentAuthoritiesIsDeterministicAndByteExact(t *testing.T) {
 	tests := []struct {
-		name   string
-		create func(*testing.T) string
+		name        string
+		create      func(*testing.T) string
+		wantVerdict []string
 	}{
+		{
+			name:        "authority holding a lease adopted from v0.13",
+			create:      createAdoptedLeaseRepairCommandDatabase,
+			wantVerdict: []string{"legacy_active"},
+		},
 		{
 			name: "freshly initialized authority",
 			create: func(t *testing.T) string {
@@ -497,6 +503,11 @@ func TestRun_ClassifyPreparedCurrentAuthoritiesIsDeterministicAndByteExact(t *te
 			require.NoError(t, json.Unmarshal(first.Bytes(), &report))
 			assert.Equal(t, placement.AuthorityPreparedCurrent, report.Classification)
 			assert.True(t, report.SafeForCutover())
+			var verdicts []string
+			for _, row := range report.Rows {
+				verdicts = append(verdicts, row.LifecycleVerdict)
+			}
+			assert.Equal(t, test.wantVerdict, verdicts)
 
 			after, readErr := os.ReadFile(dbPath)
 			require.NoError(t, readErr)
@@ -1620,6 +1631,52 @@ func createRepairCommandDatabase(t *testing.T, confirmed bool) string {
 	}
 
 	seedRepairAttempt(t, store, execution)
+	require.NoError(t, store.Close())
+	return dbPath
+}
+
+// createAdoptedLeaseRepairCommandDatabase initializes a placement authority
+// and projects one inventory sweep in which the backend reports the lease with
+// the tokenless lifecycle generation. That leaves the lease confirmed and its
+// lifecycle capability in the state of a lease adopted from v0.13.
+func createAdoptedLeaseRepairCommandDatabase(t *testing.T) string {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	store := initializeRepairPlacementStore(t, dbPath, []string{repairCommandBackend})
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	inventoryClient := &repairInventoryBackend{
+		Backend:   &repairAttemptBackend{callErr: context.DeadlineExceeded},
+		storageID: repairBackendStorageID(t, repairCommandBackend),
+	}
+	execution, err := coordinator.BindBackendRuntime(
+		repairAttemptRuntime{backend: inventoryClient}, repairAttemptLeaseReader{},
+		placement.NoBillingOnlySKUs(),
+	)
+	require.NoError(t, err)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+	repairReconciliationInventories.Store(reconciliation, map[string]*repairInventoryBackend{
+		repairCommandBackend: inventoryClient,
+	})
+	t.Cleanup(func() { repairReconciliationInventories.Delete(reconciliation) })
+
+	projectRepairInventoryWithRows(
+		t, reconciliation, []string{repairCommandBackend},
+		placement.ReconciliationProjection{
+			Placements: map[string]string{repairCommandLease: repairCommandBackend},
+		},
+		map[string][]backend.ProvisionInfo{
+			repairCommandBackend: {{
+				LeaseUUID: repairCommandLease, BackendName: repairCommandBackend,
+				ProviderUUID: repairCommandProviderUUID, Tenant: "tenant-a",
+				LifecycleGeneration: &backend.LifecycleGenerationObservation{
+					Kind: backend.LifecycleGenerationLegacy,
+				},
+			}},
+		},
+	)
+	require.Equal(t, placement.StateConfirmed, store.Lookup(repairCommandLease).State())
 	require.NoError(t, store.Close())
 	return dbPath
 }

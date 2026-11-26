@@ -1326,3 +1326,52 @@ func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *tes
 		assert.Empty(t, got[1].Message)
 	})
 }
+
+// A strict history owns a deep copy of its rows: neither the caller's slice
+// nor a reader's copy can change a validated history.
+func TestStrictReleaseHistoryOwnsItsRows(t *testing.T) {
+	// The expectation is serialized before any mutation, so it shares no
+	// memory with the rows and stays independent of cloneReleaseHistory.
+	snapshot := func(releases []Release) string {
+		encoded, err := json.Marshal(releases)
+		require.NoError(t, err)
+		return string(encoded)
+	}
+	input := []Release{{
+		Version: 1, Manifest: []byte(`{"services":{"web":{"image":"nginx:1.27"}}}`),
+		Image: "stack", Status: "active",
+	}}
+	history, err := newStrictReleaseHistory(input)
+	require.NoError(t, err)
+	want := snapshot(history.strictReleases())
+
+	input[0].Status = "failed"
+	input[0].Manifest[0] = 'X'
+	read := history.strictReleases()
+	read[0].Status = "deploying"
+	read[0].Manifest[0] = 'Y'
+	assert.Equal(t, want, snapshot(history.strictReleases()))
+}
+
+// A corrupt stored history is reported with the lease and the release it
+// belongs to, so an operator can find the row.
+func TestReleaseInspectionIdentifiesLeaseForCorruptHistory(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	path := filepath.Join(t.TempDir(), "releases.db")
+	writeRawReleaseHistory(t, path, leaseUUID, []Release{{
+		Version: 1, Manifest: []byte(`{"services":{"web":null}}`), Image: "stack",
+		Status: "active", CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
+	}})
+	// The inspector reads the rows of an identity-bound journal only.
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		_, createErr := tx.CreateBucket(storeIdentityBucketName)
+		return createErr
+	}))
+	require.NoError(t, db.Close())
+
+	_, err = InspectReleaseStoreReadOnly(path)
+	require.ErrorContains(t, err, leaseUUID)
+	require.ErrorContains(t, err, "release 1")
+}

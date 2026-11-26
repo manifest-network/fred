@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,46 @@ func TestStorageInitializationRefusesJournalsWithoutIdentity(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, resuming)
 	})
+}
+
+// An interrupted seal leaves a pending marker that records how it was started.
+// A fresh one is resumed. One started as a v0.13 adoption is refused: only the
+// final 0.14 release can finish it.
+func TestStorageInitializationResumesOnlyAFreshPendingSeal(t *testing.T) {
+	for _, test := range []struct {
+		profile backendidentity.InitializationProfile
+		wantErr string
+	}{
+		{profile: backendidentity.InitializationProfileFresh},
+		{
+			profile: backendidentity.InitializationProfileExisting,
+			wantErr: "only the final 0.14 release can finish adopting a v0.13 lineage",
+		},
+	} {
+		t.Run(string(test.profile), func(t *testing.T) {
+			cfg := storageIdentityEvidenceTestConfig(t)
+			paths := bindStorageIdentityEvidenceTestPaths(t, cfg)
+			interrupted := errors.New("injected prepare interruption")
+			_, err := paths.markers.InitializeWithStores(cfg.Name, "daemon-system-a", backendidentity.MarkerPairStoreHooks{
+				Profile: test.profile,
+				Prepare: func(backendidentity.PendingStorage, backendidentity.InitializationProfile) error {
+					return interrupted
+				},
+				Check:  func(backendidentity.PendingStorage) error { return nil },
+				Verify: func(backendidentity.VerifiedStorage) error { return nil },
+			})
+			require.ErrorIs(t, err, interrupted)
+
+			resuming, err := requireFreshStorageInitialization(cfg, paths, "daemon-system-a")
+			if test.wantErr != "" {
+				require.ErrorContains(t, err, test.wantErr)
+				assert.False(t, resuming)
+				return
+			}
+			require.NoError(t, err)
+			assert.True(t, resuming)
+		})
+	}
 }
 
 func TestFreshStorageIdentityEvidenceRequiresDrainedCallbacksBeforeInventory(t *testing.T) {
