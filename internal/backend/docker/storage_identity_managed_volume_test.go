@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend"
 )
 
 func storageIdentityEmptyBackendDockerMock() *mockDockerClient {
@@ -171,4 +174,38 @@ func TestRequireManagedVolumeMountSourceRejectsWrongSourceSubtree(t *testing.T) 
 
 	err = requireManagedVolumeMountSource(root, wrongSource, name, "/data")
 	require.ErrorContains(t, err, "does not match target-derived subtree")
+}
+
+// Volume accounting recognizes a lease's volumes by name. A single unnamed
+// service owns both the service-aware names and the v0.13 names that end
+// directly in the instance index, up to its quantity and no further.
+func TestManagedVolumeEvidenceAuthorityPreservesExactV013Forms(t *testing.T) {
+	const leaseUUID = "019d1234-5678-7abc-8def-0123456789ab"
+	authority, err := managedVolumeEvidenceAuthorityForLease(
+		leaseUUID,
+		[]backend.LeaseItem{{SKU: "stateful", Quantity: 2}},
+	)
+	require.NoError(t, err)
+	contains := func(value string) bool {
+		name, parseErr := parseManagedVolumeName(value)
+		require.NoError(t, parseErr, value)
+		return authority.containsIdentity(managedVolumeEvidenceIdentityFromName(name))
+	}
+
+	for _, value := range []string{
+		canonicalVolumeName(leaseUUID, "app", 0),
+		retainedName(canonicalVolumeName(leaseUUID, "app", 1)),
+		fmt.Sprintf("fred-%s-0", leaseUUID),
+		fmt.Sprintf("fred-retained-%s-1", leaseUUID),
+	} {
+		assert.True(t, contains(value), value)
+	}
+	for _, value := range []string{
+		canonicalVolumeName(leaseUUID, "db", 0),
+		canonicalVolumeName(leaseUUID, "app", 2),
+		fmt.Sprintf("fred-%s-2", leaseUUID),
+		canonicalVolumeName("029d1234-5678-7abc-8def-0123456789ab", "app", 0),
+	} {
+		assert.False(t, contains(value), value)
+	}
 }

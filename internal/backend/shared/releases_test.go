@@ -1375,3 +1375,35 @@ func TestReleaseInspectionIdentifiesLeaseForCorruptHistory(t *testing.T) {
 	require.ErrorContains(t, err, leaseUUID)
 	require.ErrorContains(t, err, "release 1")
 }
+
+// A bound journal can hold superseded and failed rows whose manifests predate
+// the current admission policy. The store opens it, verifies it healthy, and
+// reads the history back unchanged, with the latest active row.
+func TestReleaseStoreOpensAndReadsHistoricalPolicyRows(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	path, storage := initializeBoundReleaseStore(t)
+	created := time.Unix(1_700_000_000, 0).UTC()
+	history := []Release{
+		{Version: 1, Manifest: []byte(`{"image":"nginx","labels":{"com.docker.compose.project":"legacy"}}`), Image: "nginx", Status: "superseded", CreatedAt: created},
+		{Version: 2, Manifest: []byte(`{"image":"nginx","labels":{"traefiK.enable":"true"}}`), Image: "nginx", Status: "failed", CreatedAt: created},
+		{Version: 3, Manifest: []byte(`{"services":{"web":{"image":"nginx","user":"1:2:3"}}}`), Image: "stack", Status: "active", CreatedAt: created},
+	}
+	encoded, err := marshalReleaseHistory(history)
+	require.NoError(t, err)
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte(leaseUUID), encoded)
+	}))
+	require.NoError(t, db.Close())
+	store, err := OpenIdentityBoundReleaseStore(ReleaseStoreConfig{DBPath: path}, storage, newTestStorageAuthorityGate(t))
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Healthy())
+	rows, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, history, rows)
+	active, err := store.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, 3, active.Version)
+}

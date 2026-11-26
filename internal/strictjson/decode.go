@@ -156,10 +156,6 @@ func exactStructFields(typ reflect.Type) map[string]reflect.Type {
 // ValidateUniqueObject verifies one bounded object and rejects duplicate keys
 // recursively, including objects nested inside arrays.
 func ValidateUniqueObject(value []byte, maxBytes int) error {
-	return validateUniqueComposite(value, maxBytes, '{')
-}
-
-func validateUniqueComposite(value []byte, maxBytes int, want json.Delim) error {
 	if len(value) > maxBytes {
 		return fmt.Errorf("JSON entry exceeds %d bytes", maxBytes)
 	}
@@ -172,33 +168,13 @@ func validateUniqueComposite(value []byte, maxBytes int, want json.Delim) error 
 	if err != nil {
 		return err
 	}
-	delimiter, ok := opening.(json.Delim)
-	if !ok || delimiter != want {
-		if want == '{' {
-			return errors.New("expected JSON object")
-		}
-		return errors.New("expected JSON array")
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("expected JSON object")
 	}
-	if want == '{' {
-		err = validateUniqueObjectBody(decoder)
-	} else {
-		for index := 0; decoder.More(); index++ {
-			if err = validateUniqueValue(decoder); err != nil {
-				err = fmt.Errorf("decode array element %d: %w", index, err)
-				break
-			}
-		}
-		if err == nil {
-			err = consumeClosing(decoder, ']')
-		}
-	}
-	if err != nil {
+	if err := validateUniqueObjectBody(decoder); err != nil {
 		return err
 	}
-	if err := requireTokenEOF(decoder); err != nil {
-		return err
-	}
-	return nil
+	return requireTokenEOF(decoder)
 }
 
 func validateUniqueObjectBody(decoder *json.Decoder) error {
