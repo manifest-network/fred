@@ -319,7 +319,7 @@ func TestBackend_RefusesToStartOnARetentionThatRecordsNoSizing(t *testing.T) {
 	require.NoError(t, err)
 	b.Stop()
 	retention := journals(b)[2]
-	original := rewriteJournalRow(t, retention, "retention", lease, func(row map[string]any) {
+	original, stripped := rewriteJournalRow(t, retention, "retention", lease, func(row map[string]any) {
 		entry, ok := row["entry"].(map[string]any)
 		require.True(t, ok, "a retention row wraps its entry")
 		require.Contains(t, entry, "resource_profiles", "a retained lease records its sizing")
@@ -334,6 +334,8 @@ func TestBackend_RefusesToStartOnARetentionThatRecordsNoSizing(t *testing.T) {
 	after, err := volumeRoots(b, lease)
 	require.NoError(t, err)
 	require.Equal(t, roots, after, "a refused start must leave the retained volume in place")
+	require.Equal(t, stripped, readJournalRow(t, retention, "retention", lease),
+		"a refused start must leave the retention row as it found it")
 
 	restoreJournalRow(t, retention, "retention", lease, original)
 	b.Start()
