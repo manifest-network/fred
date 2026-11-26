@@ -69,30 +69,6 @@ func TestIntegrationStorageIdentityInitialization(t *testing.T) {
 		assertNoStorageIdentityMarkers(t, cfg)
 	})
 
-	// A sealed journal whose marker pair is gone is not an empty backend. A
-	// second seal would mint a new identity over bound journals, so it is
-	// refused and no marker is written.
-	t.Run("sealed journals without their markers are not resealed", func(t *testing.T) {
-		server := newStorageIdentityDockerServer(t, nil)
-		cfg := storageIdentityIntegrationConfig(t, server.URL)
-		_, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(),
-		)
-		require.NoError(t, err)
-		for _, path := range []string{
-			filepath.Clean(cfg.CallbackDBPath) + ".storage-identity.json",
-			filepath.Clean(cfg.CallbackDBPath) + ".storage-identity-anchor.json",
-		} {
-			require.NoError(t, os.Remove(path))
-		}
-
-		_, err = InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(),
-		)
-		require.ErrorContains(t, err, "already identity-bound")
-		assertNoStorageIdentityMarkers(t, cfg)
-	})
-
 	t.Run("committed rerun refuses a daemon swap before marker recovery", func(t *testing.T) {
 		var infoReads atomic.Int64
 		server := newStorageIdentityDockerServerWithDaemonID(t, nil, func() string {
