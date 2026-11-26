@@ -325,3 +325,51 @@ func writeLegacyCallbackStore(t *testing.T, path string, rows map[string][]byte)
 	}))
 	require.NoError(t, db.Close())
 }
+
+// The storage identity marker lives beside the callback journal, or at the
+// root of the managed volume path when one is configured. A volume path that
+// is missing or is not a directory is an error, never a fallback.
+func TestDockerStorageIdentityMarkerPath(t *testing.T) {
+	cfg := storageIdentityEvidenceTestConfig(t)
+	path, err := dockerStorageIdentityMarkerPath(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Clean(cfg.CallbackDBPath)+".storage-identity.json", path)
+
+	root := t.TempDir()
+	cfg.VolumeDataPath = root + string(filepath.Separator)
+	path, err = dockerStorageIdentityMarkerPath(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(root, backendidentity.MarkerFilename), path)
+
+	file := filepath.Join(root, "not-a-directory")
+	require.NoError(t, os.WriteFile(file, nil, 0o600))
+	cfg.VolumeDataPath = file
+	_, err = dockerStorageIdentityMarkerPath(cfg)
+	require.ErrorContains(t, err, "is not a directory")
+
+	cfg.VolumeDataPath = filepath.Join(root, "missing")
+	_, err = dockerStorageIdentityMarkerPath(cfg)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// The managed volume path must resolve inside the declared mount, after
+// symlinks: a path that leaves the mount through a link or a parent step is
+// refused, and one that does not exist is reported as missing.
+func TestRequireExistingPathUnderRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	inside := filepath.Join(root, "volumes")
+	require.NoError(t, os.Mkdir(inside, 0o700))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape")))
+	require.NoError(t, os.Symlink(inside, filepath.Join(root, "alias")))
+
+	require.NoError(t, requireExistingPathUnderRoot(root, root))
+	require.NoError(t, requireExistingPathUnderRoot(root, inside))
+	require.NoError(t, requireExistingPathUnderRoot(root, filepath.Join(root, "alias")),
+		"a link that stays inside the root resolves inside it")
+	require.ErrorContains(t, requireExistingPathUnderRoot(root, outside), "escapes configured root")
+	require.ErrorContains(t, requireExistingPathUnderRoot(root, filepath.Join(root, "escape")), "escapes configured root")
+	require.ErrorContains(t, requireExistingPathUnderRoot(inside, root), "escapes configured root")
+	require.ErrorIs(t, requireExistingPathUnderRoot(root, filepath.Join(root, "missing")), os.ErrNotExist)
+	require.ErrorIs(t, requireExistingPathUnderRoot(filepath.Join(root, "missing"), inside), os.ErrNotExist)
+}

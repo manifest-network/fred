@@ -97,6 +97,8 @@ func TestDecodeObjectRejectsFramingAndSizeViolations(t *testing.T) {
 		want  string
 	}{
 		{name: "root array", value: []byte(`[]`), max: 10, want: "expected JSON object"},
+		{name: "object where an array belongs", value: []byte(`{"children":{}}`), max: 20, want: "expected JSON array"},
+		{name: "array where an object belongs", value: []byte(`{"child":[]}`), max: 20, want: "expected JSON object"},
 		{name: "trailing", value: []byte(`{} true`), max: 10, want: "unexpected data"},
 		{name: "size", value: []byte(`{"version":1}`), max: 2, want: "exceeds 2 bytes"},
 		{name: "invalid UTF-8", value: []byte{'{', '"', 0xff, '"', ':', '1', '}'}, max: 10, want: "not valid UTF-8"},
