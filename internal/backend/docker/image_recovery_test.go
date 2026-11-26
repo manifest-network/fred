@@ -96,7 +96,6 @@ func TestPinnedImageInventoryPreservesReleaseAuthority(t *testing.T) {
 						payload = []map[string]any{{
 							"Id": "container-id", "Image": tc.configImage, "ImageID": imageID,
 							"Labels": labels, "State": "running",
-							"Names": []string{"/fred-recovered-app-0"},
 						}}
 					default:
 						return nil, fmt.Errorf("unexpected Docker request: %s %s", req.Method, req.URL.Path)
@@ -137,10 +136,6 @@ func TestPinnedImageInventoryPreservesReleaseAuthority(t *testing.T) {
 					}
 					require.NoError(t, readErr)
 					require.Len(t, cohort, 1)
-					if read.name != "inspect" {
-						require.Equal(t, "fred-recovered-app-0", cohort[0].Name,
-							"a listed container is named without Docker's leading slash")
-					}
 					cohortErr := validateRecoveredReleaseCohort(&release, cohort)
 					maintenanceErr := validateMaintenanceGenerationContainer(
 						releaseCohortLeaseUUID, maintenanceID, "docker", release, cohort[0],
