@@ -1447,7 +1447,9 @@ func TestReleaseStoreOpensAndReadsHistoricalPolicyRows(t *testing.T) {
 	created := time.Unix(1_700_000_000, 0).UTC()
 	history := []Release{
 		{Version: 1, Manifest: []byte(`{"image":"nginx","labels":{"com.docker.compose.project":"legacy"}}`), Image: "nginx", Status: "superseded", CreatedAt: created},
-		{Version: 2, Manifest: []byte(`{"image":"nginx","labels":{"traefiK.enable":"true"}}`), Image: "nginx", Status: "failed", CreatedAt: created},
+		// The label key holds U+212A KELVIN SIGN, not an ASCII K, as a
+		// historical row can.
+		{Version: 2, Manifest: []byte(`{"image":"nginx","labels":{"traefiK.enable":"true"}}`), Image: "nginx", Status: "failed", CreatedAt: created},
 		{Version: 3, Manifest: []byte(`{"services":{"web":{"image":"nginx","user":"1:2:3"}}}`), Image: "stack", Status: "active", CreatedAt: created},
 	}
 	encoded, err := marshalReleaseHistory(history)

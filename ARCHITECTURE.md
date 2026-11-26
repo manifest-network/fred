@@ -647,7 +647,7 @@ cleanup phase even when every preceding phase consumes its cap. Transitional
 operations are deferred to periodic sweeps, not waited out during startup;
 one wedged daemon call cannot block indefinitely.
 
-The separate Docker storage-identity preflight and initializer share one
+The Docker storage-identity initializer runs under one
 `-storage-identity-operation-timeout` deadline (default `10m`) across
 context-aware Docker and filesystem-control-plane probes. It is cooperative,
 not a hard wall-clock interrupt for blocking local open, bbolt, or fsync work.
@@ -1817,7 +1817,7 @@ every start). Such closes are skipped by periodic recovery, answered from
 memory by Deprovision, and left out of the close-age gauge that pages.
 
 Any ambiguous recovery preserves evidence
-and prevents readiness. Read-only preflight and initialization reject both
+and prevents readiness. Initialization rejects both
 create and delete forms rather than mutate the lineage being proved. Unattributed managed volumes are preserved;
 only an exact durable operation, close, or retention finalizer can destroy them.
 
