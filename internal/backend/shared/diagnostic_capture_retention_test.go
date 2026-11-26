@@ -3,6 +3,7 @@ package shared
 import (
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -151,4 +152,13 @@ func TestDiagnosticsStoreExpiryPreservesMalformedRowsWithoutBlockingUnrelatedCle
 		assert.Equal(t, malformed, tx.Bucket(attemptDiagnosticsBucketName).Get([]byte("bad-attempt")))
 		return nil
 	}))
+}
+
+// A write that arrives after Close began is refused, not applied to a store
+// that is shutting down.
+func TestDiagnosticsStoreRefusesWritesAfterClose(t *testing.T) {
+	store, err := NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: filepath.Join(t.TempDir(), "diagnostics.db")})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	require.ErrorIs(t, store.Delete("11111111-1111-4111-8111-111111111111"), bolt.ErrDatabaseNotOpen)
 }

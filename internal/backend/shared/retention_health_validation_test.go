@@ -120,3 +120,67 @@ func TestRetentionInspectionRejectsRestoringRowWithoutDestinationAuthority(t *te
 	_, err = InspectRetentionStoreReadOnly(dbPath)
 	require.ErrorContains(t, err, "requires exact destination items and resource profiles")
 }
+
+// Every reader and writer of a retention row validates its source authority
+// first. Each defect below is refused, by name.
+func TestRetentionSourceAuthorityRejectsIncompleteRows(t *testing.T) {
+	const source = "11111111-1111-4111-8111-111111111111"
+	valid := func() RetentionEntry {
+		return RetentionEntry{
+			OriginalLeaseUUID: source,
+			Tenant:            "tenant-a",
+			ProviderUUID:      "33333333-3333-4333-8333-333333333333",
+			Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+			StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+				"app": {Image: "docker.io/library/alpine:3.22"},
+			}},
+			CallbackURL:         "https://fred.example/callbacks/provision",
+			RetainedVolumeNames: []string{"fred-retained-" + source + "-app-0"},
+			Status:              RetentionStatusActive,
+			Generation:          1,
+			CreatedAt:           time.Date(2026, time.January, 1, 2, 3, 4, 0, time.UTC),
+		}
+	}
+	entry := valid()
+	require.NoError(t, validateRetentionSourceAuthorityForBinding(&entry))
+	require.ErrorContains(t, validateRetentionSourceAuthorityForBinding(nil), "retention entry is required")
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*RetentionEntry)
+		want   string
+	}{
+		{"no tenant", func(e *RetentionEntry) { e.Tenant = " " }, "retention tenant is required"},
+		{"no creation time", func(e *RetentionEntry) { e.CreatedAt = time.Time{} }, "retention creation timestamp is required"},
+		{"negative generation", func(e *RetentionEntry) { e.Generation = -1 }, "retention generation cannot be negative"},
+		{"mixed service naming", func(e *RetentionEntry) {
+			e.Items = []backend.LeaseItem{{SKU: "a", Quantity: 1}, {SKU: "b", Quantity: 1, ServiceName: "web"}}
+		}, "retention source items"},
+		{"zero quantity", func(e *RetentionEntry) { e.Items[0].Quantity = 0 }, "retention source quantities"},
+		{"empty SKU", func(e *RetentionEntry) { e.Items[0].SKU = " " }, "has an empty SKU"},
+		{"duplicate service", func(e *RetentionEntry) {
+			e.Items = append(e.Items, backend.LeaseItem{SKU: "docker-large", Quantity: 1, ServiceName: "app"})
+		}, "duplicate service name"},
+		{"no callback URL", func(e *RetentionEntry) { e.CallbackURL = "" }, "callback URL is required"},
+		{"invalid callback URL", func(e *RetentionEntry) { e.CallbackURL = "http://fred.example/x" }, "retention source callback URL:"},
+		{"restoring without manifest", func(e *RetentionEntry) {
+			e.Status = RetentionStatusRestoring
+			e.StackManifest = nil
+		}, "restoring retention source manifest is required"},
+		{"manifest and items disagree", func(e *RetentionEntry) { e.Items[0].ServiceName = "web" }, "retention source manifest topology"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entry := valid()
+			test.mutate(&entry)
+			require.ErrorContains(t, validateRetentionSourceAuthorityForBinding(&entry), test.want)
+		})
+	}
+
+	// A reaping tombstone needs no callback route, and a row without a stored
+	// manifest is valid unless it is restoring.
+	reaping := valid()
+	reaping.Status = RetentionStatusReaping
+	reaping.CallbackURL = ""
+	reaping.StackManifest = nil
+	require.NoError(t, validateRetentionSourceAuthorityForBinding(&reaping))
+}
