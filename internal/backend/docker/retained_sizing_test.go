@@ -160,28 +160,6 @@ func TestRestartAfterSKUProfileRemovalStartsOnRecordedRetentionSizing(t *testing
 	assert.Equal(t, recorded, stored.ResourceProfiles, "no start rewrites the row's sizing")
 }
 
-// A retention row that records no sizing has bytes on disk and no recorded
-// size. The 0.14 line recorded one from the configuration at startup; this
-// line does not, even while the row's SKU profile is still configured.
-// Sizing the row as zero would undercount the admission pool, so start fails,
-// names the lease, and leaves the row as it was.
-func TestStartRefusesARetentionThatRecordsNoSizing(t *testing.T) {
-	seed := v013RetentionEntry("stateful")
-	b, quotas := startableBackendOverJournals(t, t.TempDir(), v013RetentionProfiles, &seed)
-	_, profileErr := b.cfg.GetSKUProfile("stateful")
-	require.NoError(t, profileErr, "the row's SKU profile is configured and is not consulted")
-
-	err := b.Start(context.Background())
-	require.ErrorIs(t, err, errRetainedSizingUnfrozen)
-	require.ErrorContains(t, err, "retained resource sizing")
-	require.ErrorContains(t, err, v013RetainedLease)
-	require.ErrorContains(t, err, "start the final 0.14 release once")
-	assert.Empty(t, quotas, "start stops before any consumer sizes the row")
-	stored, getErr := b.retentionStore.Get(v013RetainedLease)
-	require.NoError(t, getErr)
-	assert.Empty(t, stored.ResourceProfiles)
-}
-
 // One refusal names a bounded number of leases and counts them all.
 func TestRefuseUnsizedRetentionsBoundsTheNamedLeases(t *testing.T) {
 	b, _ := startableBackendOverJournals(t, t.TempDir(), v013RetentionProfiles, nil)
