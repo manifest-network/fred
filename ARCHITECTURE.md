@@ -1703,8 +1703,7 @@ directory capabilities for both marker parents and every authoritative journal
 parent. They bind the physical device/inode and make all later inspection,
 creation, and publication descriptor-relative; a rename, unmount, or same-path
 directory recreation cannot redirect the transaction. A pending anchor first
-records both the chosen storage UUID and whether the input is a wholly fresh set
-or a complete existing v0.13 set. Only after that anchor is durable does the
+records the chosen storage UUID and that the seal is a fresh one. Only after that anchor is durable does the
 marker coordinator mint the opaque `PendingStorage` capability accepted by
 authoritative-store preparation; a parsed or caller-supplied UUID cannot bind a
 store. Every capability copy shares one revocation state. The coordinator
@@ -1716,15 +1715,16 @@ cross-store evidence, publishes the primary marker, and finally commits the
 anchor. It returns `VerifiedStorage` only after final committed-marker and
 read-only store verification. This ordering is crash-resumable and idempotent:
 a rerun must use the
-persisted profile and exact identity, while a committed pair is
-verification-only and never repairs a missing or unbound store. Fresh input
-means every required store is absent; existing input means every required store
-is present. A mixed set is not guessed or completed. Existing adoption
-additionally requires a stopped backend, a drained legacy callback outbox,
-valid release/retention rows, and substrate evidence that agrees with the active
-releases.
+persisted exact identity, while a committed pair is
+verification-only and never repairs a missing or unbound store. Initialization
+seals only an empty backend: every required store is absent, and no managed
+container, managed volume, retention row or active release exists. A journal
+that exists without a storage identity is refused, as is a pending anchor
+written by a v0.13 adoption: only the final 0.14 release adopts a v0.13
+lineage. A journal that is already identity-bound while its marker pair is
+missing is refused too; the pair must be restored instead.
 
-That substrate evidence is concrete rather than name-based. Every managed name
+Managed-volume evidence is concrete rather than name-based. Every managed name
 first becomes one canonical typed component and must then be a real directory on the configured XFS root with a regular no-follow
 nonzero project-ID marker.
 Container evidence separately proves the label-derived volume and exact

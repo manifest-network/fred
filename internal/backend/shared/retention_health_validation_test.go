@@ -3,11 +3,16 @@ package shared
 import (
 	"bytes"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/manifest-network/fred/internal/backend"
+	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 )
 
 // Exercise the runtime entry point after a successful probe: neither a prior
@@ -73,4 +78,45 @@ func TestRetentionHealthRevalidatesCurrentRows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A restoring row must carry the destination it is being restored into. The
+// stopped-journal inspector refuses a current row that lacks it.
+func TestRetentionInspectionRejectsRestoringRowWithoutDestinationAuthority(t *testing.T) {
+	const source = "11111111-1111-4111-8111-111111111111"
+	dbPath := filepath.Join(t.TempDir(), "retention.db")
+	raw, err := marshalRetentionEntry(RetentionEntry{
+		OriginalLeaseUUID: source,
+		Tenant:            "tenant-a",
+		ProviderUUID:      "33333333-3333-4333-8333-333333333333",
+		Items:             []backend.LeaseItem{{SKU: "docker-small", Quantity: 1, ServiceName: "app"}},
+		StackManifest: &manifest.StackManifest{Services: map[string]*manifest.Manifest{
+			"app": {Image: "docker.io/library/alpine:3.22"},
+		}},
+		CallbackURL:         "https://fred.example/callbacks/provision",
+		RetainedVolumeNames: []string{"fred-retained-" + source + "-app-0"},
+		Status:              RetentionStatusRestoring,
+		NewLeaseUUID:        "22222222-2222-4222-8222-222222222222",
+		Generation:          7,
+		CreatedAt:           time.Date(2026, time.January, 1, 2, 3, 4, 0, time.UTC),
+		RestoringSince:      time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC),
+	})
+	require.NoError(t, err)
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		// The inspector reads the rows of an identity-bound journal only.
+		if _, createErr := tx.CreateBucket(storeIdentityBucketName); createErr != nil {
+			return createErr
+		}
+		bucket, createErr := tx.CreateBucket(retentionBucketName)
+		if createErr != nil {
+			return createErr
+		}
+		return bucket.Put([]byte(source), raw)
+	}))
+	require.NoError(t, db.Close())
+
+	_, err = InspectRetentionStoreReadOnly(dbPath)
+	require.ErrorContains(t, err, "requires exact destination items and resource profiles")
 }
