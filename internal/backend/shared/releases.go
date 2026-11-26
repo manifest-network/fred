@@ -75,10 +75,9 @@ type Release struct {
 	// disk for releases written by older binaries.
 	Items []backend.LeaseItem `json:"items,omitempty"`
 	// ResourceProfiles is the immutable resource authority paired with Items.
-	// New writers always persist it before reporting success. It remains
-	// optional only for release rows written by v0.13 and older binaries; Docker
-	// recovery snapshots the then-current configuration when migrating those
-	// rows so subsequent restarts and closes cannot reprice a live lease.
+	// New writers always persist it before reporting success, so later
+	// restarts and closes cannot reprice a live lease. A row written by v0.13
+	// may lack it; Docker recovery refuses an active one.
 	ResourceProfiles []SKUResourceSnapshot `json:"resource_profiles,omitempty"`
 	// RuntimeAuthority is the current non-expiring identity needed to reconstruct a
 	// terminal lease projection when an exact committed generation has no
@@ -594,7 +593,7 @@ func PrepareBoundReleaseStoreStorage(
 		return errors.New("pending backend storage authority is required")
 	}
 	return initializeIdentityBoundBoltStoreBound(
-		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(), true,
+		path, releasesBucketName, "releases", authoritativeStoreReleases, storage.ID(),
 		func(tx *bolt.Tx) error {
 			if err := validateReleaseRootBuckets(tx); err != nil {
 				return err
@@ -780,9 +779,8 @@ func validateReleaseHistory(releases []Release) error {
 }
 
 // validateReleaseHistoryRows checks every invariant except the single-active
-// rule and returns the active row indexes in history order. Its two callers
-// decide what more than one active row means: validateReleaseHistory refuses
-// it, and adoptV013ReleaseHistory asks the v0.13 recognizers.
+// rule and returns the active row indexes in history order. Its caller,
+// validateReleaseHistory, refuses more than one active row.
 func validateReleaseHistoryRows(releases []Release) ([]int, error) {
 	if len(releases) == 0 {
 		return nil, errors.New("release history is empty")
@@ -820,12 +818,10 @@ func validateReleaseHistoryRows(releases []Release) ([]int, error) {
 }
 
 // strictReleaseHistory is a history that passed strict validation, so it holds
-// at most one active row. newStrictReleaseHistory and adoptV013ReleaseHistory
-// are its only constructors, and each owns a deep copy of its rows, so neither
-// the caller's slice nor a reader's copy can change a validated history. Every
-// read-only inspection reports from it, and the stopped-adoption binding
-// transaction compacts and writes it, so the readiness report, the capacity
-// proof, and the bound store cannot disagree about which rows change.
+// at most one active row. newStrictReleaseHistory is its only constructor and
+// owns a deep copy of its rows, so neither the caller's slice nor a reader's
+// copy can change a validated history. Every read-only inspection reports
+// from it.
 type strictReleaseHistory struct {
 	strictRows []Release
 }

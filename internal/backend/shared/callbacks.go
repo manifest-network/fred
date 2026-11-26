@@ -355,9 +355,8 @@ func inspectCallbackStoreReadOnlyFile(
 		}
 		present := countCallbackSchemaBuckets(tx)
 		if present == 0 {
-			// A stopped v0.13 backend has none of the current buckets. Its
-			// legacy bucket is the complete outbox, so this is expected during
-			// adoption.
+			// A journal that holds none of the current buckets has no
+			// aggregate schema to check.
 			return nil
 		}
 		if present != len(callbackCurrentSchemaBuckets()) {
@@ -605,7 +604,7 @@ func PrepareBoundCallbackStoreStorage(
 		return errors.New("pending backend storage authority is required")
 	}
 	return initializeIdentityBoundBoltStoreBound(
-		path, callbackBucketName, "callback", authoritativeStoreCallbacks, storage.ID(), true,
+		path, callbackBucketName, "callback", authoritativeStoreCallbacks, storage.ID(),
 		validateCallbackStoreBeforeBinding,
 	)
 }

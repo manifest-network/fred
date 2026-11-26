@@ -551,7 +551,7 @@ func PrepareBoundRetentionStoreStorage(
 		return errors.New("pending backend storage authority is required")
 	}
 	return initializeIdentityBoundBoltStoreBound(
-		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(), true,
+		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(),
 		func(tx *bolt.Tx) error {
 			if err := validateRetentionRootBuckets(tx); err != nil {
 				return err

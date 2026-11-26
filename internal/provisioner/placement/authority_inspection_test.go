@@ -748,3 +748,20 @@ func authorityDiagnosticCodes(report AuthorityReport) []string {
 	}
 	return codes
 }
+
+// The offline tools bind the authority file by an absolute, clean path before
+// they open it: a relative or unclean path names a file that depends on the
+// working directory.
+func TestOfflinePlacementToolsRejectRelativeAuthorityPaths(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"placements.db", "/var/lib/fred/../fred/placements.db"} {
+		report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
+		require.ErrorContains(t, err, "absolute and clean", path)
+		require.Equal(t, AuthorityReport{}, report, path)
+
+		repair, err := OpenAttemptRepair(path, authorityInspectionProvider)
+		require.ErrorContains(t, err, "absolute and clean", path)
+		require.Nil(t, repair, path)
+	}
+}

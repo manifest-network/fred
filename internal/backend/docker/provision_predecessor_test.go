@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -64,6 +65,106 @@ func TestProvisionOverPredecessorWithoutRecordedAuthorityRefusesBeforeDurableAdm
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 	require.ElementsMatch(t, originalAllocs, b.pool.ListAllocations())
+}
+
+// A provision over the release of a lease adopted from v0.13 is admitted on the
+// authority that release records. A foreign principal is refused before
+// anything is durable. An accepted replacement that the pool then refuses
+// settles as one durable Failed callback, even after its caller disconnects,
+// and leaves the recorded authority, the release and the pool as they were.
+func TestProvisionOverAdoptedPredecessorKeepsItsRecordedAuthority(t *testing.T) {
+	for _, mode := range []string{"foreign principal", "capacity refusal", "caller cancels after admission"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "callbacks.db")})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			items := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", Quantity: 2}}
+			spec := shared.OperationIntentSpec{
+				LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+				CallbackURL: "https://legacy.example/callbacks/provision?route=v013", Items: items,
+				ResourceProfiles: testResourceProfiles(t, items),
+				Manifest:         validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+			}
+			seedAdoptedOperationReleaseForTest(t, store, spec, shared.Release{
+				Manifest: spec.Manifest, Image: "stack", Items: slices.Clone(items), ResourceProfiles: spec.ResourceProfiles,
+				Status: "active", CreatedAt: time.Now().Add(-time.Hour),
+			})
+			first := dockerIntentContainer(spec, "legacy-survivor", "docker-small", 0)
+			second := dockerIntentContainer(spec, "legacy-second", "docker-small", 1)
+			b := newOperationIntentRecoveryBackend(t, store, backendidentity.ID{}, []ContainerInfo{first}, nil)
+			t.Cleanup(func() { b.stopCancel(); b.wg.Wait() })
+			require.NoError(t, b.recoverState(t.Context()))
+			info, err := b.GetProvision(t.Context(), spec.LeaseUUID)
+			require.NoError(t, err)
+			require.Equal(t, backend.ProvisionStatusFailed, info.Status)
+			before, err := b.releaseStore.LatestActive(spec.LeaseUUID)
+			require.NoError(t, err)
+			require.NotNil(t, before)
+			require.NotNil(t, before.LegacyRuntimeAuthority)
+			originalAllocs := b.pool.ListAllocations()
+			forbidOperationRecoveryTeardown(t, b)
+			caller, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			mock := b.docker.(*mockDockerClient)
+			mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) { return []ContainerInfo{first, second}, nil }
+			mock.InspectContainerFn = func(_ context.Context, id string) (*ContainerInfo, error) {
+				if id == first.ContainerID {
+					copy := first
+					return &copy, nil
+				}
+				copy := second
+				return &copy, nil
+			}
+			req := newProvisionRequest(spec.LeaseUUID, spec.Tenant, "docker-small", 2, spec.Manifest)
+
+			accepted := mode != "foreign principal"
+			switch mode {
+			case "foreign principal":
+				req.Tenant = "tenant-b"
+				err = b.Provision(caller, req)
+				require.ErrorIs(t, err, backend.ErrInvalidState)
+				require.ErrorContains(t, err, "belongs to a different tenant or provider")
+			case "capacity refusal":
+				hold := b.pool.HoldUnaccountedFootprint()
+				defer hold.Release()
+				err = b.Provision(caller, req)
+				require.ErrorIs(t, err, backend.ErrInsufficientResources)
+			case "caller cancels after admission":
+				hold := b.pool.HoldUnaccountedFootprint()
+				defer hold.Release()
+				planner := &pausedProvisionCapacityPlanner{
+					next: b.releaseCapacityPlanner, entered: make(chan struct{}), resume: make(chan struct{}),
+				}
+				b.releaseCapacityPlanner = planner
+				returned := make(chan error, 1)
+				go func() { returned <- b.Provision(caller, req) }()
+				waitForOperationWorker(t, planner.entered)
+				cancel()
+				close(planner.resume)
+				err = <-returned
+				require.ErrorIs(t, err, backend.ErrInsufficientResources,
+					"an accepted replacement owns its settlement after HTTP disconnect")
+			}
+
+			claims, err := b.operationSettlement.ListOperationIntents()
+			require.NoError(t, err)
+			require.Empty(t, claims, "no refusal may strand an un-settleable Pending head")
+			callbacks, err := store.ListPending()
+			require.NoError(t, err)
+			after, err := b.releaseStore.LatestActive(spec.LeaseUUID)
+			require.NoError(t, err)
+			if accepted {
+				require.Len(t, callbacks, 1, "the accepted refusal is durably representable")
+				require.Equal(t, backend.CallbackStatusFailed, callbacks[0].Status)
+			} else {
+				require.Empty(t, callbacks, "no operation was accepted or failed")
+			}
+			require.Equal(t, before, after, "the recorded authority and the release are unchanged")
+			require.Equal(t, spec.CallbackURL, after.LegacyRuntimeAuthority.CallbackURL())
+			require.ElementsMatch(t, originalAllocs, b.pool.ListAllocations())
+			require.True(t, b.provisionStore.Exists(spec.LeaseUUID))
+		})
+	}
 }
 
 func TestPreparedProvisionAdmissionRequiresOwnedCandidate(t *testing.T) {

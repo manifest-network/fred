@@ -896,8 +896,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 		// Size the recovered instance from durable authority whenever one exists.
 		// Operation intent wins during its write-ahead window; otherwise the active
 		// release snapshot owns the live generation, followed by an outstanding
-		// restore finalizer's exact destination snapshot. Current config is only the
-		// v0.13/container-only compatibility path.
+		// restore finalizer's exact destination snapshot. Current config sizes
+		// only a container that none of them covers.
 		var resourceProfiles []shared.SKUResourceSnapshot
 		if claim, pending := operationClaimsByLease[c.LeaseUUID]; pending {
 			resourceProfiles = claim.ResourceProfiles()

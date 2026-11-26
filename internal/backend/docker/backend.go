@@ -336,7 +336,7 @@ type Backend struct {
 	recoveryDockerReadTimeout time.Duration
 	// startupRecoveryTimeout bounds the complete startup convergence pass. It is
 	// intentionally independent of the caller's short readiness context because
-	// stopped v0.13 adoption and fleet recovery may legitimately outlive that
+	// fleet recovery may legitimately outlive that
 	// context, but it must still be finite if a daemon accepts requests and then
 	// stops responding.
 	startupRecoveryTimeout time.Duration
@@ -824,16 +824,6 @@ func (paths *dockerStorageInitializationPaths) Close() error {
 	return errors.Join(errs...)
 }
 
-// ErrV013InterruptedDeprovision identifies a stopped legacy lineage that must
-// finish its exact close operation under v0.13 before it can be sealed.
-var ErrV013InterruptedDeprovision = errors.New("v0.13 lineage contains an interrupted deprovision finalization")
-
-// ErrV013UnresolvedClose identifies a stopped legacy lineage whose active
-// release outlived its container cohort without a retention finalizer. That
-// shape is compatible with more than one v0.13 close boundary, so neither
-// replay nor automatic journal repair is safe.
-var ErrV013UnresolvedClose = errors.New("v0.13 lineage contains an unresolved close boundary")
-
 type dockerStorageIdentityProof struct {
 	paths         *dockerStorageInitializationPaths
 	initialDaemon DaemonSecurityInfo
@@ -1161,7 +1151,7 @@ func initializeStorageIdentityWithDependencies(
 }
 
 // storageIdentityEvidenceClient is the read-only Docker capability required to
-// prove whether a substrate is empty or belongs to the stopped v0.13 lineage.
+// prove that a substrate is empty before it is sealed.
 // Keeping the initialization proof on this narrow interface prevents it from
 // acquiring container-mutation authority by accident.
 type storageIdentityEvidenceClient interface {

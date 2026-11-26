@@ -1594,7 +1594,7 @@ func (b *Backend) classifyProvisionIntentSubstrate(
 	}
 	if len(older) == 0 {
 		// A complete Ready candidate cohort has enough exact, typed authority to
-		// commit a fresh Release and supersede a stale v0.13 row. It does not
+		// commit a fresh Release and supersede its predecessor. It does not
 		// need recovery authority for that predecessor because no failure cleanup
 		// or predecessor reconstruction follows this classification. Every failed
 		// or partial candidate still requires the predecessor's recorded runtime
