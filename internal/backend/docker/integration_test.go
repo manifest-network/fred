@@ -128,7 +128,7 @@ func initializeFreshIntegrationStorageIdentity(
 ) {
 	t.Helper()
 	_, err := InitializeStorageIdentityForConfig(
-		ctx, cfg, logger, StorageIdentityInitializeNew,
+		ctx, cfg, logger,
 	)
 	require.NoError(t, err)
 }

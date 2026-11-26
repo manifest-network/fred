@@ -2,6 +2,8 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -145,9 +148,10 @@ func (client itemslessPredecessorStrictInventory) ListManagedContainersStrict(ct
 	return client.strict(ctx)
 }
 
-// Write the real stopped v0.13 array and run Prepare Existing before opening the
-// bound stores. That decoder deliberately leaves Items/resource authority empty;
-// no Backfill helper is allowed to replace the shape under test.
+// Seal empty stores, then write the active release exactly as the 0.14 adoption
+// stored a v0.13 row: the current envelope around the v0.13 fields, with no
+// Items and no resource authority. No Backfill helper is allowed to replace the
+// shape under test.
 func newItemslessV013PredecessorRecoveryFixture(
 	t *testing.T,
 	spec shared.OperationIntentSpec,
@@ -159,26 +163,21 @@ func newItemslessV013PredecessorRecoveryFixture(
 	cfg.CallbackDBPath = filepath.Join(dir, "callbacks.db")
 	cfg.ReleasesDBPath = filepath.Join(dir, "releases.db")
 	cfg.RetentionDBPath = filepath.Join(dir, "retention.db")
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	writeRawV013ReleaseHistory(t, cfg.ReleasesDBPath, spec.LeaseUUID, []v013ReleaseWire{{
-		Version: 1, Manifest: spec.Manifest, Image: "stack", Status: "active", CreatedAt: time.Now(),
-	}})
 	paths, err := bindDockerStorageInitializationPaths(
 		cfg, filepath.Join(dir, "storage-identity.json"), filepath.Join(dir, "storage-identity-anchor.json"),
 	)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, paths.Close()) }()
 	_, err = paths.markers.InitializeWithStores(cfg.Name, "close-recovery-daemon", backendidentity.MarkerPairStoreHooks{
-		Profile: backendidentity.InitializationProfileExisting,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage, profile); err != nil {
+			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
 				return err
 			}
-			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage, profile); err != nil {
+			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage); err != nil {
 				return err
 			}
-			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage, profile)
+			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := shared.CheckBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
@@ -194,10 +193,34 @@ func newItemslessV013PredecessorRecoveryFixture(
 		},
 	})
 	require.NoError(t, err)
+	writeItemslessActiveRelease(t, cfg.ReleasesDBPath, spec.LeaseUUID, spec.Manifest)
 	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 	b.cfg.RetentionDBPath = cfg.RetentionDBPath
 	b.releaseBackfiller, err = shared.NewReleaseBackfiller(stores.callbacks, stores.releases)
 	require.NoError(t, err)
 	t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
 	return b, stores
+}
+
+// writeItemslessActiveRelease writes one active release carrying only the
+// fields v0.13 persisted into an already sealed release journal.
+func writeItemslessActiveRelease(t *testing.T, dbPath, leaseUUID string, stackManifest []byte) {
+	t.Helper()
+	db, err := bolt.Open(dbPath, 0o600, &bolt.Options{Timeout: time.Second})
+	require.NoError(t, err)
+	data, err := json.Marshal(struct {
+		SchemaVersion uint8            `json:"schema_version"`
+		Releases      []shared.Release `json:"releases"`
+	}{SchemaVersion: 1, Releases: []shared.Release{{
+		Version: 1, Manifest: stackManifest, Image: "stack", Status: "active", CreatedAt: time.Now(),
+	}}})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("releases"))
+		if bucket == nil {
+			return errors.New("releases bucket is missing")
+		}
+		return bucket.Put([]byte(leaseUUID), data)
+	}))
+	require.NoError(t, db.Close())
 }

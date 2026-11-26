@@ -35,50 +35,6 @@ func DecodeObject(value []byte, maxBytes int, destination any) error {
 	return requireEOF(decoder)
 }
 
-// DecodeArray is DecodeObject's top-level-array counterpart. It exists for
-// narrowly gated legacy formats whose historical root was an array.
-func DecodeArray(value []byte, maxBytes int, destination any) error {
-	if err := ValidateUniqueArray(value, maxBytes); err != nil {
-		return err
-	}
-	if err := validateExactShape(value, destination); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	return requireEOF(decoder)
-}
-
-// DecodeRawObject returns an exact object whose keys are constrained by
-// allowed. Values remain raw but are still recursively checked for duplicate
-// object fields and the document must contain exactly one value.
-func DecodeRawObject(
-	value []byte,
-	maxBytes int,
-	allowed map[string]struct{},
-) (map[string]json.RawMessage, error) {
-	if err := ValidateUniqueObject(value, maxBytes); err != nil {
-		return nil, err
-	}
-	var object map[string]json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	if err := decoder.Decode(&object); err != nil {
-		return nil, err
-	}
-	if err := requireEOF(decoder); err != nil {
-		return nil, err
-	}
-	for name := range object {
-		if _, ok := allowed[name]; !ok {
-			return nil, fmt.Errorf("unknown field %q", name)
-		}
-	}
-	return object, nil
-}
-
 func validateExactShape(value []byte, destination any) error {
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(value))
@@ -201,12 +157,6 @@ func exactStructFields(typ reflect.Type) map[string]reflect.Type {
 // recursively, including objects nested inside arrays.
 func ValidateUniqueObject(value []byte, maxBytes int) error {
 	return validateUniqueComposite(value, maxBytes, '{')
-}
-
-// ValidateUniqueArray verifies one bounded array and rejects duplicate object
-// keys recursively.
-func ValidateUniqueArray(value []byte, maxBytes int) error {
-	return validateUniqueComposite(value, maxBytes, '[')
 }
 
 func validateUniqueComposite(value []byte, maxBytes int, want json.Delim) error {

@@ -4,8 +4,6 @@ import (
 	"fmt"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/manifest-network/fred/internal/backend"
 )
 
 // Historical and malformed fixtures deliberately bypass typed authority only in tests.
@@ -41,21 +39,4 @@ func (mailbox *callbackReplayMailbox) pendingCount() int {
 	mailbox.mu.Lock()
 	defer mailbox.mu.Unlock()
 	return len(mailbox.pending)
-}
-
-func (inspection ReleaseStoreInspection) checkLegacyActiveAuthorityCapacityWithinLimit(
-	leaseUUID string,
-	expected Release,
-	items []backend.LeaseItem,
-	resourceProfiles []SKUResourceSnapshot,
-	limitBytes int,
-) error {
-	return inspection.checkLegacyActiveAuthorityAndRuntimeCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		resourceProfiles,
-		nil,
-		limitBytes,
-	)
 }

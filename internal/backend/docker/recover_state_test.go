@@ -1012,31 +1012,6 @@ func TestRecoverState_RejectsMismatchedLifecycleLabel(t *testing.T) {
 	assert.Empty(t, b.provisions, "invalid persisted authority must be quarantined before state publication")
 }
 
-func TestRecoveredCallbackPairs_RejectSiblingDivergenceIndependentOfListOrder(t *testing.T) {
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-	first := ContainerInfo{
-		ContainerID: "container-a", LeaseUUID: leaseUUID, Tenant: "t", SKU: "docker-small",
-		ServiceName: "app", Status: "running",
-		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
-		LifecycleCallbackURL: "https://fred.example/callbacks/provision?lifecycle_id=6ba7b810-9dad-41d1-80b4-00c04fd430c8",
-	}
-	second := ContainerInfo{
-		ContainerID: "container-b", LeaseUUID: leaseUUID, Tenant: "t", SKU: "docker-small",
-		ServiceName: "app", InstanceIndex: 1, Status: "running",
-		CallbackURL:          "https://fred.example/callbacks/provision?operation_id=6ba7b811-9dad-41d1-80b4-00c04fd430c8",
-		LifecycleCallbackURL: "https://fred.example/callbacks/provision?lifecycle_id=6ba7b811-9dad-41d1-80b4-00c04fd430c8",
-	}
-
-	_, forwardErr := recoveredCallbackPairs([]ContainerInfo{first, second})
-	_, reverseErr := recoveredCallbackPairs([]ContainerInfo{second, first})
-	require.Error(t, forwardErr)
-	require.Error(t, reverseErr)
-	assert.EqualError(t, reverseErr, forwardErr.Error(), "Docker list order must not select callback authority")
-	assert.ErrorContains(t, forwardErr, "callback labels diverge")
-	assert.ErrorContains(t, forwardErr, "container-a")
-	assert.ErrorContains(t, forwardErr, "container-b")
-}
-
 func TestRecoverState_ColdStartFailed_BumpsFailCountAndLastError(t *testing.T) {
 	got := runRecover(t, nil, []ContainerInfo{
 		{ContainerID: "c1", LeaseUUID: "L1", Tenant: "t", SKU: "docker-small", ServiceName: "app", Status: "exited", FailCount: 2},

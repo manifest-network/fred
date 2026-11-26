@@ -64,7 +64,7 @@ func newBoundLeaseSMCallbackStore(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				return shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile)
+				return shared.PrepareBoundCallbackStoreStorage(boundPath, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				return shared.CheckBoundCallbackStoreStorage(boundPath, pending)
@@ -104,7 +104,7 @@ func newBoundLeaseSMReleaseStore(
 		backendidentity.MarkerPairStoreHooks{
 			Profile: backendidentity.InitializationProfileFresh,
 			Prepare: func(pending backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-				return shared.PrepareBoundReleaseStoreStorage(boundPath, pending, profile)
+				return shared.PrepareBoundReleaseStoreStorage(boundPath, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				return shared.CheckBoundReleaseStoreStorage(boundPath, pending)
@@ -152,10 +152,10 @@ func newBoundLeaseSMMaintenanceStores(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending, profile); err != nil {
+				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending); err != nil {
 					return err
 				}
-				return shared.PrepareBoundReleaseStoreStorage(releaseBound, pending, profile)
+				return shared.PrepareBoundReleaseStoreStorage(releaseBound, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				if err := shared.CheckBoundCallbackStoreStorage(callbackBound, pending); err != nil {

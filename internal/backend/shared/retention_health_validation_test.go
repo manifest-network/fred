@@ -68,7 +68,7 @@ func TestRetentionHealthRevalidatesCurrentRows(t *testing.T) {
 			switch name {
 			case "versionless runtime", "wrong row identity", "invalid principal", "invalid source manifest", "invalid resource authority":
 			default:
-				_, err := decodeUnboundRetentionEntry(corrupt)
+				_, err := decodeRetentionEntry(corrupt)
 				require.Error(t, err)
 			}
 		})

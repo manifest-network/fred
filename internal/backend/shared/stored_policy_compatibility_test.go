@@ -7,7 +7,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
+	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
@@ -25,19 +27,23 @@ func storedPolicyDriftStack(t *testing.T) *manifest.StackManifest {
 	return stack
 }
 
-func TestStoredPolicyDriftRetentionSurvivesInspectionAdoptionAndRestart(t *testing.T) {
-	entry := v013RestoringRetentionFixture()
-	entry.Status = RetentionStatusActive
-	entry.NewLeaseUUID = ""
-	entry.Generation = 0
-	entry.RestoringSince = time.Time{}
-	entry.StackManifest = storedPolicyDriftStack(t)
+func TestStoredPolicyDriftRetentionSurvivesInspectionAndRestart(t *testing.T) {
+	const source = "11111111-1111-4111-8111-111111111111"
+	entry := RetentionEntry{
+		OriginalLeaseUUID: source,
+		Tenant:            "tenant-a",
+		ProviderUUID:      "33333333-3333-4333-8333-333333333333",
+		Items: []backend.LeaseItem{{
+			SKU: "docker-small", Quantity: 1, ServiceName: "app",
+		}},
+		StackManifest:       storedPolicyDriftStack(t),
+		CallbackURL:         "https://fred.example/callbacks/provision",
+		RetainedVolumeNames: []string{"fred-retained-" + source + "-app-0"},
+		Status:              RetentionStatusActive,
+		CreatedAt:           time.Date(2026, time.January, 1, 2, 3, 4, 0, time.UTC),
+	}
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "retention.db")
-	writeV013RetentionStore(t, dbPath, entry)
-	inspection, err := InspectRetentionStoreReadOnly(dbPath)
-	require.NoError(t, err, "read-only upgrade inspection must accept structurally valid historical policy")
-	require.Len(t, inspection.Entries, 1)
 	bound, err := BindAuthoritativeStorePath(dbPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, bound.Close()) })
@@ -45,7 +51,20 @@ func TestStoredPolicyDriftRetentionSurvivesInspectionAdoptionAndRestart(t *testi
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, pair.Close()) })
 	storage, err := pair.InitializeWithStores("docker-a", "daemon-a", retentionSchemaHooks(bound))
-	require.NoError(t, err, "historical policy must not prevent journal adoption")
+	require.NoError(t, err)
+	// Write the row below the store API: today's Put would refuse this policy,
+	// and the row stands for one admitted before the policy changed.
+	row, err := marshalRetentionEntry(entry)
+	require.NoError(t, err)
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(retentionBucketName).Put([]byte(source), row)
+	}))
+	require.NoError(t, db.Close())
+	inspection, err := InspectRetentionStoreReadOnly(dbPath)
+	require.NoError(t, err, "read-only inspection must accept structurally valid historical policy")
+	require.Len(t, inspection.Entries, 1)
 	for range 2 {
 		store, err := OpenIdentityBoundRetentionStore(RetentionStoreConfig{DBPath: dbPath}, storage, newTestStorageAuthorityGate(t))
 		require.NoError(t, err, "startup must not reapply current tenant policy to retained rows")

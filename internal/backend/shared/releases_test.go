@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -390,10 +389,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxRecordBytes: 1 << 20,
 				maxTotalBytes:  1 << 20,
 			})
-			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
-			)
-			return inspectErr
+			return inspectReleaseBucketWithObserver(tx, nil, budget.observe)
 		})
 		require.ErrorContains(t, err, "1-record cutover ceiling")
 		require.ErrorContains(t, err, "matching predecessor")
@@ -406,10 +402,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxRecordBytes: 1 << 20,
 				maxTotalBytes:  1,
 			})
-			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
-			)
-			return inspectErr
+			return inspectReleaseBucketWithObserver(tx, nil, budget.observe)
 		})
 		require.ErrorContains(t, err, "1-byte logical cutover ceiling")
 		require.ErrorContains(t, err, "matching predecessor")
@@ -1394,91 +1387,4 @@ func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *tes
 		assert.Empty(t, got[1].Reason)
 		assert.Empty(t, got[1].Message)
 	})
-}
-
-func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *testing.T) {
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-	manifestBytes := []byte(`{"image":"example.invalid/app:1"}`)
-	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
-	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
-	now := time.Now()
-	expected := Release{
-		Version: 2, Manifest: manifestBytes, Image: "example.invalid/app:1",
-		Status: "active", CreatedAt: now,
-	}
-	candidate := cloneRelease(expected)
-	candidate.Items = slices.Clone(items)
-	candidate.ResourceProfiles = CloneSKUResourceSnapshot(profiles)
-	candidateBytes, err := marshalReleaseHistory([]Release{candidate})
-	require.NoError(t, err)
-
-	dbPath := filepath.Join(t.TempDir(), "legacy_backfill_capacity.db")
-	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	putRawReleaseHistory(t, store, leaseUUID, []Release{
-		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-time.Hour), Error: "historical detail"},
-		expected,
-	})
-	require.NoError(t, store.Close())
-
-	inspection, err := InspectReleaseStoreReadOnly(dbPath)
-	require.NoError(t, err)
-	require.NoError(t, inspection.checkLegacyActiveAuthorityCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		profiles,
-		len(candidateBytes),
-	))
-
-	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.NoError(t, store.backfillLegacyActiveAuthorityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		profiles,
-		len(candidateBytes),
-	))
-	assert.Equal(t, candidateBytes, rawReleaseHistory(t, store, leaseUUID))
-}
-
-func TestReleaseStoreInspection_RejectsIrreducibleProfileBackfillAtomically(t *testing.T) {
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440001"
-	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
-	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
-	expected := Release{
-		Version:  1,
-		Manifest: []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
-		Image:    "stack", Items: items, Status: "active", CreatedAt: time.Now(),
-	}
-	dbPath := filepath.Join(t.TempDir(), "profile_backfill_capacity.db")
-	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{expected})
-	require.NoError(t, store.Close())
-
-	inspection, err := InspectReleaseStoreReadOnly(dbPath)
-	require.NoError(t, err)
-	err = inspection.checkActiveResourceProfilesCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		profiles,
-		len(wantRaw),
-	)
-	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
-
-	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	err = store.backfillActiveResourceProfilesWithinLimit(
-		leaseUUID,
-		expected.Version,
-		expected.Items,
-		profiles,
-		len(wantRaw),
-	)
-	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
-	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
 }

@@ -10,8 +10,8 @@
 # the storage-identity marker pair or authoritative journals. For a genuinely
 # new, empty backend, run this one-shot command before the first normal start:
 #   docker-backend -config docker-backend.yaml -initialize-storage-identity new
-# Existing v0.13 storage uses the stopped-and-drained `adopt` cutover documented
-# in DEPLOYMENT.md; never use `new` to replace or recover a committed lineage.
+# Existing v0.13 storage is adopted by the final 0.14 release, not by this one;
+# `new` refuses it. Never use `new` to replace or recover a committed lineage.
 #
 # ENVIRONMENT VARIABLES: only these override YAML values, and only when set to
 # a non-empty value (an empty variable cannot clear a YAML value):

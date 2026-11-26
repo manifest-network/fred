@@ -244,10 +244,10 @@ func openBoundAPICallbackStore(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				if err := shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile); err != nil {
+				if err := shared.PrepareBoundCallbackStoreStorage(boundPath, pending); err != nil {
 					return err
 				}
-				return shared.PrepareBoundReleaseStoreStorage(boundReleases, pending, profile)
+				return shared.PrepareBoundReleaseStoreStorage(boundReleases, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				if err := shared.CheckBoundCallbackStoreStorage(boundPath, pending); err != nil {

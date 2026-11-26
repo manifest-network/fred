@@ -600,17 +600,12 @@ func (s *CallbackStore) StartMaintenance() {
 func PrepareBoundCallbackStoreStorage(
 	path *BoundAuthoritativeStorePath,
 	storage backendidentity.PendingStorage,
-	profile backendidentity.InitializationProfile,
 ) error {
 	if !storage.Valid() {
 		return errors.New("pending backend storage authority is required")
 	}
-	allowCreate, err := allowAuthoritativeStoreCreation(profile)
-	if err != nil {
-		return err
-	}
 	return initializeIdentityBoundBoltStoreBound(
-		path, callbackBucketName, "callback", authoritativeStoreCallbacks, storage.ID(), allowCreate,
+		path, callbackBucketName, "callback", authoritativeStoreCallbacks, storage.ID(), true,
 		validateCallbackStoreBeforeBinding,
 	)
 }

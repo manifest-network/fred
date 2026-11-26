@@ -32,6 +32,10 @@ func TestProvisionManifestAdmissionHTTPErrorContract(t *testing.T) {
 	db, err := bolt.Open(path, 0o600, nil)
 	require.NoError(t, err)
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		// The inspector reads the rows of an identity-bound journal only.
+		if _, createErr := tx.CreateBucket([]byte("_fred_backend_storage_identity")); createErr != nil {
+			return createErr
+		}
 		bucket, createErr := tx.CreateBucket([]byte("releases"))
 		if createErr != nil {
 			return createErr

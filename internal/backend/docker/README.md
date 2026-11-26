@@ -394,40 +394,21 @@ protected authority alone exceeds the cap, admission fails before mutation.
 Before the first normal start of a genuinely new empty backend, run
 `docker-backend -config docker-backend.yaml -initialize-storage-identity new`
 once. Normal startup is verification-only and never creates, repairs, or binds a
-missing marker or authoritative journal. Existing v0.13 state must use the
-stopped-and-drained `adopt` workflow in `DEPLOYMENT.md`.
+missing marker or authoritative journal. Existing v0.13 state is adopted by the
+final 0.14 release: this one seals only an empty backend and refuses journals
+that exist without a storage identity.
 
-Before the cutover backup or `adopt`, run the upgraded binary without starting
-the service:
-
-```bash
-docker-backend -config docker-backend.yaml \
-  -preflight-storage-identity-adoption
-```
-
-Require exit status zero and the sole stdout line
-`ready_for_v0_13_storage_identity_adoption`. This proof is read-only and leaves
-both markers absent. It reports unresolved v0.13 restoring records and exact
-interrupted deprovision shapes rather than synthesizing the operation authority
-those records lack; follow the isolated-v0.13 repair procedure in
-`DEPLOYMENT.md`, then stop, preflight, and back up again.
-Both this preflight and `-initialize-storage-identity {new|adopt}` accept
+`-initialize-storage-identity new` accepts
 `-storage-identity-operation-timeout` (default `10m`). The deadline is shared
 across context-aware Docker and filesystem-control-plane probes but is
 cooperative: a blocking local open, bbolt operation, or fsync cannot be
 interrupted mid-syscall. A timeout is failure, not proof of rollback; keep the
-lineage stopped and rerun the same mode against unchanged input.
-An active legacy release with neither containers nor a retention finalizer is a
-different unresolved-close refusal: never replay deprovision against it, because
-that can purge the release while stranding remaining tenant volumes. Restore a
-complete pre-close snapshot or follow Deployment's chain-proven manual data
-decision procedure.
+backend stopped and rerun the same command against unchanged input.
 
-The supported v0.13 upgrade shape is an ordinary stack-form cohort with a
-complete service label and coherent tokenless callback identity. Any pre-stack
+A lease adopted from v0.13 is an ordinary stack-form cohort with a complete
+service label and coherent tokenless callback identity. Any pre-stack
 container, `-prev` rollback remnant, authorityless migration generation, or
-other partial topology fails the read-only preflight and normal startup before
-mutation. This release intentionally has no in-place converter or inference
+other partial topology fails normal startup before mutation. This release intentionally has no in-place converter or inference
 path for those shapes; restore a known-good supported snapshot or use a separate
 proof-bearing repair procedure.
 

@@ -147,16 +147,16 @@ func openOperationHandoffStores(t *testing.T, backendName string) operationHando
 			storage backendidentity.PendingStorage,
 			profile backendidentity.InitializationProfile,
 		) error {
-			if err := PrepareBoundCallbackStoreStorage(callbacksBound, storage, profile); err != nil {
+			if err := PrepareBoundCallbackStoreStorage(callbacksBound, storage); err != nil {
 				return err
 			}
-			if err := PrepareBoundReleaseStoreStorage(releasesBound, storage, profile); err != nil {
+			if err := PrepareBoundReleaseStoreStorage(releasesBound, storage); err != nil {
 				return err
 			}
-			if err := PrepareBoundReleaseStoreStorage(alternateReleasesBound, storage, profile); err != nil {
+			if err := PrepareBoundReleaseStoreStorage(alternateReleasesBound, storage); err != nil {
 				return err
 			}
-			return PrepareBoundRetentionStoreStorage(retentionsBound, storage, profile)
+			return PrepareBoundRetentionStoreStorage(retentionsBound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := CheckBoundCallbackStoreStorage(callbacksBound, storage); err != nil {

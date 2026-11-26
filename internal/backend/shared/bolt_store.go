@@ -711,17 +711,6 @@ func checkIdentityBoundBoltStoreFile(
 	})
 }
 
-func allowAuthoritativeStoreCreation(profile backendidentity.InitializationProfile) (bool, error) {
-	switch profile {
-	case backendidentity.InitializationProfileFresh:
-		return true, nil
-	case backendidentity.InitializationProfileExisting:
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid backend storage initialization profile %q", profile)
-	}
-}
-
 func verifyStoreIdentityBinding(
 	tx *bolt.Tx,
 	kind authoritativeStoreKind,

@@ -51,10 +51,10 @@ func journalPendingError(t *testing.T, observe func(*shared.OperationSettlement,
 	storage, err := pair.InitializeWithStores("docker-a", "test-substrate", backendidentity.MarkerPairStoreHooks{
 		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			if err := shared.PrepareBoundCallbackStoreStorage(callbacksBound, storage, profile); err != nil {
+			if err := shared.PrepareBoundCallbackStoreStorage(callbacksBound, storage); err != nil {
 				return err
 			}
-			return shared.PrepareBoundReleaseStoreStorage(releasesBound, storage, profile)
+			return shared.PrepareBoundReleaseStoreStorage(releasesBound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := shared.CheckBoundCallbackStoreStorage(callbacksBound, storage); err != nil {

@@ -942,13 +942,11 @@ latch closes the listener and drains before exiting 1; a recovery error found by
 `Start` never binds the listener and exits 1 immediately. In either case only a
 new process retries recovery.
 
-The stopped `-preflight-storage-identity-adoption` and
-`-initialize-storage-identity` commands are deliberately different: they refuse
-XFS create/delete stages without normalizing them.
-Neither form can originate from v0.13.0, so finding one during an unsealed
-v0.13 cutover
-means an upgraded process already mutated the root or the wrong snapshot is in
-use; preserve the evidence and restore the matching stopped snapshot. Never interpret a failed one-shot command as cleanup authority.
+The stopped `-initialize-storage-identity new` command is deliberately
+different: it refuses XFS create/delete stages without normalizing them. A
+stage on a backend that was never sealed means another process already mutated
+the root or the wrong snapshot is in use; preserve the evidence and restore the
+matching stopped snapshot. Never interpret a failed one-shot command as cleanup authority.
 
 ---
 
@@ -1190,9 +1188,8 @@ systemctl stop docker-backend &&
 
 `Start` registers it as a held deletion and the executor finishes it.
 
-The stopped `-preflight-storage-identity-adoption` and
-`-initialize-storage-identity` commands still refuse while any delete stage
-exists.
+The stopped `-initialize-storage-identity new` command still refuses while any
+delete stage exists.
 
 **Upgrades and deploys.**
 

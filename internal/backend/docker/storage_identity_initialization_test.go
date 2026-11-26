@@ -15,41 +15,51 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
-func TestStorageIdentityEvidenceEmptyV013LineageRequiresExplicitNewMode(t *testing.T) {
-	cfg := storageIdentityEvidenceTestConfig(t)
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	dockerClient := &mockDockerClient{
-		PingFn: func(context.Context) error { return nil },
-		DaemonInfoFn: func(context.Context) (DaemonSecurityInfo, error) {
-			return DaemonSecurityInfo{SystemID: "daemon-system-a"}, nil
+func TestStorageInitializationRefusesJournalsWithoutIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		write func(*testing.T, Config)
+		want  string
+	}{
+		{
+			name: "complete v0.13 lineage",
+			write: func(t *testing.T, cfg Config) {
+				writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
+				writeLegacyAuthorityStores(t, cfg)
+			},
+			want: "3 of 3 authoritative backend journals exist without a storage identity",
 		},
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return nil, nil
+		{
+			name: "callback store only",
+			write: func(t *testing.T, cfg Config) {
+				writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
+			},
+			want: "1 of 3 authoritative backend journals exist without a storage identity",
 		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := storageIdentityEvidenceTestConfig(t)
+			test.write(t, cfg)
+			paths := bindStorageIdentityEvidenceTestPaths(t, cfg)
+
+			resuming, err := requireFreshStorageInitialization(cfg, paths, "daemon-system-a")
+			require.ErrorContains(t, err, test.want)
+			assert.ErrorContains(t, err, "final 0.14 release")
+			assert.False(t, resuming)
+		})
 	}
-	volumes := &mockVolumeManager{}
-	paths := bindStorageIdentityEvidenceTestPaths(t, cfg)
 
-	err := verifyStorageIdentityInitializationEvidence(
-		t.Context(), cfg, dockerClient, volumes, StorageIdentityInitializeAdopt,
-		backendidentity.InitializationProfileExisting, false, paths,
-	)
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "drained v0.13 callback outbox")
-	assert.ErrorContains(t, err, "no managed containers, retentions, or volumes")
-	assert.ErrorContains(t, err, "-initialize-storage-identity new")
-	assert.ErrorContains(t, err, "expected empty v0.13 substrate")
-	assert.ErrorContains(t, err, "not lost state")
-	assert.ErrorContains(t, err, "legacy callback outbox was fully drained")
+	t.Run("empty backend", func(t *testing.T) {
+		cfg := storageIdentityEvidenceTestConfig(t)
+		paths := bindStorageIdentityEvidenceTestPaths(t, cfg)
 
-	require.NoError(t, verifyStorageIdentityInitializationEvidence(
-		t.Context(), cfg, dockerClient, volumes, StorageIdentityInitializeNew,
-		backendidentity.InitializationProfileExisting, false, paths,
-	))
+		resuming, err := requireFreshStorageInitialization(cfg, paths, "daemon-system-a")
+		require.NoError(t, err)
+		assert.False(t, resuming)
+	})
 }
 
-func TestStorageIdentityEvidenceNeverSuggestsNewWithPendingLegacyCallback(t *testing.T) {
+func TestFreshStorageIdentityEvidenceRequiresDrainedCallbacksBeforeInventory(t *testing.T) {
 	cfg := storageIdentityEvidenceTestConfig(t)
 	writeLegacyCallbackStore(t, cfg.CallbackDBPath, map[string][]byte{
 		"550e8400-e29b-41d4-a716-446655440000": []byte(`{"status":"ready"}`),
@@ -66,13 +76,10 @@ func TestStorageIdentityEvidenceNeverSuggestsNewWithPendingLegacyCallback(t *tes
 	}
 	paths := bindStorageIdentityEvidenceTestPaths(t, cfg)
 
-	err := verifyStorageIdentityInitializationEvidence(
-		t.Context(), cfg, dockerClient, &mockVolumeManager{}, StorageIdentityInitializeAdopt,
-		backendidentity.InitializationProfileExisting, false, paths,
+	err := verifyFreshStorageIdentityEvidence(
+		t.Context(), dockerClient, &mockVolumeManager{}, false, paths,
 	)
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "requires a drained callback outbox")
-	assert.NotContains(t, err.Error(), "use new")
+	require.ErrorContains(t, err, "requires a drained callback outbox")
 }
 
 func TestInitializeStorageIdentityRejectsSeparateStoreParentReplacementBeforePublication(t *testing.T) {
@@ -111,7 +118,7 @@ func TestInitializeStorageIdentityRejectsSeparateStoreParentReplacementBeforePub
 	}
 
 	_, err := initializeStorageIdentityWithDependencies(
-		t.Context(), cfg, StorageIdentityInitializeNew, dockerClient, &mockVolumeManager{},
+		t.Context(), cfg, dockerClient, &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "releases storage parent changed during lineage proof")
@@ -141,11 +148,11 @@ func TestInitializeStorageIdentityCommittedRerunRejectsCompleteSameParentLineage
 	}
 
 	idA, err := initializeStorageIdentityWithDependencies(
-		t.Context(), lineageA, StorageIdentityInitializeNew, stableClient, &mockVolumeManager{},
+		t.Context(), lineageA, stableClient, &mockVolumeManager{},
 	)
 	require.NoError(t, err)
 	idB, err := initializeStorageIdentityWithDependencies(
-		t.Context(), lineageB, StorageIdentityInitializeNew, stableClient, &mockVolumeManager{},
+		t.Context(), lineageB, stableClient, &mockVolumeManager{},
 	)
 	require.NoError(t, err)
 	require.NotEqual(t, idA, idB, "the regression requires two independently sealed lineages")
@@ -168,7 +175,7 @@ func TestInitializeStorageIdentityCommittedRerunRejectsCompleteSameParentLineage
 	}
 
 	observed, err := initializeStorageIdentityWithDependencies(
-		t.Context(), lineageA, StorageIdentityInitializeNew, swappingClient, &mockVolumeManager{},
+		t.Context(), lineageA, swappingClient, &mockVolumeManager{},
 	)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, backendidentity.ErrMarkerBindingMismatch)
