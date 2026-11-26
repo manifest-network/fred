@@ -1155,27 +1155,13 @@ That resolved profile snapshot moves unchanged from operation intent to the
 live provision and successful release, then into any close/retention authority.
 Recovery uses the intent snapshot during the write-ahead window and the active
 release snapshot afterward; mutable SKU configuration cannot reprice an
-admitted generation. Supported v0.13 live rows are normalized by authority
-backfill before ordinary recovery. A service-name-less pre-stack cohort is
-rejected before mutation; an already stack-form cohort is checked against its
-active manifest and exact
-dense Docker labels, then its ordered items and canonical profiles are frozen by
-a whole-release compare-and-swap. Transitional items-only active releases are
-compare-and-swap backfilled against their exact version and items. Every
-backfill of an active Release (items and profiles, profiles alone, or the
-legacy runtime authority) writes through one store function, which orders its
-maintenance checks: a deploying maintenance target refuses every backfill, a
-backfill that would change nothing returns before any other check, and a
-backfill that would change the row is refused while the history holds any
-maintenance row, because re-encoding the history can compact one away. Local Docker
-evidence cannot prove that v0.13's requested highest instance index was not
-already missing, because the old release row omitted desired items. The provider
-therefore remains stopped until the placement preflight compares the backend's
-frozen workload with the height-pinned chain items (a custom domain the backend
-reports empty is accepted against any chain domain). Operators must
-keep the deployed v0.13 SKU mapping, numeric profiles, and Docker
-`container_tmpfs_size_mb` unchanged through that first successful upgraded
-startup.
+admitted generation. An active release adopted from v0.13 carries the
+ordered items, canonical profiles and tokenless runtime authority that the
+first 0.14 start recorded on it. This line records none of them from an
+observed cohort: recovery refuses to start on an active release that lacks its
+items (unless a pending operation supersedes it), its resource profiles, or the
+runtime authority of a cohort that still carries a callback pair, and names the
+lease. A service-name-less pre-stack cohort is rejected before mutation.
 
 Restore's source finalizer separately freezes the destination items, manifest,
 profiles, source generation, typed operation ID, and exact operation/lifecycle
@@ -1225,8 +1211,7 @@ surviving runtime after a replacement refusal, including an adopted v0.13
 runtime; an initial Failed operation has no predecessor authority. Pending
 operations and every maintenance, close, or closed phase have no representable
 publication capability. Publication re-attests both the Release and that sealed
-phase while holding the same gate used by operation settlement and the separate,
-pair-bound Release-backfill authority. Callback route, backend lineage, status,
+phase while holding the same gate used by operation settlement. Callback route, backend lineage, status,
 and retained state are never supplied by the actor. `shared.CallbackSender`
 cannot enqueue or settle anything. It only
 replays durable heads, performs HMAC HTTP delivery/retries, and precisely removes
@@ -1320,10 +1305,10 @@ here accepts the bare v0.13 array, and the runtime decoder rejects any history
 with more than one active row. This
 release does not write a
 migration marker or attempt a live single-container-to-Compose conversion.
-Only an already stack-form v0.13 cohort can be adopted: strict inventory and
-the active manifest must prove its complete dense topology before exact items,
-resource profiles, and tokenless runtime authority are backfilled. Pre-stack,
-`-prev`, or authorityless migration remnants stop startup before mutation.
+A lease adopted from v0.13 is a stack-form cohort whose active release already
+records its items, resource profiles, and tokenless runtime authority. Pre-stack
+cohorts and releases that record no such authority stop startup before
+mutation.
 
 Docker deprovision has an analogous close-tagged write-ahead finalizer in the
 non-expiring `callback_lease_mutation_heads` aggregate. Before the first
@@ -1558,15 +1543,11 @@ provision or restore operation can rotate it to operation-scoped typed callback
 authority.
 
 This is an anti-corruption boundary, not a tokenless mode in current lifecycle
-code. Stopped adoption only proves that each active v0.13 cohort's callback
-authority resolves and that its backfill fits; it persists no authority. The
-running docker-backend freezes that authority from a validated complete v0.13
-cohort into the distinct, zero-invalid `LegacyRuntimeAuthority` variant, during
-state recovery, at provision admission, or while classifying a failed
-provision's predecessor. Each of those mints a `LegacyRuntimeAuthorityFreeze`, which can
-exist only while the active Release has no runtime authority and is the only
-input the backfill accepts, so a recorded authority is never persisted again
-(ENG-1313). A restart, update, or custom-domain replacement of that lineage
+code. The 0.14 line recorded each adopted cohort's callback authority on its active
+Release as the distinct, zero-invalid `LegacyRuntimeAuthority` variant. This
+line never records one from an observed cohort: state recovery, provision
+admission, and the classification of a failed provision's predecessor all
+refuse a Release that records no runtime authority. A restart, update, or custom-domain replacement of that lineage
 carries a legacy authority forward at its request's callback base.
 Authenticated callback ingress recognizes an absent query capability only when
 it matches that migrated owner. Current operation constructors reject missing

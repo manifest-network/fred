@@ -299,8 +299,7 @@ rendered configuration on every host, not only the source template. Production
 environments must render `production_mode: true`; every Docker host with
 `volume_data_path` must also render the actual `volume_mount_path`; and disk
 capacity/tenant quotas must include one `container_tmpfs_size_mb` scratch charge
-per possible diskless instance. For a v0.13 cutover, freeze that value with the
-SKU profiles until each backend completes its first upgraded startup. Render one
+per possible diskless instance. Render one
 unique secret `K_i` into each backend's `callback_secret` and the matching
 provider `backends[].hmac_secret`; remove the provider's top-level
 `callback_secret` in production. Update the
@@ -350,8 +349,8 @@ multiple passes; it cannot consume the state/operation-recovery budget.
 
 Startup intentionally remains fail-closed if a retained v0.13 row lacks immutable
 resource profiles and its SKU has been removed from configuration: Fred cannot
-prove quota/accounting from that row. Preserve the original SKU profile through
-the stopped adoption and first upgraded start; do not substitute guessed limits
+prove quota/accounting from that row. Keep the original SKU profile configured
+until one start has recorded that row's sizing; do not substitute guessed limits
 or delete the retention row. Similarly, a directory in the managed `fred-*`
 namespace with an invalid volume name or unverifiable quota substrate must be
 attributed and corrected while stopped. An ordinary file/symlink is not adopted
@@ -1494,15 +1493,23 @@ initialization may have left a crash-resumable pending state or even completed
 the seal before a later check reports cancellation. Keep the backend stopped
 and rerun the same command against unchanged input.
 
-If recovery encounters an unbackfilled v0.13 Release alongside a pending new
-provision, it can supersede that row only after strict identity-bound inventory
-and the existing classifier verify the complete Ready candidate with its exact
-callback, topology, image, and principal identity. Empty, partial, failed, or
-older container cohorts do not supply the missing predecessor resource
-authority: recovery refuses before publishing a smaller reservation. This latent
-recovery case is not an alternative to the stopped cutover sequence above,
-which freezes the old cohort before admitting
-new operations. Preserve the journals and substrate on refusal; do not fill in
+Startup recovery refuses an active Release that the first 0.14 start never
+completed: one that records no items, no resource profiles, or no runtime
+authority while its containers still carry a callback pair. The error names the
+lease and wraps `the release predates the first 0.14 start; start the final 0.14
+release once to complete it`. Only the 0.14 line completes such a Release from
+its surviving cohort. Stop the backend, start the final 0.14 release against
+the same data and substrate until it reports ready, stop it, and start this
+release again. Every environment that ran 0.14 has already done that, so the
+refusal indicates a backend that skipped the 0.14 line or damaged journals.
+
+A Release that records no items alongside a pending new provision is the one
+exception: recovery can supersede that row, but only after strict
+identity-bound inventory and the existing classifier verify the complete Ready
+candidate with its exact callback, topology, image, and principal identity.
+Empty, partial, failed, or older container cohorts do not supply the missing
+predecessor resource authority: recovery refuses before publishing a smaller
+reservation. Preserve the journals and substrate on refusal; do not fill in
 Items by hand or delete the pending intent. The refusal stops startup on the
 affected backend and aborts its periodic recovery pass; it does not stop the
 other configured backends. An accounting hold alone is not a recovery path:
@@ -1610,17 +1617,6 @@ The marker detects replacement, not a simultaneously running full clone. A
 snapshot that includes both markers and complete Docker data or cluster state
 intentionally retains the same UUID. Fence the original node or cluster before
 starting the restored clone, and never copy markers onto replacement storage.
-
-Keep the exact deployed v0.13 `sku_mapping`, numeric `sku_profiles`, and
-`container_tmpfs_size_mb` through the first successful upgraded Docker-backend
-startup. Do not resize/remove a profile or change the scratch allowance in the
-cutover deployment: startup adoption uses that configuration to freeze supported
-stack-form v0.13 generations into ordered release items and canonical resource
-snapshots. For each v0.13 `disk_mb: 0` instance it pins the cutover
-`container_tmpfs_size_mb` as scratch once; later configuration changes do not
-reprice it. After startup succeeds, back up the resulting
-`releases.db`, `retention.db`, `callbacks.db`, and marker pair with the matching
-substrate before making later profile changes.
 
 v0.13.0 allowed an explicit
 `callback_max_age: 0`; before restarting each upgraded backend, replace that

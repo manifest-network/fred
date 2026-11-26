@@ -285,7 +285,7 @@ func (b *Backend) routeReplaceRestart(
 	}
 	if len(resourceProfiles) == 0 {
 		var profileErr error
-		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, leaseUUID, authorityItems)
+		resourceProfiles, profileErr = b.activeResourceProfiles(leaseUUID, authorityItems)
 		if profileErr != nil {
 			return fmt.Errorf("resolve restart resource profiles: %w", profileErr)
 		}
@@ -601,7 +601,7 @@ func (b *Backend) update(
 	b.provisionsMu.Unlock()
 	if len(resourceProfiles) == 0 {
 		var profileErr error
-		resourceProfiles, profileErr = b.activeResourceProfiles(ctx, req.LeaseUUID, items)
+		resourceProfiles, profileErr = b.activeResourceProfiles(req.LeaseUUID, items)
 		if profileErr != nil {
 			return fmt.Errorf("%w: resolve update resource profiles: %w", backend.ErrInvalidState, profileErr)
 		}

@@ -19,8 +19,8 @@
 //     memory.
 //   - Settlement capabilities bound to one exact journal pair, the only way to
 //     change that authority: OperationSettlement, MaintenanceSettlement,
-//     CloseSettlement, RestoreSettlement and ReleaseBackfiller, plus
-//     RecoveryCoordinator for lease-scoped recovery
+//     CloseSettlement and RestoreSettlement, plus RecoveryCoordinator for
+//     lease-scoped recovery
 //   - CallbackPublisher (callback_publisher.go) — commits each operation and
 //     maintenance result and its outbox entry in one transaction (close
 //     results commit through CloseSettlement); CallbackSender

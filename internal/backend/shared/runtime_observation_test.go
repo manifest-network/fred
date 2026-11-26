@@ -4,15 +4,12 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/manifest-network/fred/internal/backend"
 )
 
 func successfulRuntimeForObservationTest(
@@ -233,137 +230,6 @@ func TestRuntimeObservationPermitReattestsMutationPhase(t *testing.T) {
 	assert.Empty(t, pending)
 }
 
-func TestRuntimeObservationPermitSerializesReleaseBackfillWithCallbackGate(t *testing.T) {
-	fixture := newCallbackPublisherFixture(t, "docker-a")
-	leaseUUID := testLeaseUUID("runtime-observation-backfill")
-	release := validRuntimeAuthorityRelease()
-	require.NoError(t, fixture.stores.releases.appendActive(leaseUUID, release))
-	active, err := fixture.stores.releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	proof, err := fixture.stores.releases.ProveRuntimeGeneration(leaseUUID)
-	require.NoError(t, err)
-	permit := authorizeRuntimeObservationForTest(t, fixture.publisher, proof)
-
-	unlock := fixture.stores.callbacks.lockDeliveryLease(leaseUUID)
-	backfiller, err := NewReleaseBackfiller(
-		fixture.stores.callbacks, fixture.stores.releases,
-	)
-	require.NoError(t, err)
-	backfillDone := make(chan error, 1)
-	go func() {
-		backfillDone <- backfiller.BackfillActiveResourceProfilesContext(
-			context.Background(), leaseUUID, active.Version, active.Items,
-			active.ResourceProfiles,
-		)
-	}()
-	select {
-	case backfillErr := <-backfillDone:
-		t.Fatalf("release backfill bypassed the callback lease gate: %v", backfillErr)
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlock()
-	require.NoError(t, <-backfillDone)
-
-	err = fixture.publisher.PublishLifecycleFailureContext(
-		context.Background(), permit, "observation after idempotent backfill",
-	)
-	require.NoError(t, err)
-	pending, listErr := fixture.stores.callbacks.ListPending()
-	require.NoError(t, listErr)
-	require.Len(t, pending, 1)
-}
-
-func TestReleaseBackfillerSerializesActualMutationWithCallbackGate(t *testing.T) {
-	fixture := newCallbackPublisherFixture(t, "docker-a")
-	leaseUUID := testLeaseUUID("release-backfill-actual-mutation")
-	legacy := Release{
-		Manifest:  []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
-		Image:     "stack",
-		Status:    "active",
-		CreatedAt: time.Now().UTC(),
-	}
-	require.NoError(t, fixture.stores.releases.append(leaseUUID, legacy))
-	active, err := fixture.stores.releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-	items := []backend.LeaseItem{{SKU: "sku-a", ServiceName: "app", Quantity: 1}}
-	profiles := []SKUResourceSnapshot{{SKU: "sku-a", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
-
-	backfiller, err := NewReleaseBackfiller(
-		fixture.stores.callbacks, fixture.stores.releases,
-	)
-	require.NoError(t, err)
-	unblock := fixture.stores.callbacks.lockDeliveryLease(leaseUUID)
-	var unblockOnce sync.Once
-	releaseGate := func() { unblockOnce.Do(unblock) }
-	t.Cleanup(releaseGate)
-	result := make(chan error, 1)
-	go func() {
-		result <- backfiller.BackfillLegacyActiveAuthorityContext(
-			context.Background(), leaseUUID, *active, items, profiles,
-		)
-	}()
-	require.Eventually(t, func() bool {
-		fixture.stores.callbacks.deliveryLocksMu.Lock()
-		defer fixture.stores.callbacks.deliveryLocksMu.Unlock()
-		lock := fixture.stores.callbacks.deliveryLocks[leaseUUID]
-		return lock != nil && lock.refs == 2
-	}, time.Second, time.Millisecond, "actual release mutation never queued on the callback gate")
-	releaseGate()
-	require.NoError(t, <-result)
-
-	backfilled, err := fixture.stores.releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, backfilled)
-	assert.Equal(t, items, backfilled.Items)
-	assert.Equal(t, profiles, backfilled.ResourceProfiles)
-}
-
-func TestReleaseBackfillerContextCancellationCannotOutliveOwner(t *testing.T) {
-	fixture := newCallbackPublisherFixture(t, "docker-a")
-	leaseUUID := testLeaseUUID("release-backfill-context-cancel")
-	release := validRuntimeAuthorityRelease()
-	require.NoError(t, fixture.stores.releases.appendActive(leaseUUID, release))
-	active, err := fixture.stores.releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, active)
-
-	backfiller, err := NewReleaseBackfiller(
-		fixture.stores.callbacks, fixture.stores.releases,
-	)
-	require.NoError(t, err)
-	unblock := fixture.stores.callbacks.lockDeliveryLease(leaseUUID)
-	var unblockOnce sync.Once
-	releaseGate := func() { unblockOnce.Do(unblock) }
-	t.Cleanup(releaseGate)
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		result <- backfiller.BackfillActiveResourceProfilesContext(
-			ctx, leaseUUID, active.Version, active.Items, active.ResourceProfiles,
-		)
-	}()
-	require.Eventually(t, func() bool {
-		fixture.stores.callbacks.deliveryLocksMu.Lock()
-		defer fixture.stores.callbacks.deliveryLocksMu.Unlock()
-		lock := fixture.stores.callbacks.deliveryLocks[leaseUUID]
-		return lock != nil && lock.refs == 2
-	}, time.Second, time.Millisecond, "release backfill never queued on the per-lease gate")
-	cancel()
-	select {
-	case err := <-result:
-		require.ErrorIs(t, err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("canceled release backfill remained blocked on the per-lease gate")
-	}
-	releaseGate()
-
-	after, err := fixture.stores.releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.Equal(t, active, after)
-}
-
 func TestRuntimeObservationPermitAllowsCurrentRuntimeWithoutHead(t *testing.T) {
 	fixture := newCallbackPublisherFixture(t, "docker-a")
 	spec, proof := successfulRuntimeForObservationTest(
@@ -493,47 +359,14 @@ func TestRuntimeObservationPermitIsRevokedByStoreCloseAndReopen(t *testing.T) {
 func TestJournalPairConstructionRejectsClosedStores(t *testing.T) {
 	t.Run("callback", func(t *testing.T) {
 		fixture := newCallbackPublisherFixture(t, "docker-a")
-		backfiller, err := NewReleaseBackfiller(
-			fixture.stores.callbacks, fixture.stores.releases,
-		)
-		require.NoError(t, err)
 		require.NoError(t, fixture.stores.callbacks.Close())
-		_, err = NewOperationSettlement(fixture.stores.callbacks, fixture.stores.releases)
+		_, err := NewOperationSettlement(fixture.stores.callbacks, fixture.stores.releases)
 		require.ErrorContains(t, err, "exact identity-bound")
-		_, err = NewReleaseBackfiller(fixture.stores.callbacks, fixture.stores.releases)
-		require.ErrorContains(t, err, "exact identity-bound")
-		require.ErrorContains(t, backfiller.BackfillActiveResourceProfilesContext(
-			context.Background(), testLeaseUUID("closed-backfiller"), 1, nil, nil,
-		), "open journal pair")
 	})
 	t.Run("release", func(t *testing.T) {
 		fixture := newCallbackPublisherFixture(t, "docker-a")
-		backfiller, err := NewReleaseBackfiller(
-			fixture.stores.callbacks, fixture.stores.releases,
-		)
-		require.NoError(t, err)
 		require.NoError(t, fixture.stores.releases.Close())
-		_, err = NewOperationSettlement(fixture.stores.callbacks, fixture.stores.releases)
+		_, err := NewOperationSettlement(fixture.stores.callbacks, fixture.stores.releases)
 		require.ErrorContains(t, err, "exact identity-bound")
-		_, err = NewReleaseBackfiller(fixture.stores.callbacks, fixture.stores.releases)
-		require.ErrorContains(t, err, "exact identity-bound")
-		require.ErrorContains(t, backfiller.BackfillLegacyRuntimeAuthorityContext(
-			context.Background(), LegacyRuntimeAuthorityFreeze{},
-		), "open journal pair")
 	})
-}
-
-func TestReleaseBackfillerExposesContextBoundAuthorityOnly(t *testing.T) {
-	typeOf := reflect.TypeFor[*ReleaseBackfiller]()
-	want := map[string]struct{}{
-		"BackfillActiveResourceProfilesContext": {},
-		"BackfillLegacyActiveAuthorityContext":  {},
-		"BackfillLegacyRuntimeAuthorityContext": {},
-	}
-	require.Equal(t, len(want), typeOf.NumMethod())
-	for index := range typeOf.NumMethod() {
-		method := typeOf.Method(index)
-		_, expected := want[method.Name]
-		assert.True(t, expected, "ReleaseBackfiller exposes unexpected method %s", method.Name)
-	}
 }

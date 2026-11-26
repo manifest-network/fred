@@ -342,9 +342,6 @@ func newOperationIntentRecoveryBackend(
 	b.callbackStore = store
 	releaseStore, retentionStore, settlement, restoreSettlement, closeSettlement := operationHandoffForCallbackTest(t, store)
 	b.releaseStore = releaseStore
-	backfiller, err := shared.NewReleaseBackfiller(store, releaseStore)
-	require.NoError(t, err)
-	b.releaseBackfiller = backfiller
 	b.operationSettlement = settlement
 	b.retentionStore = retentionStore
 	b.restoreSettlement = restoreSettlement
@@ -1382,7 +1379,7 @@ func TestRecoverOperationIntent_PausedProvisionWithoutHealthCheckCannotWedgeStar
 	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
 }
 
-func TestRecoverOperationIntent_NonterminalCandidateFreezesLegacyPredecessorBeforeTeardown(t *testing.T) {
+func TestRecoverOperationIntent_NonterminalCandidateKeepsLegacyPredecessorAuthorityThroughTeardown(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
 	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
@@ -1394,7 +1391,7 @@ func TestRecoverOperationIntent_NonterminalCandidateFreezesLegacyPredecessorBefo
 	predecessorSpec := candidate
 	predecessorSpec.CallbackURL = "https://legacy.example/callbacks/provision?route=v013"
 	predecessorSpec.LifecycleCallbackURL = ""
-	seedV013OperationReleaseForTest(t, store, candidate.LeaseUUID, shared.Release{
+	seedAdoptedOperationReleaseForTest(t, store, predecessorSpec, shared.Release{
 		Manifest:         slices.Clone(predecessorSpec.Manifest),
 		Image:            "stack",
 		Items:            slices.Clone(predecessorSpec.Items),
@@ -1464,7 +1461,7 @@ func TestRecoverOperationIntent_NonterminalCandidateRejectsContradictoryPredeces
 	predecessorSpec := candidate
 	predecessorSpec.CallbackURL = "https://legacy.example/callbacks/provision?route=v013"
 	predecessorSpec.LifecycleCallbackURL = ""
-	seedV013OperationReleaseForTest(t, store, candidate.LeaseUUID, shared.Release{
+	seedAdoptedOperationReleaseForTest(t, store, predecessorSpec, shared.Release{
 		Manifest:         slices.Clone(predecessorSpec.Manifest),
 		Image:            "stack",
 		Items:            slices.Clone(predecessorSpec.Items),
@@ -1498,7 +1495,7 @@ func TestRecoverOperationIntent_NonterminalCandidateRejectsContradictoryPredeces
 	warnings := captureOperationRecoveryWarnings(b)
 	err = b.recoverOperationIntents(ctx)
 	require.NoError(t, err)
-	require.Contains(t, warnings.String(), "different tenant or provider")
+	require.Contains(t, warnings.String(), "identity differs from its active release")
 	assert.Zero(t, teardownCalls, "contradictory predecessor evidence cannot mint lease-wide teardown authority")
 	intents, listErr := listOperationIntentsForCallbackTest(t, store)
 	require.NoError(t, listErr)
@@ -1509,8 +1506,72 @@ func TestRecoverOperationIntent_NonterminalCandidateRejectsContradictoryPredeces
 	active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
 	require.NoError(t, readErr)
 	require.NotNil(t, active)
+	require.NotNil(t, active.LegacyRuntimeAuthority)
+	assert.Equal(t, predecessorSpec.CallbackURL, active.LegacyRuntimeAuthority.CallbackURL(),
+		"contradictory observations must not replace the recorded predecessor authority")
+}
+
+// A predecessor release that records no runtime authority is one the first
+// 0.14 start never completed. Recovery no longer completes it from the
+// surviving cohort: it keeps the intent and tears nothing down.
+func TestRecoverOperationIntent_PredecessorWithoutRecordedAuthorityIsRefusedBeforeTeardown(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	candidate := dockerOperationIntentSpec(t, storageID)
+	predecessorSpec := candidate
+	predecessorSpec.CallbackURL = "https://legacy.example/callbacks/provision?route=v013"
+	predecessorSpec.LifecycleCallbackURL = ""
+	seedV013OperationReleaseForTest(t, store, candidate.LeaseUUID, shared.Release{
+		Manifest:         slices.Clone(predecessorSpec.Manifest),
+		Image:            "stack",
+		Items:            slices.Clone(predecessorSpec.Items),
+		ResourceProfiles: shared.CloneSKUResourceSnapshot(predecessorSpec.ResourceProfiles),
+		Status:           "active",
+		CreatedAt:        time.Now().Add(-time.Hour),
+	})
+	_, err = beginDockerTestOperationIntent(t, store, candidate, storageID)
+	require.NoError(t, err)
+	predecessor := dockerIntentContainer(
+		predecessorSpec, "predecessor-container", predecessorSpec.Items[0].SKU, 0,
+	)
+	current := dockerIntentContainer(candidate, "candidate-container", candidate.Items[0].SKU, 0)
+	current.Status = "created"
+	b := newOperationIntentRecoveryBackend(
+		t, store, storageID, []ContainerInfo{predecessor, current},
+		readyIntentProjection(candidate, current.ContainerID),
+	)
+	b.cfg.ContainerStartTimeout = time.Minute
+	b.cfg.ProvisionTimeout = time.Minute
+	teardownCalls := 0
+	b.compose = &mockComposeExecutor{DownFn: func(context.Context, string, time.Duration) error {
+		teardownCalls++
+		return nil
+	}}
+	forbidOperationRecoveryTeardown(t, b)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	warnings := captureOperationRecoveryWarnings(b)
+	err = b.recoverOperationIntents(ctx)
+	require.NoError(t, err)
+	require.Contains(t, warnings.String(), "exists without exact predecessor authority")
+	assert.Zero(t, teardownCalls, "a predecessor that records no runtime authority grants no teardown authority")
+	intents, listErr := listOperationIntentsForCallbackTest(t, store)
+	require.NoError(t, listErr)
+	assert.Len(t, intents, 1)
+	pending, listErr := store.ListPending()
+	require.NoError(t, listErr)
+	assert.Empty(t, pending)
+	active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
+	require.NoError(t, readErr)
+	require.NotNil(t, active)
 	assert.Nil(t, active.LegacyRuntimeAuthority,
-		"contradictory observations must not be frozen into durable predecessor authority")
+		"recovery must not record an authority it observed on the surviving cohort")
 }
 
 func TestStart_CreatedProvisionIntentConvergesInsteadOfRestartLoop(t *testing.T) {
@@ -3264,7 +3325,7 @@ func TestRecoverOperationIntent_PredecessorSubsetRestoresReleaseAndLeavesUnattri
 		"a candidate-only path is preserved for operator attribution, never inferred disposable")
 }
 
-func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(t *testing.T) {
+func TestRecoverOperationIntent_LegacyPredecessorKeepsAuthorityThroughTeardown(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
 	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
@@ -3294,7 +3355,7 @@ func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(
 		ResourceProfiles:     oldProfiles,
 		Manifest:             oldManifest,
 	}
-	seedV013OperationReleaseForTest(t, store, candidate.LeaseUUID, shared.Release{
+	seedAdoptedOperationReleaseForTest(t, store, oldSpec, shared.Release{
 		Manifest:         oldManifest,
 		Image:            "stack",
 		Items:            slices.Clone(oldItems),
@@ -3313,11 +3374,6 @@ func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(
 	b.cfg.ProvisionTimeout = time.Nanosecond
 
 	require.NoError(t, b.recoverState(context.Background()))
-	beforeBackfill, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
-	require.NoError(t, readErr)
-	require.NotNil(t, beforeBackfill)
-	require.Nil(t, beforeBackfill.LegacyRuntimeAuthority,
-		"accounting the immutable predecessor must not manufacture teardown authority")
 	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-0"))
 	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
 	require.NotNil(t, b.pool.GetAllocation(candidate.LeaseUUID+"-replacement-0"),
@@ -3327,7 +3383,7 @@ func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(
 	require.NoError(t, readErr)
 	require.NotNil(t, active)
 	require.NotNil(t, active.LegacyRuntimeAuthority,
-		"legacy identity must commit before teardown removes its last witness")
+		"the recorded legacy identity must survive the teardown of its last witness")
 	assert.Equal(t, oldSpec.Tenant, active.LegacyRuntimeAuthority.Tenant())
 	assert.Equal(t, oldSpec.ProviderUUID, active.LegacyRuntimeAuthority.ProviderUUID())
 	assert.Equal(t, oldSpec.CallbackURL, active.LegacyRuntimeAuthority.CallbackURL())
@@ -3374,7 +3430,7 @@ func TestRecoverOperationIntent_LegacyPredecessorFreezesAuthorityBeforeTeardown(
 	assert.NotNil(t, fresh.pool.GetAllocation(candidate.LeaseUUID+"-app-1"))
 }
 
-func TestRecoverState_ProactivelyFreezesCompleteLegacyRuntimeAuthority(t *testing.T) {
+func TestRecoverState_AdoptedLeaseRecoversFromItsRecordedAuthorityWithoutContainers(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)
 	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
@@ -3394,7 +3450,7 @@ func TestRecoverState_ProactivelyFreezesCompleteLegacyRuntimeAuthority(t *testin
 		ResourceProfiles:     profiles,
 		Manifest:             validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
 	}
-	seedV013OperationReleaseForTest(t, store, legacySpec.LeaseUUID, shared.Release{
+	seedAdoptedOperationReleaseForTest(t, store, legacySpec, shared.Release{
 		Manifest:         legacySpec.Manifest,
 		Image:            "stack",
 		Items:            slices.Clone(items),
@@ -3449,7 +3505,7 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 				containers[1].CallbackURL = "https://other.example/callbacks/provision"
 				return containers
 			},
-			want: "mixed callback identities",
+			want: "does not exactly match the candidate or predecessor callback identity",
 		},
 		{
 			name: "foreign principal",
@@ -3457,7 +3513,7 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 				containers[1].Tenant = "tenant-b"
 				return containers
 			},
-			want: "different tenant or provider",
+			want: "identity differs from its active release",
 		},
 		{
 			name: "out of release instance",
@@ -3489,7 +3545,7 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 				ResourceProfiles:     oldProfiles,
 				Manifest:             validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
 			}
-			seedV013OperationReleaseForTest(t, store, candidate.LeaseUUID, shared.Release{
+			seedAdoptedOperationReleaseForTest(t, store, oldSpec, shared.Release{
 				Manifest:         oldSpec.Manifest,
 				Image:            "stack",
 				Items:            slices.Clone(oldItems),
@@ -3522,8 +3578,9 @@ func TestRecoverOperationIntentRejectsAmbiguousLegacyPredecessor(t *testing.T) {
 			active, readErr := b.releaseStore.LatestActive(candidate.LeaseUUID)
 			require.NoError(t, readErr)
 			require.NotNil(t, active)
-			assert.Nil(t, active.LegacyRuntimeAuthority,
-				"ambiguous evidence must not be promoted into durable teardown authority")
+			require.NotNil(t, active.LegacyRuntimeAuthority)
+			assert.Equal(t, oldSpec.CallbackURL, active.LegacyRuntimeAuthority.CallbackURL(),
+				"ambiguous evidence must not replace the recorded authority")
 		})
 	}
 }

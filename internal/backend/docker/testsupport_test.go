@@ -378,7 +378,37 @@ func operationHandoffForCallbackTest(
 // row produced by stopped v0.13 adoption before the ReleaseStore is opened.
 // Keeping the compatibility fixture at the file boundary avoids exposing a
 // runtime API that can manufacture one.
+// seedV013OperationReleaseForTest writes an active release that records no
+// runtime authority: one the first 0.14 start never completed.
 func seedV013OperationReleaseForTest(
+	t *testing.T,
+	callbacks *shared.CallbackStore,
+	leaseUUID string,
+	release shared.Release,
+) {
+	t.Helper()
+	require.Nil(t, release.LegacyRuntimeAuthority)
+	seedOperationReleaseRowForTest(t, callbacks, leaseUUID, release)
+}
+
+// seedAdoptedOperationReleaseForTest writes the active release of a lease
+// adopted from v0.13, with the tokenless runtime authority of spec recorded.
+func seedAdoptedOperationReleaseForTest(
+	t *testing.T,
+	callbacks *shared.CallbackStore,
+	spec shared.OperationIntentSpec,
+	release shared.Release,
+) {
+	t.Helper()
+	authority, err := shared.NewLegacyRuntimeAuthority(
+		spec.Tenant, spec.ProviderUUID, spec.CallbackURL, spec.LifecycleCallbackURL,
+	)
+	require.NoError(t, err)
+	release.LegacyRuntimeAuthority = &authority
+	seedOperationReleaseRowForTest(t, callbacks, spec.LeaseUUID, release)
+}
+
+func seedOperationReleaseRowForTest(
 	t *testing.T,
 	callbacks *shared.CallbackStore,
 	leaseUUID string,
@@ -392,7 +422,6 @@ func seedV013OperationReleaseForTest(
 	defer authority.mu.Unlock()
 	require.Nil(t, authority.releases, "legacy release fixture must precede journal-pair open")
 	require.Nil(t, release.RuntimeAuthority)
-	require.Nil(t, release.LegacyRuntimeAuthority)
 	require.False(t, release.OperationID.Valid())
 	require.Equal(t, "active", release.Status)
 	if release.Version == 0 {
@@ -473,14 +502,11 @@ func bindBackendToOperationIntentTestStore(
 	require.NotNil(t, closeSettlement)
 	maintenance, err := shared.NewMaintenanceSettlement(callbacks, releases)
 	require.NoError(t, err)
-	backfiller, err := shared.NewReleaseBackfiller(callbacks, releases)
-	require.NoError(t, err)
 
 	b.callbackStore = callbacks
 	b.releaseStore = releases
 	b.retentionStore = retentions
 	b.operationSettlement = operations
-	b.releaseBackfiller = backfiller
 	b.restoreSettlement = restore
 	b.maintenanceSettlement = maintenance
 	b.closeSettlement = closeSettlement
@@ -781,14 +807,11 @@ func bindBackendToRetentionFixtureStore(
 	authority.backend = b
 	maintenance, err := shared.NewMaintenanceSettlement(authority.callbacks, authority.releases)
 	require.NoError(t, err)
-	backfiller, err := shared.NewReleaseBackfiller(authority.callbacks, authority.releases)
-	require.NoError(t, err)
 
 	b.callbackStore = authority.callbacks
 	b.releaseStore = authority.releases
 	b.retentionStore = retentions
 	b.operationSettlement = authority.operations
-	b.releaseBackfiller = backfiller
 	b.restoreSettlement = authority.restore
 	b.maintenanceSettlement = maintenance
 	b.closeSettlement = authority.close
@@ -1518,11 +1541,6 @@ func attachBoundOperationHandoffStores(t *testing.T, b *Backend) {
 			b.operationSettlement = settlement
 			bindExecutors = true
 		}
-		if b.releaseBackfiller == nil {
-			backfiller, err := shared.NewReleaseBackfiller(b.callbackStore, b.releaseStore)
-			require.NoError(t, err)
-			b.releaseBackfiller = backfiller
-		}
 		if b.restoreSettlement == nil {
 			operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
 			require.True(t, ok)
@@ -1602,9 +1620,6 @@ func attachBoundOperationHandoffStores(t *testing.T, b *Backend) {
 	settlement, err := shared.NewOperationSettlement(callbacks, releases)
 	require.NoError(t, err)
 	b.operationSettlement = settlement
-	backfiller, err := shared.NewReleaseBackfiller(callbacks, releases)
-	require.NoError(t, err)
-	b.releaseBackfiller = backfiller
 	restore, err := shared.NewRestoreSettlement(settlement, retentions)
 	require.NoError(t, err)
 	b.restoreSettlement = restore
@@ -2151,9 +2166,6 @@ func bindTestStorageIdentityAt(t *testing.T, b *Backend, dockerClient *mockDocke
 	b.operationSettlement = noopOperationIntentJournal{
 		store: callbacks, operationSettlementService: operations,
 	}
-	backfiller, err := shared.NewReleaseBackfiller(callbacks, releases)
-	require.NoError(t, err)
-	b.releaseBackfiller = backfiller
 	b.restoreSettlement = restore
 	b.maintenanceSettlement = maintenance
 	b.closeSettlement = closeSettlement
@@ -2604,6 +2616,21 @@ func (f *fakeReleaseStore) seedV013Releases(
 	releases map[string]shared.Release,
 ) {
 	t.Helper()
+	for _, release := range releases {
+		require.Nil(t, release.RuntimeAuthority)
+		require.Nil(t, release.LegacyRuntimeAuthority)
+		require.False(t, release.OperationID.Valid())
+	}
+	f.seedReleaseRows(t, releases)
+}
+
+// seedReleaseRows writes each release as its lease's whole history, below the
+// store API, then reopens the store and rebuilds what is bound to it.
+func (f *fakeReleaseStore) seedReleaseRows(
+	t *testing.T,
+	releases map[string]shared.Release,
+) {
+	t.Helper()
 	require.NotNil(t, f.Store)
 	require.NotNil(t, f.backend)
 	require.NotNil(t, f.authority)
@@ -2618,9 +2645,6 @@ func (f *fakeReleaseStore) seedV013Releases(
 			return errors.New("v0.13 release fixture: releases bucket is missing")
 		}
 		for leaseUUID, release := range releases {
-			require.Nil(t, release.RuntimeAuthority)
-			require.Nil(t, release.LegacyRuntimeAuthority)
-			require.False(t, release.OperationID.Valid())
 			if release.Version == 0 {
 				release.Version = 1
 			}
@@ -2655,9 +2679,6 @@ func (f *fakeReleaseStore) seedV013Releases(
 	)
 	require.NoError(t, err)
 	f.backend.operationSettlement = operations
-	backfiller, err := shared.NewReleaseBackfiller(f.backend.callbackStore, store)
-	require.NoError(t, err)
-	f.backend.releaseBackfiller = backfiller
 	f.backend.restoreSettlement = restore
 	f.backend.maintenanceSettlement = maintenance
 	f.backend.closeSettlement = closeSettlement

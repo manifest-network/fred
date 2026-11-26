@@ -594,6 +594,14 @@ func (b *Backend) changedProvisionRecoveryLeases(
 	return changed
 }
 
+// errIncompleteStoredRelease means an active release lacks a fact every release
+// has carried since the first 0.14 start: its items, its resource profiles, or
+// its runtime authority. Only the final 0.14 release completes such a release,
+// so this one refuses to start on it rather than guess the missing fact.
+var errIncompleteStoredRelease = errors.New(
+	"the release predates the first 0.14 start; start the final 0.14 release once to complete it",
+)
+
 // recoverState rebuilds in-memory state from Docker containers.
 // Handles multi-unit leases by grouping containers by lease UUID.
 // Merges with existing state to preserve in-flight provisions.
@@ -823,53 +831,16 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			}
 			if len(release.Items) == 0 {
 				if _, pending := pendingIntentLeases[leaseUUID]; !pending {
-					items, deriveErr := deriveV013ActiveReleaseItems(
-						release,
-						containersByLease[leaseUUID],
+					return fmt.Errorf(
+						"active release for lease %q records no items: %w", leaseUUID, errIncompleteStoredRelease,
 					)
-					if deriveErr != nil {
-						return fmt.Errorf(
-							"derive v0.13 active release authority for lease %q: %w",
-							leaseUUID,
-							deriveErr,
-						)
-					}
-					resourceProfiles, profileErr := b.resolveResourceProfiles(items)
-					if profileErr != nil {
-						return fmt.Errorf(
-							"freeze v0.13 active release resource profiles for lease %q: %w",
-							leaseUUID,
-							profileErr,
-						)
-					}
-					if backfillErr := b.releaseBackfiller.BackfillLegacyActiveAuthorityContext(
-						ctx, leaseUUID,
-						*release,
-						items,
-						resourceProfiles,
-					); backfillErr != nil {
-						return fmt.Errorf(
-							"persist v0.13 active release authority for lease %q: %w",
-							leaseUUID,
-							backfillErr,
-						)
-					}
-					release.Items = items
-					release.ResourceProfiles = resourceProfiles
 				}
 			}
 			releasesByLease[leaseUUID] = release
 			if len(release.Items) > 0 && len(release.ResourceProfiles) == 0 {
-				resourceProfiles, profileErr := b.resolveResourceProfiles(release.Items)
-				if profileErr != nil {
-					return fmt.Errorf("resolve v0.13 active release resource profiles for lease %q: %w", leaseUUID, profileErr)
-				}
-				if profileErr := b.releaseBackfiller.BackfillActiveResourceProfilesContext(
-					ctx, leaseUUID, release.Version, release.Items, resourceProfiles,
-				); profileErr != nil {
-					return fmt.Errorf("backfill v0.13 active release resource profiles for lease %q: %w", leaseUUID, profileErr)
-				}
-				release.ResourceProfiles = resourceProfiles
+				return fmt.Errorf(
+					"active release for lease %q records no resource profiles: %w", leaseUUID, errIncompleteStoredRelease,
+				)
 			}
 			if len(release.ResourceProfiles) > 0 {
 				if profileErr := validateDockerResourceProfiles(release.Items, release.ResourceProfiles); profileErr != nil {
@@ -879,8 +850,8 @@ func (b *Backend) recoverState(ctx context.Context) error {
 			if proof, ok := runtimeGenerationProofs[leaseUUID]; ok &&
 				!proof.MatchesRelease(*release) {
 				// Inventory must be interpreted only against the release generation
-				// captured before that inventory began. A maintenance commit or
-				// same-version legacy backfill invalidates this pass's observation.
+				// captured before that inventory began. A maintenance commit
+				// invalidates this pass's observation.
 				delete(runtimeGenerationProofs, leaseUUID)
 			}
 			if _, pending := pendingIntentLeases[leaseUUID]; pending {
@@ -890,39 +861,14 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				cohortIssues[leaseUUID] = cohortErr
 				continue
 			}
-			// A complete v0.13 cohort is the last place its tokenless principal
-			// and callback pair can be proven without inference. Freeze that identity
-			// proactively, before an ordinary runtime failure or later replacement can
-			// remove the last container. Callbackless pre-label cohorts remain on the
-			// older conservative path because no callback authority can be minted.
+			// A release with no runtime authority whose cohort still carries a
+			// callback identity is one that the first 0.14 start never completed.
 			if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
-				release.LegacyRuntimeAuthority == nil && len(containersByLease[leaseUUID]) > 0 {
-				pair := callbackPairs[leaseUUID]
-				if pair.callbackURL != "" {
-					identity := containersByLease[leaseUUID][0]
-					legacyAuthority, authorityErr := shared.NewLegacyRuntimeAuthority(
-						identity.Tenant,
-						identity.ProviderUUID,
-						pair.callbackURL,
-						pair.lifecycleCallbackURL,
-					)
-					if authorityErr != nil {
-						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
-							leaseUUID, authorityErr)
-					}
-					freeze, freezeErr := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *release, legacyAuthority)
-					if freezeErr != nil {
-						return fmt.Errorf("freeze v0.13 runtime authority for lease %q: %w",
-							leaseUUID, freezeErr)
-					}
-					if backfillErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-						ctx, freeze,
-					); backfillErr != nil {
-						return fmt.Errorf("persist v0.13 runtime authority for lease %q: %w",
-							leaseUUID, backfillErr)
-					}
-					release.LegacyRuntimeAuthority = &legacyAuthority
-				}
+				release.LegacyRuntimeAuthority == nil && len(containersByLease[leaseUUID]) > 0 &&
+				callbackPairs[leaseUUID].callbackURL != "" {
+				return fmt.Errorf(
+					"active release for lease %q records no runtime authority: %w", leaseUUID, errIncompleteStoredRelease,
+				)
 			}
 		}
 	}
@@ -969,12 +915,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 						resourceProfiles = release.ResourceProfiles
 					} else if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
 						release.LegacyRuntimeAuthority == nil {
-						// Transitional v0.13 rows can reach this pass before their
-						// tokenless identity has been frozen. Sizing a visibly
+						// A release that records no runtime authority can reach this
+						// pass under a pending operation. Sizing a visibly
 						// non-candidate survivor from the immutable active Release is
 						// conservative accounting only; the strict intent classifier
-						// still proves principal, callback pair, image, and exact instance
-						// membership before granting teardown authority.
+						// refuses such a predecessor before any teardown.
 						resourceProfiles = release.ResourceProfiles
 					}
 				}
@@ -1244,8 +1189,7 @@ func (b *Backend) recoverState(ctx context.Context) error {
 				return fmt.Errorf("pending provision predecessor for lease %q has divergent resource authority", leaseUUID)
 			}
 			if legacySizingOnly && len(predecessor.Items) == 0 {
-				// Stopped v0.13 adoption leaves no sizing until its first ordinary
-				// recovery; a pending operation deliberately prevents that backfill.
+				// A predecessor the first 0.14 start never sized has no items.
 				// Only the existing classifier's exact Ready candidate may supersede
 				// this row without predecessor authority. Empty/partial/failed or
 				// older substrate must refuse before publishing a smaller envelope.
@@ -1264,11 +1208,11 @@ func (b *Backend) recoverState(ctx context.Context) error {
 					return fmt.Errorf("unsized pending provision predecessor for lease %q requires an exact ready candidate", leaseUUID)
 				}
 			} else {
-				// A normalized v0.13 Release can carry frozen sizing before recovery
-				// has persisted its runtime identity. Reserving that complete cohort is
-				// conservative accounting only, as for legacy survivors above. It does
-				// not grant teardown authority: the strict operation classifier must
-				// still validate the survivor and freeze its identity before cleanup.
+				// A predecessor can record sizing without a runtime identity.
+				// Reserving that complete cohort is conservative accounting only, as
+				// for legacy survivors above. It grants no teardown authority: the
+				// strict operation classifier refuses a predecessor that records no
+				// runtime authority before any cleanup.
 				previous, previousErr := recoveredSnapshotAllocations(
 					leaseUUID, claim.Tenant(), predecessor.Items, predecessor.ResourceProfiles,
 				)

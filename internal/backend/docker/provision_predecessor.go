@@ -1,17 +1,15 @@
 package docker
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // preparedProvisionOperation is the private admission phase after validating
-// and, when necessary, freezing the predecessor. It owns the detached candidate
+// the predecessor. It owns the detached candidate
 // and exact issuing settlement; callers cannot splice another request into its
 // eventual acceptance. It grants no physical execution or failure authority.
 type preparedProvisionOperation struct {
@@ -66,12 +64,13 @@ func (prepared preparedProvisionOperation) begin() (shared.OperationIntentClaim,
 	return claim, created, nil
 }
 
-// prepareProvisionPredecessor finishes the read-only admission prerequisite and
-// the exact legacy identity backfill before a replacement operation is durable.
+// prepareProvisionPredecessor finishes the read-only admission prerequisite
+// before a replacement operation is durable: an active predecessor must record
+// its runtime authority and belong to the requesting tenant and provider.
 // The request remains caller-owned work until that acceptance boundary. This
 // observation grants no teardown authority: the Started executor still requires
 // its claim-bound classification and resource admission.
-func (b *Backend) prepareProvisionPredecessor(ctx context.Context, request provisionOperationInput) error {
+func (b *Backend) prepareProvisionPredecessor(request provisionOperationInput) error {
 	if b.releaseStore == nil {
 		return fmt.Errorf("provision predecessor requires the release journal")
 	}
@@ -88,61 +87,5 @@ func (b *Backend) prepareProvisionPredecessor(ctx context.Context, request provi
 		}
 		return nil
 	}
-	if !active.OperationID.IsZero() || active.RuntimeAuthority != nil || active.LegacyRuntimeAuthority != nil {
-		return fmt.Errorf("%w: provision predecessor has incomplete runtime authority", backend.ErrInvalidState)
-	}
-	if len(active.Items) == 0 || validateDockerResourceProfiles(active.Items, active.ResourceProfiles) != nil {
-		return fmt.Errorf("%w: legacy provision predecessor has incomplete topology or resource authority", backend.ErrInvalidState)
-	}
-	inventoryCtx, cancel := b.recoveryDockerReadContext(ctx)
-	defer cancel()
-	all, err := b.listManagedContainersStrictForRecovery(inventoryCtx)
-	if err != nil {
-		return fmt.Errorf("inspect legacy provision admission predecessor: %w", err)
-	}
-	var cohort []ContainerInfo
-	for _, listed := range all {
-		if listed.LeaseUUID != request.LeaseUUID || strings.HasSuffix(listed.Name, "-prev") {
-			continue
-		}
-		inspected, err := b.inspectContainerForRecovery(inventoryCtx, listed.ContainerID)
-		if err != nil {
-			return fmt.Errorf("inspect legacy admission container %q: %w", listed.ContainerID, err)
-		}
-		if inspected == nil || inspected.ContainerID != listed.ContainerID ||
-			inspected.LeaseUUID != request.LeaseUUID || inspected.BackendName != b.Name() {
-			return fmt.Errorf("%w: legacy admission container identity changed", backend.ErrInvalidState)
-		}
-		cohort = append(cohort, *inspected)
-	}
-	if err := validateRecoveredReleaseCohort(active, cohort); err != nil {
-		return fmt.Errorf("%w: legacy provision predecessor cannot freeze its complete cohort: %w", backend.ErrInvalidState, err)
-	}
-	// Complete topology establishes a nonempty cohort. Freezing observed identity
-	// before checking every member would allow one peer's callbacks to authorize
-	// the others, so revalidate against the candidate identity before its CAS.
-	first := cohort[0]
-	if first.Tenant != request.Tenant || first.ProviderUUID != request.ProviderUUID {
-		return fmt.Errorf("%w: legacy provision predecessor belongs to a different tenant or provider", backend.ErrInvalidState)
-	}
-	authority, err := shared.NewLegacyRuntimeAuthority(first.Tenant, first.ProviderUUID, first.CallbackURL, first.LifecycleCallbackURL)
-	if err != nil {
-		return fmt.Errorf("%w: legacy provision predecessor has no complete callback identity: %w", backend.ErrInvalidState, err)
-	}
-	frozen := *active
-	frozen.LegacyRuntimeAuthority = &authority
-	if err := validateRecoveredReleaseCohort(&frozen, cohort); err != nil {
-		return fmt.Errorf("%w: legacy provision predecessor identity is inconsistent: %w", backend.ErrInvalidState, err)
-	}
-	if b.releaseBackfiller == nil {
-		return fmt.Errorf("legacy provision admission requires the release backfiller")
-	}
-	freeze, err := shared.FreezeLegacyRuntimeAuthority(request.LeaseUUID, *active, authority)
-	if err != nil {
-		return fmt.Errorf("%w: freeze legacy provision admission predecessor: %w", backend.ErrInvalidState, err)
-	}
-	if err := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(inventoryCtx, freeze); err != nil {
-		return fmt.Errorf("freeze legacy provision admission predecessor: %w", err)
-	}
-	return nil
+	return fmt.Errorf("%w: provision predecessor has incomplete runtime authority", backend.ErrInvalidState)
 }

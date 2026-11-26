@@ -1216,13 +1216,6 @@ func TestMaintenanceReleaseRejectsRawMutationBypasses(t *testing.T) {
 			ErrMaintenanceReleaseClaimRequired,
 		)
 		require.ErrorIs(t, releases.activateLatest(intent.LeaseUUID()), ErrMaintenanceReleaseClaimRequired)
-		targetRelease := intent.TargetRelease()
-		require.ErrorIs(t, releases.backfillActiveResourceProfiles(
-			intent.LeaseUUID(),
-			intent.SourceRelease().Version(),
-			targetRelease.Items,
-			targetRelease.ResourceProfiles,
-		), ErrMaintenanceReleaseClaimRequired)
 		require.ErrorIs(t, releases.delete(intent.LeaseUUID()), ErrMaintenanceReleaseClaimRequired)
 
 		release, _, found, err := maintenancePairForTest(t, callbacks, releases).FindMaintenanceRelease(

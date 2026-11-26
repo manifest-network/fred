@@ -1531,10 +1531,7 @@ tenant-declared tmpfs remain memory-backed and are not additional disk charges.
    every resulting ownership decision.
 2. **Tighten SKU profiles for future generations**: smaller CPU/memory/disk per
    SKU lets newly admitted leases fit. Existing active generations, maintenance
-   operations, recovery, and closes use their pinned profiles. Never combine a
-   v0.13 cutover with a profile resize or removal; keep the deployed mapping and
-   numeric values—and Docker's `container_tmpfs_size_mb` scratch allowance—through
-   the first successful upgraded backend startup.
+   operations, recovery, and closes use their pinned profiles.
 3. **Tenant quotas**: if one tenant is hogging resources, set `tenant_quota` in
    `docker-backend.yaml` to cap them. Size `max_disk_mb` for durable SKU disk plus
    the pinned scratch allowance of every live diskless instance.
@@ -2239,21 +2236,27 @@ queue, or retry from an assumed rollback.
 ### An unsized legacy predecessor blocks Docker recovery
 
 An `unsized pending provision predecessor` error, or a refusal stating that a
-legacy predecessor has no durable runtime authority and no surviving cohort to
-freeze, means recovery cannot attribute the old generation's complete resource
-and cleanup authority. This is not ordinary young-operation or cleanup-retry
-uncertainty. Startup fails on that backend; a running backend aborts that
-recovery pass before the operation-recovery phase. Other configured backends
-remain independent.
+predecessor has no durable runtime authority, means recovery cannot attribute
+the old generation's complete resource and cleanup authority. This is not
+ordinary young-operation or cleanup-retry uncertainty. Startup fails on that
+backend; a running backend aborts that recovery pass before the
+operation-recovery phase. Other configured backends remain independent.
 
-The supported stopped cutover freezes a complete v0.13 cohort before serving
-new requests. Current provision admission also requires the predecessor's
-principal and frozen sizing before it can issue an executable capacity token.
-A Started operation alongside an unbackfilled predecessor therefore indicates
-an unsupported intermediate writer or damaged/mixed-time state, not a normal
+The first 0.14 start recorded the items, sizing and runtime authority of every
+lease adopted from v0.13, and this line records none of them from an observed
+cohort. Current provision admission refuses a predecessor that records no
+runtime authority before it accepts the request. A Started operation alongside
+such a predecessor therefore indicates a backend that skipped the 0.14 line, an
+unsupported intermediate writer, or damaged or mixed-time state, not a normal
 admission window. A candidate-only resource projection plus
 `HoldUnaccountedFootprint` would block new allocations but would not supply
 settlement, close, or quota authority; do not use it to force startup.
+
+A startup refusal that names a lease and says `the release predates the first
+0.14 start` is the same missing record, found on an active release. Start the final 0.14 release
+once against the same data, as described under
+[Storage identity of a backend](DEPLOYMENT.md#storage-identity-of-a-backend),
+then start this release again.
 
 Recovery procedure:
 

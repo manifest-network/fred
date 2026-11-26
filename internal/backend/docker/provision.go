@@ -158,10 +158,11 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 	if err != nil {
 		return fmt.Errorf("%w: validate resource profiles: %w", backend.ErrValidation, err)
 	}
-	// Freeze a legacy predecessor before asking its journal to authorize an
-	// exact historical replay. New or changed payloads still require strict
-	// admission; only the opaque result can bind a replay to Pending.
-	if err := b.prepareProvisionPredecessor(ctx, req); err != nil {
+	// Refuse a predecessor that records no runtime authority, or another
+	// principal's, before asking its journal to authorize an exact historical
+	// replay. New or changed payloads still require strict admission; only the
+	// opaque result can bind a replay to Pending.
+	if err := b.prepareProvisionPredecessor(req); err != nil {
 		return err
 	}
 	manifestAdmission, err := b.operationSettlement.AdmitProvisionManifest(ctx, req.LeaseUUID, req.Tenant, req.ProviderUUID, req.Items, req.Payload)
@@ -384,18 +385,6 @@ func (b *Backend) Provision(ctx context.Context, request backend.ProvisionReques
 			return b.refuseOperationIntent(intent, errors.New(
 				"failed provision predecessor changed during read-only validation",
 			))
-		}
-		if classification.legacyFreeze != nil {
-			backfillCtx, cancelBackfill := b.recoveryDockerReadContext(b.stopCtx)
-			persistErr := b.releaseBackfiller.BackfillLegacyRuntimeAuthorityContext(
-				backfillCtx, *classification.legacyFreeze,
-			)
-			cancelBackfill()
-			if persistErr != nil {
-				return b.refuseOperationIntent(intent, fmt.Errorf(
-					"persist failed provision predecessor runtime authority: %w", persistErr,
-				))
-			}
 		}
 		if !predecessorUnchanged() {
 			return b.refuseOperationIntent(intent, errors.New(

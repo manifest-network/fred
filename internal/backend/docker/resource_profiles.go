@@ -1,7 +1,6 @@
 package docker
 
 import (
-	"context"
 	"fmt"
 	"slices"
 
@@ -130,9 +129,8 @@ func (b *Backend) resolveResourceProfiles(
 }
 
 // liveProvisionResourceProfiles returns a live provision's pinned resource
-// authority. Normal startup recovery freezes it into the active release before
-// quota reconciliation; resolving the live configuration here is explicit
-// v0.13 compatibility only.
+// authority, or resolves the live configuration for a provision that pins
+// none.
 func (b *Backend) liveProvisionResourceProfiles(
 	items []backend.LeaseItem,
 	pinned []shared.SKUResourceSnapshot,
@@ -144,11 +142,9 @@ func (b *Backend) liveProvisionResourceProfiles(
 }
 
 // activeResourceProfiles returns the resource authority pinned to the active
-// release. A v0.13 row has no snapshot; in that compatibility case the current
-// configuration is resolved once and compare-and-swap backfilled before the
-// value is returned, so later config changes cannot reprice the lease again.
+// release. An active release that records none is refused; a lease with no
+// active release is sized from the live configuration.
 func (b *Backend) activeResourceProfiles(
-	ctx context.Context,
 	leaseUUID string,
 	items []backend.LeaseItem,
 ) ([]shared.SKUResourceSnapshot, error) {
@@ -169,16 +165,10 @@ func (b *Backend) activeResourceProfiles(
 		return shared.CloneSKUResourceSnapshot(active.ResourceProfiles), nil
 	}
 
-	resourceProfiles, err := b.resolveResourceProfiles(items)
-	if err != nil {
-		return nil, fmt.Errorf("resolve legacy active release resource profiles: %w", err)
+	if active != nil {
+		return nil, fmt.Errorf(
+			"active release for lease %q records no resource profiles: %w", leaseUUID, errIncompleteStoredRelease,
+		)
 	}
-	if active != nil && slices.Equal(active.Items, items) {
-		if err := b.releaseBackfiller.BackfillActiveResourceProfilesContext(
-			ctx, leaseUUID, active.Version, active.Items, resourceProfiles,
-		); err != nil {
-			return nil, fmt.Errorf("freeze legacy active release resource profiles: %w", err)
-		}
-	}
-	return resourceProfiles, nil
+	return b.resolveResourceProfiles(items)
 }
