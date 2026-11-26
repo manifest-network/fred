@@ -223,45 +223,70 @@ func restoreJournalRow(t *testing.T, path, bucket, key string, original []byte) 
 }
 
 // TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted strips a
-// running lease's release down to what v0.13 recorded: its manifest and its
-// items, with no sizing and no authority. The backend completed such a
-// release from the containers it found; it now refuses to start, names the
-// lease, and leaves the workload running. With the row put back, the same
-// backend starts and reports the lease ready.
+// running lease's release down to what v0.13 recorded, three ways: with no
+// items, with items and no sizing, and with both and no authority. The
+// backend completed such a release from the containers it found; it now
+// refuses to start, names the lease, and leaves the workload running. With
+// the row put back, the same backend starts and reports the lease ready on
+// the same container.
 func TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted(t *testing.T) {
-	b := StartBackend(t)
-	lease := stateless("tenant-a")
-	require.NoError(t, b.Client.Apply(t.Context(), lease))
-	requireStatus(t, b, lease.LeaseUUID, statusReady)
-	running := requireOneRunningContainer(t, b, lease.LeaseUUID)
-	b.Stop()
-	releases := journals(b)[1]
-	original := rewriteJournalRow(t, releases, "releases", lease.LeaseUUID, func(row map[string]any) {
-		history, ok := row["releases"].([]any)
-		require.True(t, ok, "a release row wraps its history")
-		require.NotEmpty(t, history)
-		active, ok := history[len(history)-1].(map[string]any)
-		require.True(t, ok)
-		require.Equal(t, "active", active["status"])
-		for _, field := range []string{"resource_profiles", "runtime_authority", "operation_id"} {
-			require.Contains(t, active, field, "an active release records its %s", field)
-			delete(active, field)
-		}
-	})
+	for _, shape := range []struct {
+		name   string
+		strip  []string
+		refuse string
+	}{
+		{
+			name:   "no items",
+			strip:  []string{"items", "resource_profiles", "runtime_authority", "operation_id"},
+			refuse: "records no items",
+		},
+		{
+			name:   "no sizing",
+			strip:  []string{"resource_profiles", "runtime_authority", "operation_id"},
+			refuse: "records no resource profiles",
+		},
+		{
+			name:   "no authority",
+			strip:  []string{"runtime_authority", "operation_id"},
+			refuse: "records no runtime authority",
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			b := StartBackend(t)
+			lease := stateless("tenant-a")
+			require.NoError(t, b.Client.Apply(t.Context(), lease))
+			requireStatus(t, b, lease.LeaseUUID, statusReady)
+			running := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			b.Stop()
+			releases := journals(b)[1]
+			original := rewriteJournalRow(t, releases, "releases", lease.LeaseUUID, func(row map[string]any) {
+				history, ok := row["releases"].([]any)
+				require.True(t, ok, "a release row wraps its history")
+				require.NotEmpty(t, history)
+				active, ok := history[len(history)-1].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, "active", active["status"])
+				for _, field := range shape.strip {
+					require.Contains(t, active, field, "an active release records its %s", field)
+					delete(active, field)
+				}
+			})
 
-	out, err := runBackend(t, b)
-	require.Error(t, err, "the backend must refuse to start:\n%s", out)
-	require.Contains(t, out, "records no resource profiles")
-	require.Contains(t, out, lease.LeaseUUID)
-	require.Contains(t, out, "the release predates the first 0.14 start")
-	still := requireOneRunningContainer(t, b, lease.LeaseUUID)
-	require.Equal(t, running.ID, still.ID, "a refused start must leave the workload running")
+			out, err := runBackend(t, b)
+			require.Error(t, err, "the backend must refuse to start:\n%s", out)
+			require.Contains(t, out, shape.refuse)
+			require.Contains(t, out, lease.LeaseUUID)
+			require.Contains(t, out, "the release predates the first 0.14 start")
+			still := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			require.Equal(t, running.ID, still.ID, "a refused start must leave the workload running")
 
-	restoreJournalRow(t, releases, "releases", lease.LeaseUUID, original)
-	b.Start()
-	requireStatus(t, b, lease.LeaseUUID, statusReady)
-	again := requireOneRunningContainer(t, b, lease.LeaseUUID)
-	require.Equal(t, running.ID, again.ID, "the lease must come back on the same container")
+			restoreJournalRow(t, releases, "releases", lease.LeaseUUID, original)
+			b.Start()
+			requireStatus(t, b, lease.LeaseUUID, statusReady)
+			again := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			require.Equal(t, running.ID, again.ID, "the lease must come back on the same container")
+		})
+	}
 }
 
 // TestBackend_RefusesToStartOnARetentionThatRecordsNoSizing removes the

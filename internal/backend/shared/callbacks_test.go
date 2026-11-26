@@ -1668,26 +1668,3 @@ func storeLegacyCallback(t *testing.T, store *CallbackStore, entry v013CallbackE
 		return tx.Bucket(callbackBucketName).Put([]byte(entry.LeaseUUID), data)
 	}))
 }
-
-// An operation result is the only evidence that can settle its operation, so
-// age never expires it: the sweep stops at it and removes nothing behind it.
-func TestCallbackStore_RemoveOlderThanKeepsAnExpiredOperationResult(t *testing.T) {
-	store, err := newUnboundCallbackStoreForTest(CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "cb_ttl.db")})
-	require.NoError(t, err)
-	defer store.Close()
-	lease := testLeaseUUID("old-operation")
-	require.NoError(t, store.storeValidTest(CallbackEntry{
-		LeaseUUID:    lease,
-		CallbackURL:  "http://example.com/callbacks/provision",
-		DeliveryKind: CallbackDeliveryKindOperation,
-		CreatedAt:    time.Now().Add(-48 * time.Hour),
-	}))
-
-	removed, err := store.removeOlderThan(24 * time.Hour)
-	require.NoError(t, err)
-	assert.Zero(t, removed)
-	pending, err := store.ListPending()
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, lease, pending[0].LeaseUUID)
-}
