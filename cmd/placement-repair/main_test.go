@@ -240,28 +240,6 @@ func (repairFreshChainSnapshot) BlockHeight() int64      { return 1 }
 func (repairFreshChainSnapshot) TotalLeases() int        { return 0 }
 func (repairFreshChainSnapshot) BlockingLeaseCount() int { return 0 }
 
-type repairLegacyChainSnapshot struct{ leaseUUIDs []string }
-
-func (snapshot repairLegacyChainSnapshot) Valid() bool          { return true }
-func (snapshot repairLegacyChainSnapshot) ProviderUUID() string { return repairCommandProviderUUID }
-func (snapshot repairLegacyChainSnapshot) BlockHeight() int64   { return 2 }
-func (snapshot repairLegacyChainSnapshot) TotalLeases() int     { return len(snapshot.leaseUUIDs) }
-func (snapshot repairLegacyChainSnapshot) BlockingLeaseCount() int {
-	return 0
-}
-func (snapshot repairLegacyChainSnapshot) LeaseUUIDs() []string {
-	return slices.Clone(snapshot.leaseUUIDs)
-}
-func (snapshot repairLegacyChainSnapshot) LeaseItems() map[string][]backend.LeaseItem {
-	items := make(map[string][]backend.LeaseItem, len(snapshot.leaseUUIDs))
-	for _, leaseUUID := range snapshot.leaseUUIDs {
-		items[leaseUUID] = []backend.LeaseItem{{
-			SKU: "sku-test", Quantity: 1, ServiceName: "app",
-		}}
-	}
-	return items
-}
-
 var errRepairVerdictWrite = errors.New("synthetic repair verdict write failure")
 
 type semanticFailingRepairInspector struct {
@@ -354,7 +332,9 @@ func TestRun_HelpWritesUsageAndSucceeds(t *testing.T) {
 	}
 }
 
-func TestRun_ClassifyEmitsMachineReadableSchemaNeutralVerdict(t *testing.T) {
+// A file still in the v0.13 layout gets a machine-readable verdict like any
+// other, but not a safe one: this release does not read that layout.
+func TestRun_ClassifyReportsV013LayoutAsIncompleteWithoutMutation(t *testing.T) {
 	dbPath := writeRepairLegacyAuthorityDB(t)
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
@@ -364,20 +344,19 @@ func TestRun_ClassifyEmitsMachineReadableSchemaNeutralVerdict(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err = run(t.Context(), []string{"-config", configPath, "-classify"}, &stdout, &bytes.Buffer{})
-	require.NoError(t, err)
+	require.ErrorContains(t, err, string(placement.AuthorityMixedOrIncomplete))
 	assert.NotContains(t, stdout.String(), "PASS")
 	var report placement.AuthorityReport
 	require.NoError(t, json.Unmarshal(stdout.Bytes(), &report))
-	assert.Equal(t, placement.AuthorityPristineV013, report.Classification)
+	assert.Equal(t, placement.AuthorityMixedOrIncomplete, report.Classification)
+	assert.False(t, report.SafeForCutover())
 	assert.Equal(t, []string{repairCommandBackend}, report.ExpectedBackendTopology)
-	require.Len(t, report.Rows, 1)
-	assert.False(t, report.Rows[0].UntrustedPositive)
-	assert.Contains(t, stdout.String(), `"untrusted_positive":false`,
-		"legacy authority output must explicitly distinguish an ordinary row from quarantine")
+	assert.Equal(t, []string{"placements"}, report.TopLevelBuckets)
+	assert.Empty(t, report.Rows)
 
 	after, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
-	assert.Equal(t, before, after, "classification must not rewrite the stopped authority")
+	assert.Equal(t, before, after)
 }
 
 func TestRun_ClassifyExposesPersistedUntrustedPositiveQuarantine(t *testing.T) {
@@ -482,12 +461,6 @@ func TestRun_ClassifyPreparedCurrentAuthoritiesIsDeterministicAndByteExact(t *te
 		create func(*testing.T) string
 	}{
 		{
-			name: "prepared v0.13 authority",
-			create: func(t *testing.T) string {
-				return prepareRepairLegacyAuthority(t)
-			},
-		},
-		{
 			name: "freshly initialized authority",
 			create: func(t *testing.T) string {
 				dbPath := filepath.Join(t.TempDir(), "placements.db")
@@ -546,7 +519,7 @@ func TestRun_ClassifyCancellationCannotEmitSafeSuccess(t *testing.T) {
 	) (placement.AuthorityReport, error) {
 		cancel()
 		return placement.AuthorityReport{
-			Classification: placement.AuthorityPristineV013,
+			Classification: placement.AuthorityPreparedCurrent,
 		}, nil
 	}
 
@@ -574,7 +547,7 @@ func TestRunAuthorityClassificationRejectsShortReportWrite(t *testing.T) {
 		repairShortWriter{},
 		func(string, placement.AuthorityExpectation) (placement.AuthorityReport, error) {
 			return placement.AuthorityReport{
-				Classification: placement.AuthorityPristineV013,
+				Classification: placement.AuthorityPreparedCurrent,
 			}, nil
 		},
 	)
@@ -655,57 +628,6 @@ func writeRepairLegacyAuthorityDB(t *testing.T) string {
 	}))
 	require.NoError(t, db.Close())
 	return path
-}
-
-func prepareRepairLegacyAuthority(t *testing.T) string {
-	t.Helper()
-	dbPath := writeRepairLegacyAuthorityDB(t)
-	backupPath := filepath.Join(t.TempDir(), "placements.v013.bak")
-	inventories := map[string]placement.BackendInventory{
-		repairCommandBackend: {
-			StorageIdentity: repairBackendStorageID(t, repairCommandBackend),
-			Provisions:      []string{repairCommandLease},
-			ProvisionProviderUUIDs: map[string]string{
-				repairCommandLease: "",
-			},
-			ProvisionItems: map[string][]backend.LeaseItem{
-				repairCommandLease: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
-			},
-			Retentions: []string{},
-		},
-	}
-	chainProof, err := placement.NewLegacyUpgradeChainProof(repairLegacyChainSnapshot{
-		leaseUUIDs: []string{repairCommandLease},
-	})
-	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
-	require.NoError(t, err)
-	backupTarget, err := placement.BindExactBackupTarget(backupPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
-	capability, err := preparer.AuthorizePreparation(
-		ctx,
-		repairCommandProviderUUID,
-		[]string{repairCommandBackend},
-		inventories,
-		chainProof,
-		backupTarget,
-		placement.LegacyPreparationDrainAttestation,
-	)
-	require.NoError(t, err)
-	_, err = preparer.PrepareContext(
-		ctx,
-		repairCommandProviderUUID,
-		[]string{repairCommandBackend},
-		inventories,
-		chainProof,
-		capability,
-	)
-	require.NoError(t, err)
-	require.NoError(t, preparer.Close())
-	return dbPath
 }
 
 func TestRun_DryRunClosesWithoutChangingDatabaseBytes(t *testing.T) {

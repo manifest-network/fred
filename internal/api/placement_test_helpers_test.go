@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
+	"github.com/manifest-network/fred/internal/chain/chaintest"
 	"github.com/manifest-network/fred/internal/provisioner/operation"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
 	"github.com/manifest-network/fred/internal/testsupport/placementstore"
@@ -372,6 +374,74 @@ func projectAPIInventoryWithExplicitLifetime(
 	})
 	require.NoError(t, err)
 	return result, sweep
+}
+
+// seedAPIPlacementOwners opens a fresh placement store at dbPath and projects
+// one complete inventory sweep in which every named backend reports exactly its
+// rows. Each reported lease ends with that backend as its confirmed owner and
+// with the lifecycle generation its row carries: a row reporting the tokenless
+// generation leaves the lease in the state of one adopted from v0.13. The
+// store is closed again so the caller opens it the way providerd would.
+func seedAPIPlacementOwners(
+	t *testing.T,
+	dbPath string,
+	rows map[string][]backend.ProvisionInfo,
+) {
+	t.Helper()
+	backendNames := slices.Sorted(maps.Keys(rows))
+	storageIDs := testAPIBackendStorageIDs(backendNames...)
+	entries := make([]backend.BackendEntry, 0, len(backendNames))
+	for index, backendName := range backendNames {
+		entries = append(entries, backend.BackendEntry{
+			Backend:   backend.NewMockBackend(backend.MockBackendConfig{Name: backendName}),
+			IsDefault: index == 0,
+		})
+	}
+	router, err := backend.NewRouter(backend.RouterConfig{Backends: entries})
+	require.NoError(t, err)
+
+	store, err := placementstore.NewStore(dbPath)
+	require.NoError(t, err)
+	require.NoError(t, placementstore.ConfigureBackendTopologyWithStorageIdentities(
+		store, backendNames, storageIDs,
+	))
+	coordinator, err := store.BindOperationCoordinator(nil)
+	require.NoError(t, err)
+	execution, inventoryRuntime := bindAPIInventoryRuntime(
+		t, coordinator, router, &chaintest.MockClient{},
+	)
+	reconciliation, err := execution.ReconciliationCoordinator(nil, nil)
+	require.NoError(t, err)
+
+	sweep, err := reconciliation.BeginSweep()
+	require.NoError(t, err)
+	placements := make(map[string]string)
+	for _, backendName := range backendNames {
+		provisions := append([]backend.ProvisionInfo{}, rows[backendName]...)
+		for _, provision := range provisions {
+			placements[provision.LeaseUUID] = backendName
+		}
+		inventoryRuntime.backends[backendName].stage(
+			storageIDs[backendName], provisions, []backend.RetainedLease{},
+		)
+		provisionReceipt, collectErr := sweep.CollectProvisionInventory(t.Context(), backendName)
+		require.NoError(t, collectErr)
+		retentionReceipt, collectErr := sweep.CollectRetentionInventory(t.Context(), backendName)
+		require.NoError(t, collectErr)
+		disposition, collectErr := sweep.RecordBackendInventory(provisionReceipt, retentionReceipt)
+		require.NoError(t, collectErr)
+		require.Equal(t, placement.BackendInventoryAuthoritative, disposition.Disposition())
+	}
+	require.NoError(t, sweep.SealInventory())
+	_, err = sweep.Project(placement.ReconciliationProjection{Placements: placements})
+	require.NoError(t, err)
+	sweep.End()
+	for leaseUUID, backendName := range placements {
+		owner := store.Lookup(leaseUUID)
+		require.Equal(t, placement.StateConfirmed, owner.State())
+		require.Equal(t, backendName, owner.Backend)
+	}
+	require.NoError(t, store.Close())
 }
 
 // restoreAuthorityForTest mints a restore coordinator the way providerd does,

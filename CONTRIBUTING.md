@@ -41,7 +41,7 @@ cmd/
 ├── providerd/          Main daemon (chain ↔ backends, tenant API)
 ├── docker-backend/     Production Docker backend
 ├── mock-backend/       Test/dev backend
-├── placement-preflight/ Offline inventory proof and placement initialization/upgrade
+├── placement-preflight/ Offline inventory proof and fresh placement initialization
 ├── placement-repair/   Offline placement-authority repair
 └── loadtest/           Load tester (exercises the API)
 

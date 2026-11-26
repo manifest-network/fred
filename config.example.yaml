@@ -575,9 +575,11 @@ payload_store_db_path: "/var/lib/fred/payloads.db"
 # inventories; owned work, recordless ACTIVE recovery, attempts, and conflicts
 # remain deferred. Inventory silence never clears an attempt or conflict.
 #
-# Normal startup opens only an existing, non-empty, prepared database and never
-# creates or initializes this authority file. Prepare it with the documented
-# placement-preflight workflow while providerd is stopped. It must be an
+# Normal startup opens only an existing, non-empty database in the current
+# layout and never creates or initializes this authority file. A provider that
+# has never run creates it with placement-preflight -initialize-fresh while
+# providerd is stopped; a v0.13 database is converted by the final 0.14 release,
+# not by this one. It must be an
 # unsymlinked, single-link regular file with exact mode 0600; providerd binds and
 # re-attests that exact path/inode while running. Ensure fred can write the file
 # and its parent directory.

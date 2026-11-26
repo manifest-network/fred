@@ -168,15 +168,10 @@ func TestToolMutationClassifiers_ExposeOperationSpecificOutcomeUnknownSentinels(
 	cause := errors.New("synthetic commit failure")
 	commitErr := fmt.Errorf("%w: %w", errBoltCommitOutcomeUnknown, cause)
 
-	legacyErr := classifyLegacyPreparationTransactionError(commitErr)
-	require.ErrorIs(t, legacyErr, ErrLegacyPreparationOutcomeUnknown)
-	require.ErrorIs(t, legacyErr, cause)
-
 	repairErr := classifyRepairTransactionError("refuse test operation", commitErr)
 	require.ErrorIs(t, repairErr, ErrRepairMutationOutcomeUnknown)
 	require.ErrorIs(t, repairErr, cause)
 
 	ordinary := errors.New("synthetic pre-commit failure")
-	assert.Same(t, ordinary, classifyLegacyPreparationTransactionError(ordinary))
 	assert.Same(t, ordinary, classifyRepairTransactionError("test", ordinary))
 }

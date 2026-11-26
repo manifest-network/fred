@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backendidentity"
@@ -29,8 +27,6 @@ import (
 
 const (
 	preflightCommandProvisionLease = "018f47a2-8b1c-7def-8123-456789abcdef"
-	preflightCommandRetainedLease  = "018f47a2-8b1c-7def-8123-456789abcdee"
-	preflightCommandOtherLease     = "018f47a2-8b1c-7def-8123-456789abcded"
 )
 
 type preflightFreshChainSnapshot struct {
@@ -39,8 +35,6 @@ type preflightFreshChainSnapshot struct {
 	total              int
 	blocking           int
 	blockingLeaseUUIDs []string
-	leaseUUIDs         []string
-	leaseItems         map[string][]backend.LeaseItem
 }
 
 func (snapshot preflightFreshChainSnapshot) Valid() bool {
@@ -56,31 +50,6 @@ func (snapshot preflightFreshChainSnapshot) BlockingLeaseCount() int {
 }
 func (snapshot preflightFreshChainSnapshot) BlockingLeaseUUIDs() []string {
 	return append([]string(nil), snapshot.blockingLeaseUUIDs...)
-}
-func (snapshot preflightFreshChainSnapshot) LeaseUUIDs() []string {
-	leaseUUIDs := make([]string, len(snapshot.leaseUUIDs))
-	copy(leaseUUIDs, snapshot.leaseUUIDs)
-	return leaseUUIDs
-}
-func (snapshot preflightFreshChainSnapshot) LeaseItems() map[string][]backend.LeaseItem {
-	if snapshot.leaseItems == nil {
-		return nil
-	}
-	items := make(map[string][]backend.LeaseItem, len(snapshot.leaseItems))
-	for leaseUUID, leaseItems := range snapshot.leaseItems {
-		items[leaseUUID] = append([]backend.LeaseItem(nil), leaseItems...)
-	}
-	return items
-}
-
-func preflightSnapshotItems(leaseUUIDs []string) map[string][]backend.LeaseItem {
-	items := make(map[string][]backend.LeaseItem, len(leaseUUIDs))
-	for _, leaseUUID := range leaseUUIDs {
-		items[leaseUUID] = []backend.LeaseItem{{
-			SKU: "sku-test", Quantity: 1, ServiceName: "app",
-		}}
-	}
-	return items
 }
 
 type preflightFreshChainClient struct {
@@ -117,51 +86,6 @@ func (client *blockingPreflightFreshChainClient) SnapshotProviderLeases(
 func (client *blockingPreflightFreshChainClient) Close() error {
 	client.closed = true
 	return nil
-}
-
-type closeFailingLegacyPreparer struct {
-	legacyUpgradePreparer
-	cause error
-}
-
-func (preparer *closeFailingLegacyPreparer) Close() error {
-	return errors.Join(preparer.legacyUpgradePreparer.Close(), preparer.cause)
-}
-
-type syncFailingLegacyPreparer struct {
-	legacyUpgradePreparer
-	cause error
-}
-
-type semanticFailingPreparedAuthority struct {
-	preparedAuthorityInspector
-	cause error
-}
-
-func (inspector *semanticFailingPreparedAuthority) VerifyLegacyPreparationPostcondition(
-	string,
-	[]string,
-	map[string]placement.BackendInventory,
-	placement.LegacyUpgradePreflightSummary,
-) error {
-	return inspector.cause
-}
-
-func (preparer *syncFailingLegacyPreparer) PrepareContext(
-	ctx context.Context,
-	providerUUID string,
-	backendNames []string,
-	inventories map[string]placement.BackendInventory,
-	chainProof placement.LegacyUpgradeChainProof,
-	capability placement.LegacyPreparationCapability,
-) (placement.LegacyUpgradePreflightSummary, error) {
-	summary, err := preparer.legacyUpgradePreparer.PrepareContext(
-		ctx, providerUUID, backendNames, inventories, chainProof, capability,
-	)
-	if err != nil {
-		return summary, err
-	}
-	return summary, fmt.Errorf("%w: %w", placement.ErrLegacyPreparationCommitted, preparer.cause)
 }
 
 type preflightVerdictErrorWriter struct{ cause error }
@@ -227,263 +151,6 @@ func TestRun_HelpWritesUsageAndSucceeds(t *testing.T) {
 	}
 }
 
-func legacyPreflightDependencies(leaseUUIDs ...string) commandDependencies {
-	dependencies := defaultCommandDependencies()
-	dependencies.newFreshChainClient = func(
-		chain.ReadOnlyClientConfig,
-	) (freshChainClient, error) {
-		return &preflightFreshChainClient{snapshot: preflightFreshChainSnapshot{
-			providerUUID: "550e8400-e29b-41d4-a716-446655440000",
-			height:       913,
-			total:        len(leaseUUIDs),
-			leaseUUIDs:   append([]string(nil), leaseUUIDs...),
-			leaseItems:   preflightSnapshotItems(leaseUUIDs),
-		}}, nil
-	}
-	return dependencies
-}
-
-func legacyPreflightChainProof(
-	t *testing.T,
-	leaseUUIDs ...string,
-) placement.LegacyUpgradeChainProof {
-	t.Helper()
-	proof, err := placement.NewLegacyUpgradeChainProof(preflightFreshChainSnapshot{
-		providerUUID: "550e8400-e29b-41d4-a716-446655440000",
-		height:       913,
-		total:        len(leaseUUIDs),
-		leaseUUIDs:   append([]string(nil), leaseUUIDs...),
-		leaseItems:   preflightSnapshotItems(leaseUUIDs),
-	})
-	require.NoError(t, err)
-	return proof
-}
-
-func TestRun_CleanStoppedDatabaseAndLiveInventoriesPassReadOnly(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
-		preflightCommandRetainedLease:  []byte("backend-a"),
-	})
-	before, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-
-	server := newInventoryServer(t,
-		[]backend.ProvisionInfo{{LeaseUUID: preflightCommandProvisionLease}},
-		[]backend.RetainedLease{{LeaseUUID: preflightCommandRetainedLease}},
-	)
-	defer server.Close()
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	err = runWithDependencies(
-		t.Context(),
-		[]string{"-config", configPath, "-proof-timeout", "5s"},
-		&stdout,
-		&stderr,
-		legacyPreflightDependencies(preflightCommandProvisionLease, preflightCommandRetainedLease),
-	)
-	require.NoError(t, err)
-	assert.Empty(t, stderr.String())
-	assert.Contains(t, stdout.String(),
-		inspectSuccessVerdict+": v0.13 placement preflight verified 2 rows against 2 leases on 1 backends")
-
-	after, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-	assert.Equal(t, before, after, "the command must not migrate or rewrite the placement database")
-}
-
-func TestRun_DocumentedInspectThenPrepareSequenceCreatesRollbackBackup(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "placements.db")
-	backupPath := filepath.Join(tempDir, "placements\nPASS: forged-preflight-verdict.bak")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
-		preflightCommandRetainedLease:  []byte("backend-a"),
-	})
-	legacyBytes, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-
-	server := newInventoryServer(t,
-		[]backend.ProvisionInfo{{LeaseUUID: preflightCommandProvisionLease}},
-		[]backend.RetainedLease{{LeaseUUID: preflightCommandRetainedLease}},
-	)
-	defer server.Close()
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-
-	var inspectOut bytes.Buffer
-	err = runWithDependencies(t.Context(), []string{
-		"-config", configPath, "-proof-timeout", "5s",
-	}, &inspectOut, &bytes.Buffer{},
-		legacyPreflightDependencies(preflightCommandProvisionLease, preflightCommandRetainedLease))
-	require.NoError(t, err)
-	assert.Contains(t, inspectOut.String(), inspectSuccessVerdict+":")
-	assert.Contains(t, inspectOut.String(), "database remained read-only")
-	assert.NotContains(t, inspectOut.String(), `"outcome"`, "only -prepare reports an outcome")
-	afterInspect, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-	assert.Equal(t, legacyBytes, afterInspect,
-		"the documented inspection pass must leave the stopped database byte-exact")
-
-	var prepareOut bytes.Buffer
-	err = runWithDependencies(t.Context(), []string{
-		"-config", configPath, "-proof-timeout", "5s", "-prepare", "-backup", backupPath,
-		"-attest-drained", placement.LegacyPreparationDrainAttestation,
-	}, &prepareOut, &bytes.Buffer{},
-		legacyPreflightDependencies(preflightCommandProvisionLease, preflightCommandRetainedLease))
-	require.NoError(t, err)
-	assert.Contains(t, prepareOut.String(), prepareSuccessVerdict+":")
-	assert.Contains(t, prepareOut.String(), "database prepared; exact legacy backup: "+strconv.Quote(backupPath))
-	assert.NotContains(t, prepareOut.String(), "\nPASS: forged-preflight-verdict.bak\n",
-		"an operator-supplied backup path must not be able to forge a verdict line")
-	assert.Contains(t, prepareOut.String(), "old-binary rollback now requires restoring the backup")
-	assert.True(t, strings.HasSuffix(prepareOut.String(),
-		"database prepared; exact legacy backup: "+strconv.Quote(backupPath)+"\n"+
-			`{"outcome":"prepared"}`+"\n"),
-		"the outcome is the final line, after the verdict")
-
-	backupInfo, err := os.Stat(backupPath)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), backupInfo.Mode().Perm())
-	assert.Positive(t, backupInfo.Size())
-
-	storageID, err := backendidentity.Parse("c0a8012e-b4ee-4f4d-9c31-7e6623928311")
-	require.NoError(t, err)
-	backupInspector, err := placement.OpenLegacyUpgradeInspector(backupPath)
-	require.NoError(t, err)
-	backupSummary, err := backupInspector.Check(
-		"550e8400-e29b-41d4-a716-446655440000",
-		[]string{"backend-a"},
-		map[string]placement.BackendInventory{
-			"backend-a": {
-				StorageIdentity:        storageID,
-				Provisions:             []string{preflightCommandProvisionLease},
-				ProvisionProviderUUIDs: map[string]string{preflightCommandProvisionLease: ""},
-				ProvisionItems:         preflightSnapshotItems([]string{preflightCommandProvisionLease}),
-				Retentions:             []string{preflightCommandRetainedLease},
-			},
-		},
-		legacyPreflightChainProof(
-			t, preflightCommandProvisionLease, preflightCommandRetainedLease,
-		),
-	)
-	require.NoError(t, err)
-	assert.Equal(t, placement.LegacyUpgradePreflightSummary{
-		ConfiguredBackends: 1,
-		PlacementRows:      2,
-		InventoryLeases:    2,
-	}, backupSummary)
-	require.NoError(t, backupInspector.Close())
-
-	store, err := placement.OpenStore(dbPath, "550e8400-e29b-41d4-a716-446655440000")
-	require.NoError(t, err)
-	require.NoError(t, store.VerifyBackendTopology([]string{"backend-a"}))
-	require.NoError(t, store.Close())
-}
-
-func TestRun_PreparePostCommitFailuresRequireReadOnlyInspection(t *testing.T) {
-	tests := []struct {
-		name              string
-		wrapPreparer      func(legacyUpgradePreparer, error) legacyUpgradePreparer
-		stdout            func(error) io.Writer
-		wantStage         string
-		wantReportingOnly bool
-	}{
-		{
-			name: "sync verification",
-			wrapPreparer: func(preparer legacyUpgradePreparer, cause error) legacyUpgradePreparer {
-				return &syncFailingLegacyPreparer{legacyUpgradePreparer: preparer, cause: cause}
-			},
-			stdout:    func(error) io.Writer { return &bytes.Buffer{} },
-			wantStage: "explicit database sync verification",
-		},
-		{
-			name: "close verification",
-			wrapPreparer: func(preparer legacyUpgradePreparer, cause error) legacyUpgradePreparer {
-				return &closeFailingLegacyPreparer{legacyUpgradePreparer: preparer, cause: cause}
-			},
-			stdout:    func(error) io.Writer { return &bytes.Buffer{} },
-			wantStage: "database close verification",
-		},
-		{
-			name: "stdout verdict",
-			wrapPreparer: func(preparer legacyUpgradePreparer, _ error) legacyUpgradePreparer {
-				return preparer
-			},
-			stdout: func(cause error) io.Writer {
-				return preflightVerdictErrorWriter{cause: cause}
-			},
-			wantStage:         "complete cutover verdict reporting",
-			wantReportingOnly: true,
-		},
-	}
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			tempDir := t.TempDir()
-			dbPath := filepath.Join(tempDir, "placements.db")
-			backupPath := filepath.Join(tempDir, "placements.v013.bak")
-			writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-				preflightCommandProvisionLease: []byte(
-					`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`,
-				),
-			})
-			server := newInventoryServer(t,
-				[]backend.ProvisionInfo{{LeaseUUID: preflightCommandProvisionLease}},
-				[]backend.RetainedLease{},
-			)
-			t.Cleanup(server.Close)
-			configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-			dependencies := legacyPreflightDependencies(preflightCommandProvisionLease)
-			openPreparer := dependencies.openLegacyUpgradePreparer
-			cause := errors.New("synthetic post-commit " + test.name + " failure")
-			dependencies.openLegacyUpgradePreparer = func(
-				path string,
-			) (legacyUpgradePreparer, error) {
-				preparer, err := openPreparer(path)
-				if err != nil {
-					return nil, err
-				}
-				return test.wrapPreparer(preparer, cause), nil
-			}
-
-			stdout := test.stdout(cause)
-			err := runWithDependencies(t.Context(), []string{
-				"-config", configPath,
-				"-proof-timeout", "5s",
-				"-prepare",
-				"-backup", backupPath,
-				"-attest-drained", placement.LegacyPreparationDrainAttestation,
-			}, stdout, &bytes.Buffer{}, dependencies)
-			require.ErrorIs(t, err, errPreflightPrepared)
-			require.ErrorIs(t, err, cause)
-			require.ErrorContains(t, err, "PREPARED:")
-			require.ErrorContains(t, err, test.wantStage)
-			require.ErrorContains(t, err,
-				"run placement-repair -classify with the same providerd config immediately")
-			require.ErrorContains(t, err, "do not retry blindly")
-			assert.Equal(t, 13, commandExitCode(err))
-			if buffer, ok := stdout.(*bytes.Buffer); ok {
-				assert.True(t, strings.HasSuffix(buffer.String(), `{"outcome":"prepared_unverified"}`+"\n"))
-			}
-			if test.wantReportingOnly {
-				require.ErrorContains(t, err,
-					"database was durably written and closed; only command reporting is indeterminate")
-			}
-
-			store, openErr := placement.OpenStore(
-				dbPath, "550e8400-e29b-41d4-a716-446655440000",
-			)
-			require.NoError(t, openErr,
-				"PREPARED means the current-schema authority must be inspected, not retried")
-			require.NoError(t, store.Close())
-			_, backupErr := os.Stat(backupPath)
-			require.NoError(t, backupErr)
-		})
-	}
-}
-
 func TestRun_InitializeFreshStdoutFailureReportsPublishedAuthority(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
 	server := newInventoryServer(t,
@@ -519,80 +186,6 @@ func TestRun_InitializeFreshStdoutFailureReportsPublishedAuthority(t *testing.T)
 	)
 	require.NoError(t, openErr)
 	require.NoError(t, store.Close())
-}
-
-func TestRun_PrepareReopenSemanticFailureIsCategoricallyCommitted(t *testing.T) {
-	tempDir := t.TempDir()
-	dbPath := filepath.Join(tempDir, "placements.db")
-	backupPath := filepath.Join(tempDir, "placements.v013.bak")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(
-			`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`,
-		),
-	})
-	server := newInventoryServer(t,
-		[]backend.ProvisionInfo{{LeaseUUID: preflightCommandProvisionLease}},
-		[]backend.RetainedLease{},
-	)
-	t.Cleanup(server.Close)
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-	dependencies := legacyPreflightDependencies(preflightCommandProvisionLease)
-	openPrepared := dependencies.openPreparedAuthority
-	cause := errors.New("synthetic reopened semantic failure")
-	dependencies.openPreparedAuthority = func(
-		path, providerUUID string,
-	) (preparedAuthorityInspector, error) {
-		inspector, err := openPrepared(path, providerUUID)
-		if err != nil {
-			return nil, err
-		}
-		return &semanticFailingPreparedAuthority{
-			preparedAuthorityInspector: inspector,
-			cause:                      cause,
-		}, nil
-	}
-
-	var stdout bytes.Buffer
-	err := runWithDependencies(t.Context(), []string{
-		"-config", configPath,
-		"-proof-timeout", "5s",
-		"-prepare",
-		"-backup", backupPath,
-		"-attest-drained", placement.LegacyPreparationDrainAttestation,
-	}, &stdout, &bytes.Buffer{}, dependencies)
-	require.ErrorIs(t, err, errPreflightPrepared)
-	require.ErrorIs(t, err, cause)
-	require.ErrorContains(t, err, "PREPARED:")
-	require.ErrorContains(t, err, "reopened database semantic verification")
-	require.ErrorContains(t, err,
-		"run placement-repair -classify with the same providerd config immediately")
-	assert.NotContains(t, stdout.String(), "PASS:")
-	assert.Equal(t, 13, commandExitCode(err))
-	assert.Equal(t, `{"outcome":"prepared_unverified"}`+"\n", stdout.String())
-
-	inspector, openErr := placement.OpenRepairInspector(
-		dbPath, "550e8400-e29b-41d4-a716-446655440000",
-	)
-	require.NoError(t, openErr)
-	require.NoError(t, inspector.Close())
-}
-
-func TestOutcomeUnknownPreflightFailurePreservesLowLevelSentinel(t *testing.T) {
-	cause := fmt.Errorf(
-		"%w: synthetic bbolt commit failure",
-		placement.ErrLegacyPreparationOutcomeUnknown,
-	)
-	err := newDurablePreflightFailure(
-		preflightPreparationOutcomeUnknown,
-		"commit outcome could be established",
-		cause,
-	)
-	require.ErrorIs(t, err, errPreflightOutcomeUnknown)
-	require.ErrorIs(t, err, placement.ErrLegacyPreparationOutcomeUnknown)
-	require.ErrorContains(t, err, "OUTCOME UNKNOWN:")
-	require.ErrorContains(t, err, "may or may not contain the preparation")
-	require.ErrorContains(t, err,
-		"run placement-repair -classify with the same providerd config immediately")
 }
 
 func TestRun_InitializeFreshPublishesProofBoundStore(t *testing.T) {
@@ -1000,19 +593,13 @@ func TestRequireAuthenticatedChainProofTransport(t *testing.T) {
 }
 
 func TestRun_RefusesUnauthenticatedChainBeforePlacementOpenOrBackendProbe(t *testing.T) {
-	t.Parallel()
-
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(
-			`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`,
-		),
-	})
-	before, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-	configPath := writePreflightConfig(
-		t, dbPath, "https://127.0.0.1:1", "backend-a",
-	)
+	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("unauthenticated chain policy must fail before any backend probe")
+	}))
+	defer server.Close()
+	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
+	args := freshInitializationArgs(t, configPath)
 	configBytes, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	configBytes = bytes.ReplaceAll(
@@ -1020,51 +607,14 @@ func TestRun_RefusesUnauthenticatedChainBeforePlacementOpenOrBackendProbe(t *tes
 	)
 	require.NoError(t, os.WriteFile(configPath, configBytes, 0o600))
 
-	dependencies := defaultCommandDependencies()
-	dependencies.newInventoryClients = func(*config.Config) ([]inventoryClient, error) {
-		t.Fatal("unauthenticated chain policy must fail before backend client construction")
-		return nil, nil
-	}
 	var stdout bytes.Buffer
 	err = runWithDependencies(
-		t.Context(), []string{"-config", configPath}, &stdout, &bytes.Buffer{}, dependencies,
+		t.Context(), args, &stdout, &bytes.Buffer{}, defaultCommandDependencies(),
 	)
 	require.ErrorContains(t, err, "requires an explicit local-development operator attestation")
 	assert.Empty(t, stdout.String())
-	after, readErr := os.ReadFile(dbPath)
-	require.NoError(t, readErr)
-	assert.Equal(t, before, after)
-}
-
-func TestRun_PrepareRequiresExactCausalDrainAttestationBeforeLoadingConfig(t *testing.T) {
-	for _, test := range []struct {
-		name        string
-		attestation string
-	}{
-		{name: "absent"},
-		{name: "wrong", attestation: "inventory looked empty"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			dependencies := defaultCommandDependencies()
-			dependencies.loadConfig = func(string) (*config.Config, error) {
-				t.Fatal("invalid causal authority must fail before loading configuration")
-				return nil, nil
-			}
-			args := []string{
-				"-config", "not-opened.yaml",
-				"-prepare",
-				"-backup", "placements.v013.bak",
-			}
-			if test.attestation != "" {
-				args = append(args, "-attest-drained", test.attestation)
-			}
-			err := runWithDependencies(
-				t.Context(), args, &bytes.Buffer{}, &bytes.Buffer{}, dependencies,
-			)
-			require.ErrorContains(t, err, "-attest-drained must exactly equal")
-			require.ErrorContains(t, err, placement.LegacyPreparationDrainAttestation)
-		})
-	}
+	_, statErr := os.Stat(dbPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
 func TestRun_RejectsNonCanonicalConfiguredProviderBeforePlacementOpenOrProbe(t *testing.T) {
@@ -1079,7 +629,12 @@ func TestRun_RejectsNonCanonicalConfiguredProviderBeforePlacementOpenOrProbe(t *
 			)
 
 			var stdout bytes.Buffer
-			err := runWithDependencies(t.Context(), []string{"-config", configPath},
+			err := runWithDependencies(t.Context(), []string{
+				"-config", configPath,
+				"-initialize-fresh",
+				"-expected-backends", `["backend-a"]`,
+				"-confirm-quiesced", "invalid provider prevents target-bound confirmation",
+			},
 				&stdout, &bytes.Buffer{}, defaultCommandDependencies())
 			require.ErrorIs(t, err, placement.ErrProviderAuthorityMismatch)
 			assert.ErrorContains(t, err, "configured provider UUID")
@@ -1116,20 +671,24 @@ func TestRun_InitializeFreshRejectsModeAndFlagConflicts(t *testing.T) {
 		want string
 	}{
 		{
-			name: "prepare mode",
-			args: []string{"-initialize-fresh", "-prepare", "-backup", "backup.db",
-				"-confirm-quiesced", confirmation},
-			want: "-initialize-fresh and -prepare are mutually exclusive",
+			name: "removed prepare mode",
+			args: []string{"-initialize-fresh", "-prepare"},
+			want: "flag provided but not defined: -prepare",
 		},
 		{
-			name: "backup flag",
-			args: []string{"-initialize-fresh", "-backup", "backup.db",
-				"-confirm-quiesced", confirmation},
-			want: "-backup cannot be used with -initialize-fresh",
+			name: "removed backup flag",
+			args: []string{"-initialize-fresh", "-backup", "backup.db"},
+			want: "flag provided but not defined: -backup",
+		},
+		{
+			name: "no mode",
+			args: nil,
+			want: "a mode is required",
 		},
 		{
 			name: "confirmation outside fresh mode",
-			args: []string{"-confirm-quiesced", confirmation},
+			args: []string{"-print-fresh-confirmation", "-expected-backends", `["backend-a"]`,
+				"-confirm-quiesced", confirmation},
 			want: "-confirm-quiesced is only valid with -initialize-fresh",
 		},
 		{
@@ -1138,9 +697,9 @@ func TestRun_InitializeFreshRejectsModeAndFlagConflicts(t *testing.T) {
 			want: "-expected-backends is required with -initialize-fresh",
 		},
 		{
-			name: "independent roster outside fresh mode",
+			name: "independent roster without a mode",
 			args: []string{"-expected-backends", `["backend-a"]`},
-			want: "-expected-backends is only valid with -initialize-fresh",
+			want: "a mode is required",
 		},
 		{
 			name: "removed ambiguous timeout flag",
@@ -1163,140 +722,6 @@ func TestRun_InitializeFreshRejectsModeAndFlagConflicts(t *testing.T) {
 	}
 }
 
-func TestRun_InconsistentInventoryExitsWithPreflightError(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`),
-	})
-	server := newInventoryServer(t,
-		[]backend.ProvisionInfo{{LeaseUUID: preflightCommandOtherLease}},
-		[]backend.RetainedLease{},
-	)
-	defer server.Close()
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-
-	var stdout bytes.Buffer
-	err := runWithDependencies(
-		t.Context(),
-		[]string{"-config", configPath},
-		&stdout,
-		&bytes.Buffer{},
-		legacyPreflightDependencies(preflightCommandProvisionLease, preflightCommandOtherLease),
-	)
-	require.ErrorIs(t, err, placement.ErrLegacyUpgradePreflight)
-	assert.ErrorContains(t, err,
-		`inventory lease "`+preflightCommandOtherLease+`" on backend "backend-a" has no eligible placement row`)
-	assert.ErrorContains(t, err,
-		`placement "`+preflightCommandProvisionLease+`" on backend "backend-a" is absent from complete backend inventory`)
-	assert.Empty(t, stdout.String(), "a failed preflight must never print PASS")
-}
-
-func TestRun_PrepareRejectsEmptyOrTruncatedSourceWithoutMutation(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		contents []byte
-	}{
-		{name: "zero length", contents: []byte{}},
-		{name: "truncated", contents: []byte{0x42, 0x4f, 0x4c, 0x54}},
-	}
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			tempDir := t.TempDir()
-			dbPath := filepath.Join(tempDir, "placements.db")
-			backupPath := filepath.Join(tempDir, "placements.v013.bak")
-			require.NoError(t, os.WriteFile(dbPath, test.contents, 0o600))
-			before, err := os.ReadFile(dbPath)
-			require.NoError(t, err)
-			configPath := writePreflightConfig(
-				t, dbPath, "https://127.0.0.1:1", "backend-a",
-			)
-			dependencies := defaultCommandDependencies()
-			dependencies.newInventoryClients = func(*config.Config) ([]inventoryClient, error) {
-				t.Fatal("invalid source must fail before backend client construction")
-				return nil, nil
-			}
-
-			var stdout bytes.Buffer
-			err = runWithDependencies(t.Context(), []string{
-				"-config", configPath, "-prepare", "-backup", backupPath,
-				"-attest-drained", placement.LegacyPreparationDrainAttestation,
-			}, &stdout, &bytes.Buffer{}, dependencies)
-			require.Error(t, err)
-			assert.Equal(t, 10, commandExitCode(err))
-			assert.Equal(t, `{"outcome":"not_mutated"}`+"\n", stdout.String())
-			after, readErr := os.ReadFile(dbPath)
-			require.NoError(t, readErr)
-			assert.Equal(t, before, after)
-			_, backupErr := os.Lstat(backupPath)
-			require.ErrorIs(t, backupErr, os.ErrNotExist)
-		})
-	}
-}
-
-func TestRun_ProvisionProviderMismatchIsNotDiscardedByInventoryAdapter(t *testing.T) {
-	t.Parallel()
-
-	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{
-		preflightCommandProvisionLease: []byte(
-			`{"backend":"backend-a","set_at":"2026-08-25T15:00:00Z"}`,
-		),
-	})
-	before, err := os.ReadFile(dbPath)
-	require.NoError(t, err)
-	const wrongProvider = "1e1698c3-a922-460a-8296-70efdbc03032"
-	server := newInventoryServer(t,
-		[]backend.ProvisionInfo{{
-			LeaseUUID: preflightCommandProvisionLease, ProviderUUID: wrongProvider,
-		}},
-		[]backend.RetainedLease{},
-	)
-	defer server.Close()
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-
-	var stdout bytes.Buffer
-	err = runWithDependencies(
-		t.Context(),
-		[]string{"-config", configPath},
-		&stdout,
-		&bytes.Buffer{},
-		legacyPreflightDependencies(preflightCommandProvisionLease),
-	)
-	require.ErrorIs(t, err, placement.ErrLegacyUpgradePreflight)
-	require.ErrorContains(t, err,
-		`provision "`+preflightCommandProvisionLease+`" reports provider "`+wrongProvider+`"`)
-	assert.Empty(t, stdout.String())
-	after, readErr := os.ReadFile(dbPath)
-	require.NoError(t, readErr)
-	assert.Equal(t, before, after)
-}
-
-func TestRun_IncompleteBackendInventoryFailsBeforeDatabaseVerdict(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	writeLegacyPlacementDB(t, dbPath, map[string][]byte{})
-	server := newVerifiedInventoryServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(backendidentity.ResponseHeader, "c0a8012e-b4ee-4f4d-9c31-7e6623928311")
-		if r.URL.Path == "/provisions" {
-			_ = json.NewEncoder(w).Encode(backend.ListProvisionsResponse{
-				Provisions: []backend.ProvisionInfo{},
-			})
-			return
-		}
-		http.Error(w, "inventory unavailable", http.StatusServiceUnavailable)
-	}))
-	defer server.Close()
-	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
-
-	err := run(t.Context(), []string{"-config", configPath}, &bytes.Buffer{}, &bytes.Buffer{})
-	require.Error(t, err)
-	assert.False(t, errors.Is(err, placement.ErrLegacyUpgradePreflight))
-	assert.ErrorContains(t, err, `backend "backend-a": collect complete retentions inventory`)
-}
-
 func TestCollectInventories_CancellationAbortsIncompleteSnapshot(t *testing.T) {
 	client := &blockingInventoryClient{started: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1307,53 +732,6 @@ func TestCollectInventories_CancellationAbortsIncompleteSnapshot(t *testing.T) {
 
 	_, err := collectInventories(ctx, []inventoryClient{client})
 	require.ErrorIs(t, err, context.Canceled)
-}
-
-func TestCollectInventoriesCarriesExactProvisionItems(t *testing.T) {
-	storageID, err := backendidentity.Parse("c0a8012e-b4ee-4f4d-9c31-7e6623928311")
-	require.NoError(t, err)
-
-	t.Run("empty backend has a nonnil exact item map", func(t *testing.T) {
-		inventories, collectErr := collectInventories(t.Context(), []inventoryClient{
-			&staticInventoryClient{
-				name: "backend-empty", storageID: storageID,
-				provisions: []backend.ProvisionInfo{}, retentions: []backend.RetainedLease{},
-			},
-		})
-		require.NoError(t, collectErr)
-		inventory := inventories["backend-empty"]
-		require.NotNil(t, inventory.ProvisionItems)
-		assert.Empty(t, inventory.ProvisionItems)
-	})
-
-	t.Run("populated backend clones every workload field", func(t *testing.T) {
-		items := []backend.LeaseItem{{
-			SKU:          "sku-stateful",
-			Quantity:     2,
-			ServiceName:  "db",
-			CustomDomain: "db.tenant.example",
-		}}
-		client := &staticInventoryClient{
-			name:       "backend-a",
-			storageID:  storageID,
-			retentions: []backend.RetainedLease{},
-			provisions: []backend.ProvisionInfo{{
-				LeaseUUID:    preflightCommandProvisionLease,
-				ProviderUUID: "provider-a",
-				Items:        items,
-			}},
-		}
-		inventories, collectErr := collectInventories(t.Context(), []inventoryClient{client})
-		require.NoError(t, collectErr)
-		got := inventories["backend-a"]
-		require.Equal(t, items, got.ProvisionItems[preflightCommandProvisionLease])
-
-		items[0].SKU = "mutated-caller"
-		client.provisions[0].Items[0].CustomDomain = "mutated.example"
-		assert.Equal(t, "sku-stateful", got.ProvisionItems[preflightCommandProvisionLease][0].SKU)
-		assert.Equal(t, "db.tenant.example",
-			got.ProvisionItems[preflightCommandProvisionLease][0].CustomDomain)
-	})
 }
 
 type staticInventoryClient struct {
@@ -1430,25 +808,6 @@ func newInventoryServer(
 			http.NotFound(w, r)
 		}
 	}))
-}
-
-func writeLegacyPlacementDB(t *testing.T, dbPath string, rows map[string][]byte) {
-	t.Helper()
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucket([]byte("placements"))
-		if err != nil {
-			return err
-		}
-		for leaseUUID, value := range rows {
-			if err := bucket.Put([]byte(leaseUUID), value); err != nil {
-				return err
-			}
-		}
-		return nil
-	}))
-	require.NoError(t, db.Close())
 }
 
 func freshInitializationArgs(t *testing.T, configPath string) []string {

@@ -14,13 +14,13 @@ import (
 	"github.com/manifest-network/fred/internal/backendname"
 )
 
-// AuthorityClassification is the schema-neutral result of inspecting one
-// stopped placement authority file. Only PristineV013 and PreparedCurrent are
-// safe answers to an indeterminate legacy-preparation commit.
+// AuthorityClassification is the result of inspecting one stopped placement
+// authority file. Only PreparedCurrent is a complete authority in the current
+// layout. A file still in the v0.13 layout is MixedOrIncomplete: this release
+// does not read that layout.
 type AuthorityClassification string
 
 const (
-	AuthorityPristineV013      AuthorityClassification = "pristine_v0_13"
 	AuthorityPreparedCurrent   AuthorityClassification = "prepared_current"
 	AuthorityMixedOrIncomplete AuthorityClassification = "mixed_or_incomplete"
 	AuthorityCorrupt           AuthorityClassification = "corrupt"
@@ -196,11 +196,10 @@ type AuthorityReport struct {
 	FenceRestartWouldRecordOmitted int      `json:"fence_restart_would_record_omitted,omitempty"`
 }
 
-// SafeForCutover reports whether the stopped file is wholly on one side of the
-// v0.13 preparation boundary. It says nothing about external drain evidence.
+// SafeForCutover reports whether the stopped file is one complete authority in
+// the current layout. It says nothing about external drain evidence.
 func (report AuthorityReport) SafeForCutover() bool {
-	return report.Classification == AuthorityPristineV013 ||
-		report.Classification == AuthorityPreparedCurrent
+	return report.Classification == AuthorityPreparedCurrent
 }
 
 type authorityAssessment struct {
@@ -558,11 +557,10 @@ func inspectAuthorityTransaction(
 	}
 	slices.Sort(assessment.report.TopLevelBuckets)
 
-	legacyShape := assessment.report.Counts.TopLevelBuckets == 1 && hasPlacements
 	currentShape := assessment.report.Counts.TopLevelBuckets == 3 &&
 		hasPlacements && hasLifecycle && hasMetadata
 
-	if !legacyShape && !currentShape {
+	if !currentShape {
 		assessment.mixedFinding(
 			"mixed_bucket_set",
 			"top-level buckets do not form one complete supported authority schema",
@@ -574,23 +572,14 @@ func inspectAuthorityTransaction(
 			"the placements bucket is missing",
 		)
 	}
-	// A partial bucket set is neither the exact v0.13 root nor the exact
-	// current root. Do not reinterpret its placement rows under either schema:
-	// doing so can incorrectly upgrade the more useful mixed/incomplete verdict
-	// to corruption merely because the remaining bucket still carries the other
-	// schema's row encoding.
-	if !legacyShape && !currentShape {
+	// Any other bucket set is not the exact current root. Do not read its
+	// placement rows under the current schema: doing so can turn the more
+	// useful mixed/incomplete verdict into corruption merely because a bucket
+	// still carries another layout's row encoding.
+	if !currentShape {
 		return
 	}
-
-	if legacyShape {
-		assessment.report.Classification = AuthorityPristineV013
-		inspectLegacyPlacementRows(tx.Bucket(bucketName), expectation, assessment)
-		return
-	}
-	if currentShape {
-		assessment.report.Classification = AuthorityPreparedCurrent
-	}
+	assessment.report.Classification = AuthorityPreparedCurrent
 
 	metadata, metadataDecoded := inspectCurrentMetadata(
 		tx.Bucket(metadataBucketName), expectation, assessment,
@@ -603,108 +592,6 @@ func inspectAuthorityTransaction(
 	inspectCurrentLifecycleRows(
 		lifecycleBucket, metadata, metadataDecoded, placementBucket, assessment,
 	)
-}
-
-func inspectLegacyPlacementRows(
-	bucket *bolt.Bucket,
-	expectation AuthorityExpectation,
-	assessment *authorityAssessment,
-) {
-	configured := stringSet(expectation.backendTopology)
-	if err := bucket.ForEach(func(key, value []byte) error {
-		assessment.report.Counts.PlacementRows++
-		leaseUUID, canonicalKey := authorityLeaseKey(key)
-		if value == nil || !canonicalKey {
-			assessment.corruptFinding(
-				"invalid_legacy_placement_row",
-				"a v0.13 placement row has an invalid key or nested value",
-			)
-			return nil
-		}
-		assessment.addReportableRow()
-		row := AuthorityRowFact{
-			LeaseUUID:        leaseUUID,
-			State:            "unusable",
-			LifecycleVerdict: "not_present_v0_13",
-		}
-		if len(value) > maxAuthorityRowValueBytes {
-			assessment.corruptFinding(
-				"oversized_legacy_placement_row",
-				"a v0.13 placement row exceeds the safe decoder bound",
-			)
-			assessment.setRow(row)
-			return nil
-		}
-		if revision, object, malformed := authorityRevisionHeader(value); object {
-			row.Revision = revision
-			switch {
-			case malformed:
-				assessment.corruptFinding(
-					"malformed_legacy_placement_json",
-					"a v0.13 placement JSON row is malformed",
-				)
-				assessment.setRow(row)
-				return nil
-			case revision != 0:
-				assessment.report.Counts.RevisionedPlacementRows++
-				assessment.mixedFinding(
-					"revisioned_row_in_legacy_shape",
-					"a revisioned placement exists without the complete current schema",
-				)
-				row.State = "mixed_revisioned"
-				assessment.setRow(row)
-				return nil
-			}
-		}
-		backendName, err := decodeV013PreflightPlacement(value)
-		if err != nil {
-			if json.Valid(value) {
-				assessment.mixedFinding(
-					"non_v013_row_in_legacy_shape",
-					"a valid JSON placement is not a v0.13 confirmed-owner row",
-				)
-			} else {
-				assessment.corruptFinding(
-					"undecodable_legacy_placement",
-					"a v0.13 placement row cannot be decoded safely",
-				)
-			}
-			assessment.setRow(row)
-			return nil
-		}
-		assessment.report.Counts.LegacyPlacementRows++
-		row.State = "confirmed"
-		if safeAuthorityBackendName(backendName) {
-			row.Backend = backendName
-		} else {
-			assessment.corruptFinding(
-				"legacy_backend_identity_invalid",
-				"a v0.13 placement backend cannot be rendered safely",
-			)
-		}
-		assessment.setRow(row)
-		if _, ok := configured[backendName]; !ok {
-			assessment.mixedFinding(
-				"legacy_backend_outside_expected_topology",
-				"a v0.13 placement names a backend outside the expected topology",
-			)
-		}
-		return nil
-	}); err != nil {
-		assessment.corruptFinding(
-			"legacy_placement_scan_failed",
-			"v0.13 placement rows could not be traversed",
-		)
-	}
-}
-
-// authorityRevisionHeader reduces the parser error to the only distinction the
-// classifier needs. Keeping an error out of the Bolt iterator's control flow
-// also makes explicit that malformed row data is a reported finding, not an
-// iterator failure.
-func authorityRevisionHeader(value []byte) (revision uint64, object, malformed bool) {
-	revision, object, err := preflightRevisionHeader(value)
-	return revision, object, err != nil
 }
 
 func inspectCurrentMetadata(

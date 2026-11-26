@@ -172,6 +172,18 @@ func canonicalFreshTargetPath(
 	return filepath.Join(parentPath, targetName), parentPath, identity, nil
 }
 
+// BackendInventory is one configured backend's complete provision and
+// retention inventory. Callers must include an entry for every configured
+// backend, including backends whose two inventories are empty. Provisions and
+// ProvisionProviderUUIDs are an exact pair: the map holds one observation for
+// every provision and no others.
+type BackendInventory struct {
+	StorageIdentity        backendidentity.ID
+	Provisions             []string
+	ProvisionProviderUUIDs map[string]string
+	Retentions             []string
+}
+
 // FreshChainSnapshot is the narrow read-only evidence produced by the
 // signer-free, height-pinned chain client. An implementation must represent a
 // complete all-state query for one provider at one positive block height.
@@ -682,7 +694,7 @@ func initializeFreshStoreContext(
 		if err := putTopologyMetadata(tx, metadata); err != nil {
 			return err
 		}
-		return initializeLifecycleCapabilities(tx, lifecycleInitializationEpoch{})
+		return initializeLifecycleCapabilities(tx)
 	}); err != nil {
 		return fmt.Errorf("initialize fresh placement database: %w", err)
 	}

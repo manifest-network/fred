@@ -495,7 +495,7 @@ operator acknowledgement includes the target parent's physical device/inode;
 the initializer rejects a rename/recreation between print and initialize and
 publishes descriptor-relatively with `renameat2(RENAME_NOREPLACE)`.
 
-Mutation modes that read backend inventory (`placement-preflight --prepare` / `--initialize-fresh`, and `placement-repair --apply`, including conflict repair) require certificate-verified HTTPS for every configured backend, independently of `production_mode`, and refuse to run while any configured backend is fenced. `placement-repair --apply` with `-attest-restored-backup` or `-retire-lost-backend` reads no backend inventory and has neither requirement. Use `tls_ca_file` for a private CA or system roots; existing mTLS credentials remain supported. HTTP and `tls_skip_verify` cannot authorize durable changes because request HMAC does not authenticate inventory responses. Read-only inspection and repair dry-runs may observe development HTTP endpoints; there is no insecure-backend-evidence override.
+Mutation modes that read backend inventory (`placement-preflight --initialize-fresh`, and `placement-repair --apply`, including conflict repair) require certificate-verified HTTPS for every configured backend, independently of `production_mode`, and refuse to run while any configured backend is fenced. `placement-repair --apply` with `-attest-restored-backup` or `-retire-lost-backend` reads no backend inventory and has neither requirement. Use `tls_ca_file` for a private CA or system roots; existing mTLS credentials remain supported. HTTP and `tls_skip_verify` cannot authorize durable changes because request HMAC does not authenticate inventory responses. Read-only inspection and repair dry-runs may observe development HTTP endpoints; there is no insecure-backend-evidence override.
 
 It is also bound at runtime to the exact regular-file inode opened at
 `placement_store_db_path`. Never copy over, unlink, rename, rotate, or restore
@@ -2015,7 +2015,7 @@ cmd/
 ├── providerd/          # Main daemon entry point
 ├── mock-backend/       # Mock backend for testing
 ├── docker-backend/     # Docker container backend
-├── placement-preflight/ # Offline placement inspector, v0.13 preparer, and fresh initializer
+├── placement-preflight/ # Offline fresh placement initializer
 ├── placement-repair/    # Offline placement inspector and exact repair tool
 ├── lease-token/        # Mints ADR-036 tenant bearer tokens for lease endpoints
 └── loadtest/           # Load testing tool (not built by `make all`; `go build ./cmd/loadtest`)

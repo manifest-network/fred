@@ -685,7 +685,8 @@ func (s *Store) VerifyBackendTopology(names []string) error {
 }
 
 // VerifyProviderUUID binds this placement authority to the exact provider
-// whose chain history authorized its creation or v0.13 preparation.
+// whose chain history authorized its creation, or its preparation by the 0.14
+// line when the provider upgraded from v0.13.
 func (s *Store) VerifyProviderUUID(providerUUID string) error {
 	if !canonicalLeaseUUID(providerUUID) {
 		return fmt.Errorf("%w: configured provider UUID %q is not canonical",

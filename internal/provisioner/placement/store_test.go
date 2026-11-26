@@ -301,7 +301,7 @@ func newStore(
 				return metadataErr
 			}
 		}
-		if lifecycleErr := initializeLifecycleCapabilities(tx, initializationEpoch); lifecycleErr != nil {
+		if lifecycleErr := adoptLegacyLifecycleCapabilities(tx, initializationEpoch); lifecycleErr != nil {
 			return lifecycleErr
 		}
 		if migrationErr := migrateLegacyConfirmedRevisions(tx); migrationErr != nil {
@@ -360,7 +360,7 @@ func TestOpenStoreIsExistingPreparedAndReadOnlyAtStartup(t *testing.T) {
 		assert.Zero(t, info.Size())
 	})
 
-	t.Run("legacy authority requires offline preparation without mutation", func(t *testing.T) {
+	t.Run("v0.13 layout is refused without mutation", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "legacy.db")
 		db, err := bolt.Open(path, 0o600, nil)
 		require.NoError(t, err)
@@ -377,6 +377,7 @@ func TestOpenStoreIsExistingPreparedAndReadOnlyAtStartup(t *testing.T) {
 
 		_, err = OpenStore(path, freshTestProviderUUID)
 		require.ErrorIs(t, err, ErrPreparationRequired)
+		require.ErrorContains(t, err, "final 0.14 release")
 		after, readErr := os.ReadFile(path)
 		require.NoError(t, readErr)
 		assert.Equal(t, before, after)

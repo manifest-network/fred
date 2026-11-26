@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -346,139 +345,15 @@ type persistedLifecycleCapability struct {
 	Unusable       bool   `json:"unusable,omitempty"`
 }
 
-// lifecycleInitializationEpoch captures upgrade provenance before NewStore
-// creates either post-v0.13 bucket or migrates any placement revision. Legacy
-// adoption is safe only when the whole database, not merely one lease, is
-// provably crossing that boundary for the first time.
-type lifecycleInitializationEpoch struct {
-	lifecycleBucketAbsent  bool
-	metadataBucketAbsent   bool
-	noRevisionedPlacements bool
-}
-
-func captureLifecycleInitializationEpoch(
-	tx *bolt.Tx,
-) (lifecycleInitializationEpoch, error) {
-	epoch := lifecycleInitializationEpoch{
-		lifecycleBucketAbsent:  tx.Bucket(lifecycleCapabilityBucketName) == nil,
-		metadataBucketAbsent:   tx.Bucket(metadataBucketName) == nil,
-		noRevisionedPlacements: true,
-	}
-	placements := tx.Bucket(bucketName)
-	if placements == nil {
-		return epoch, nil
-	}
-	if err := placements.ForEach(func(_ []byte, value []byte) error {
-		trimmed := bytes.TrimSpace(value)
-		if len(trimmed) == 0 || trimmed[0] != '{' {
-			// Pre-revision raw backend records cannot carry a revision field.
-			return nil
-		}
-		var header struct {
-			Revision uint64 `json:"revision"`
-		}
-		if decodeErr := json.Unmarshal(trimmed, &header); decodeErr != nil {
-			// An unreadable object cannot prove that it lacks a revision, so the
-			// entire epoch is ineligible even though that row is also quarantined.
-			epoch.noRevisionedPlacements = false
-		} else if header.Revision != 0 {
-			epoch.noRevisionedPlacements = false
-		}
-		return nil
-	}); err != nil {
-		return lifecycleInitializationEpoch{}, fmt.Errorf(
-			"scan placement revisions for lifecycle initialization: %w", err,
-		)
-	}
-	return epoch, nil
-}
-
-func (epoch lifecycleInitializationEpoch) permitsLegacyAdoption() bool {
-	return epoch.lifecycleBucketAbsent && epoch.metadataBucketAbsent &&
-		epoch.noRevisionedPlacements
-}
-
-func initializeLifecycleCapabilities(
-	tx *bolt.Tx,
-	epoch lifecycleInitializationEpoch,
-) error {
-	capabilities := tx.Bucket(lifecycleCapabilityBucketName)
-	var err error
-	if capabilities == nil {
-		capabilities, err = tx.CreateBucketIfNotExists(lifecycleCapabilityBucketName)
-	}
-	if err != nil {
+// initializeLifecycleCapabilities creates the lifecycle capability bucket of a
+// new placement database. It writes no capability: a lease obtains one only
+// from the online provision path.
+func initializeLifecycleCapabilities(tx *bolt.Tx) error {
+	if _, err := tx.CreateBucketIfNotExists(lifecycleCapabilityBucketName); err != nil {
 		return fmt.Errorf("create placement lifecycle capability bucket: %w", err)
 	}
-	placements := tx.Bucket(bucketName)
-	if placements == nil {
+	if tx.Bucket(bucketName) == nil {
 		return errors.New("placements bucket missing")
-	}
-
-	// Only a first-open v0.13 epoch plus a revision-zero placement proves this
-	// database has never issued typed lifecycle authority. If either post-v0.13
-	// bucket already existed, or any placement was already revisioned before
-	// initialization, every missing row remains fail-closed: recreating it as
-	// tokenless could downgrade formerly typed authority after corruption,
-	// pruning, downgrade, or bucket deletion.
-	if !epoch.permitsLegacyAdoption() {
-		return nil
-	}
-	return placements.ForEach(func(key, value []byte) error {
-		// v0.13 chose raw-vs-object decoding solely from the first stored
-		// byte. Reuse that exact, strict grammar here so printable raw names
-		// which are also JSON scalars (for example "null" or "[]") receive
-		// the same legacy lifecycle authority proved by preflight.
-		backendName, decodeErr := decodeV013PreflightPlacement(value)
-		if decodeErr != nil {
-			// Invalid v0.13 rows are quarantined lease-locally. They must not
-			// prevent valid peers in the same proven legacy epoch from adopting
-			// their tokenless lifecycle authority.
-			backendName = ""
-		}
-		if backendName == "" || capabilities.Get(key) != nil {
-			return nil
-		}
-		encoded, encodeErr := encodeLifecycleCapability(lifecycleCapability{
-			backend: backendName,
-		})
-		if encodeErr != nil {
-			return fmt.Errorf("encode adopted legacy lifecycle capability %q: %w", string(key), encodeErr)
-		}
-		if putErr := capabilities.Put(key, encoded); putErr != nil {
-			return fmt.Errorf("write adopted legacy lifecycle capability %q: %w", string(key), putErr)
-		}
-		return nil
-	})
-}
-
-// pruneDetachedRetiredLifecycleCapabilities removes completed lifecycle
-// history left by older versions. An active capability without a placement is
-// outstanding teardown authority and must remain durable until its exact
-// terminal observation consumes it. A retired capability that still shares a
-// row with an unresolved typed attempt must likewise remain until settlement.
-func pruneDetachedRetiredLifecycleCapabilities(tx *bolt.Tx) error {
-	placements := tx.Bucket(bucketName)
-	capabilities := tx.Bucket(lifecycleCapabilityBucketName)
-	if placements == nil || capabilities == nil {
-		return errors.New("placement lifecycle buckets missing")
-	}
-
-	var prune [][]byte
-	if err := capabilities.ForEach(func(key, value []byte) error {
-		capability, decodeErr := decodeLifecycleCapability(value)
-		if decodeErr == nil && capability.retired && capability.attemptBackend == "" &&
-			placements.Get(key) == nil {
-			prune = append(prune, append([]byte(nil), key...))
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("scan detached retired lifecycle capabilities: %w", err)
-	}
-	for _, key := range prune {
-		if err := capabilities.Delete(key); err != nil {
-			return fmt.Errorf("delete detached retired lifecycle capability %q: %w", string(key), err)
-		}
 	}
 	return nil
 }
