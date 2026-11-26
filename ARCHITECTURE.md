@@ -1443,7 +1443,7 @@ releases ownership. The durable row is the authority, while the periodic
 30-second sweep discovers startup work and retries dormant failed heads. Current outbox rows
 and compact terminal receipts carry a required wire version and reject duplicate,
 unknown, or future-schema fields recursively. Nothing decodes versionless v0.13
-callback rows: the stopped upgrade inspector only counts the rows in
+callback rows: the read-only inspector only counts the rows in
 `pending_callbacks`, and current runtime requires that bucket to be empty and
 never decodes or replays it. An
 unknown top-level `callbacks.db` bucket refuses current startup so a downgrade

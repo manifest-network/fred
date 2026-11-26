@@ -200,10 +200,11 @@ lease-local and retryable; other leases remain available.
 When recovery records maintenance Success followed by runtime Failed, both
 rows are maintenance-derived exact deliveries; removing only the Success head
 does not release the fence.
-The legacy v0.13 lease-keyed queue must be empty before upgrade: current startup
+The legacy v0.13 lease-keyed queue must be empty: current startup
 and health refuse a nonempty old bucket, and the current sender never invents a
-storage identity for an old row. See `DEPLOYMENT.md` for the stopped cutover;
-rolling either direction across this callback-store boundary is unsupported.
+storage identity for an old row. The final 0.14 release performs that stopped
+cutover; rolling either direction across this callback-store boundary is
+unsupported.
 
 Provision/restore admission also commits an immutable per-lease Pending operation row,
 including the exact resolved CPU/memory/durable-disk/scratch profiles, before its first
