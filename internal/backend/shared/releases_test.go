@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1470,4 +1471,36 @@ func TestReleaseStoreOpensAndReadsHistoricalPolicyRows(t *testing.T) {
 	active, err := store.LatestActive(leaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, 3, active.Version)
+}
+
+// The read-only inspector reports which leases hold an active release. Fresh
+// initialization counts them to refuse a backend that is not empty.
+func TestReleaseInspectionReportsLeasesWithAnActiveRelease(t *testing.T) {
+	const (
+		activeLease = "11111111-1111-4111-8111-111111111111"
+		failedLease = "22222222-2222-4222-8222-222222222222"
+	)
+	path, _ := initializeBoundReleaseStore(t)
+	created := time.Unix(1_700_000_000, 0).UTC()
+	manifestJSON := []byte(`{"services":{"web":{"image":"nginx"}}}`)
+	writeRawReleaseHistory(t, path, activeLease, []Release{
+		{Version: 1, Manifest: manifestJSON, Image: "stack", Status: "active", CreatedAt: created},
+	})
+	writeRawReleaseHistory(t, path, failedLease, []Release{
+		{Version: 1, Manifest: manifestJSON, Image: "stack", Status: "failed", CreatedAt: created},
+	})
+
+	inspection, err := InspectReleaseStoreReadOnly(path)
+	require.NoError(t, err)
+	require.True(t, inspection.IdentityBound)
+	require.Contains(t, inspection.ActiveLeaseUUIDs, activeLease)
+	require.NotContains(t, inspection.ActiveLeaseUUIDs, failedLease)
+}
+
+// A journal file that is not there is reported as missing, not opened empty.
+func TestOpenExistingBoltDBReportsAMissingFile(t *testing.T) {
+	db, info, err := openExistingBoltDB(filepath.Join(t.TempDir(), "missing.db"), true, false)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Nil(t, db)
+	require.Nil(t, info)
 }
