@@ -412,6 +412,34 @@ func TestRun_InitializeFreshRefusesNonemptyBackendBeforeChainQuery(t *testing.T)
 	require.ErrorIs(t, statErr, os.ErrNotExist)
 }
 
+// A backend that still holds retained data is not empty, even with no
+// provision: fresh initialization refuses it before any chain query.
+func TestRun_InitializeFreshRefusesBackendHoldingRetainedData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "placements.db")
+	server := newInventoryServer(t,
+		[]backend.ProvisionInfo{},
+		[]backend.RetainedLease{{LeaseUUID: preflightCommandProvisionLease}},
+	)
+	defer server.Close()
+	configPath := writePreflightConfig(t, dbPath, server.URL, "backend-a")
+	dependencies := defaultCommandDependencies()
+	var chainFactoryCalled bool
+	dependencies.newFreshChainClient = func(
+		chain.ReadOnlyClientConfig,
+	) (freshChainClient, error) {
+		chainFactoryCalled = true
+		return nil, errors.New("chain must not be queried for a nonempty backend")
+	}
+
+	err := runWithDependencies(t.Context(), freshInitializationArgs(t, configPath),
+		&bytes.Buffer{}, &bytes.Buffer{}, dependencies)
+	require.ErrorIs(t, err, placement.ErrFreshInitializationProof)
+	assert.ErrorContains(t, err, `backend "backend-a" is not empty (0 provisions, 1 retentions)`)
+	assert.False(t, chainFactoryCalled)
+	_, statErr := os.Stat(dbPath)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
 func TestRun_InitializeFreshRequiresExactQuiescenceConfirmation(t *testing.T) {
 	for _, confirmation := range []string{"", "I confirm the provider and all backends are quiesced"} {
 		t.Run(fmt.Sprintf("confirmation=%q", confirmation), func(t *testing.T) {
