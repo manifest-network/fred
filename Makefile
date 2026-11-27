@@ -102,6 +102,11 @@ test:
 test-models:
 	python3 models/quint/run.py
 
+# Check the cases marked exhaustive in every reachable state (needs Java)
+.PHONY: test-models-exhaustive
+test-models-exhaustive:
+	python3 models/quint/verify.py
+
 # Run volume unit tests (no special requirements)
 test-volume:
 	@echo "Running volume unit tests..."
@@ -254,6 +259,7 @@ help:
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  test                    - Run tests"
 	@echo "  test-models             - Run the pinned Quint simulation suite"
+	@echo "  test-models-exhaustive  - Check the exhaustive Quint cases in every reachable state (Java)"
 	@echo "  test-volume             - Run volume unit tests"
 	@echo "  test-integration               - Run Docker integration tests (sudo, Docker, xfsprogs)"
 	@echo "  test-e2e                - Run the black-box suite in test/e2e (sudo, Docker, xfsprogs, capsh)"
