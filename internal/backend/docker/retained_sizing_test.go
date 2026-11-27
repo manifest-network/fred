@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
@@ -50,6 +51,18 @@ func reopenRetentionStoreWithV013Row(t *testing.T, b *Backend, entry shared.Rete
 	require.NoError(t, err)
 	b.restoreSettlement = restore
 	return reopened
+}
+
+// writeRawLegacyRetentionRow puts row under leaseUUID in the retention bucket
+// of a closed retention journal.
+func writeRawLegacyRetentionRow(t *testing.T, dbPath, leaseUUID string, row []byte) {
+	t.Helper()
+	db, err := bolt.Open(dbPath, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("retention")).Put([]byte(leaseUUID), row)
+	}))
+	require.NoError(t, db.Close())
 }
 
 // frozenRetainedProfilesForTest returns the sizing Start freezes onto a

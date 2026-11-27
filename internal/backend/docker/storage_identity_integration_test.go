@@ -18,7 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manifest-network/fred/internal/backend/shared/manifest"
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
@@ -27,22 +26,13 @@ import (
 // boundary. The callback database and marker pair are real bbolt/filesystem
 // artifacts, so this covers the v0.13 evidence -> seal -> verify-only restart
 // sequence without depending on a host Docker daemon or quota filesystem.
-func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
-	t.Run("empty lineage rejects adopt and initializes new", func(t *testing.T) {
+func TestIntegrationStorageIdentityInitialization(t *testing.T) {
+	t.Run("empty backend initializes and reruns verify-only", func(t *testing.T) {
 		server := newStorageIdentityDockerServer(t, nil)
 		cfg := storageIdentityIntegrationConfig(t, server.URL)
-		writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-		writeLegacyAuthorityStores(t, cfg)
-
-		_, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeAdopt,
-		)
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "-initialize-storage-identity new")
-		assertNoStorageIdentityMarkers(t, cfg)
 
 		initialized, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.NoError(t, err)
 		require.True(t, initialized.Valid())
@@ -53,7 +43,7 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 		)
 		require.NoError(t, os.Link(primaryPath, interruptedPublish))
 		rerun, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.NoError(t, err)
 		assert.Equal(t, initialized, rerun, "committed initializer rerun must be verify-only")
@@ -62,56 +52,21 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 		assertStorageIdentitySurvivesVerifyOnlyRestart(t, cfg, initialized)
 	})
 
-	t.Run("managed v0.13 lineage rejects new and adopts", func(t *testing.T) {
-		// v0.13 persisted one tokenless callback URL and had no lifecycle
-		// callback label. Keep this fixture byte-shape faithful so adoption does
-		// not accidentally rely on labels introduced by the new protocol.
-		const callbackURL = "https://fred.example/callbacks/provision"
-		const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-		server := newStorageIdentityDockerServer(t, []container.Summary{{
-			ID:    "managed-container-a",
-			Names: []string{"/fred-" + leaseUUID + "-app-0"},
-			Image: "docker.io/library/alpine:3.22",
-			Labels: map[string]string{
-				LabelManaged:       "true",
-				LabelBackendName:   "docker",
-				LabelLeaseUUID:     leaseUUID,
-				LabelTenant:        "tenant-a",
-				LabelProviderUUID:  "22222222-2222-4222-8222-222222222222",
-				LabelSKU:           "sku-stateless",
-				LabelInstanceIndex: "0",
-				LabelServiceName:   manifest.DefaultServiceName,
-				LabelCallbackURL:   callbackURL,
-			},
-		}})
+	// Journals that exist without a storage identity are a v0.13 lineage. This
+	// release seals only an empty backend, so it refuses them, empty or not,
+	// and leaves them unsealed for the final 0.14 release to adopt.
+	t.Run("v0.13 journals are refused and left unsealed", func(t *testing.T) {
+		server := newStorageIdentityDockerServer(t, nil)
 		cfg := storageIdentityIntegrationConfig(t, server.URL)
 		writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
 		writeLegacyAuthorityStores(t, cfg)
-		writeRawV013ReleaseHistory(t, cfg.ReleasesDBPath, leaseUUID, []v013ReleaseWire{{
-			Version:  1,
-			Manifest: []byte(`{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}}`),
-			Image:    "stack",
-			Status:   "active",
-		}})
 
 		_, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "use adopt for a verified v0.13 lineage")
+		require.ErrorContains(t, err, "3 of 3 authoritative backend journals exist without a storage identity")
+		assert.ErrorContains(t, err, "final 0.14 release")
 		assertNoStorageIdentityMarkers(t, cfg)
-
-		initialized, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeAdopt,
-		)
-		require.NoError(t, err)
-		require.True(t, initialized.Valid())
-		rerun, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeAdopt,
-		)
-		require.NoError(t, err)
-		assert.Equal(t, initialized, rerun, "committed initializer rerun must be verify-only")
-		assertStorageIdentitySurvivesVerifyOnlyRestart(t, cfg, initialized)
 	})
 
 	t.Run("committed rerun refuses a daemon swap before marker recovery", func(t *testing.T) {
@@ -126,11 +81,9 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 			return "daemon-system-a"
 		})
 		cfg := storageIdentityIntegrationConfig(t, server.URL)
-		writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-		writeLegacyAuthorityStores(t, cfg)
 
 		_, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.NoError(t, err)
 		primaryPath := filepath.Clean(cfg.CallbackDBPath) + ".storage-identity.json"
@@ -141,7 +94,7 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 		require.NoError(t, os.Link(primaryPath, interruptedPublish))
 
 		_, err = InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.ErrorContains(t, err, "docker daemon identity changed during lineage proof")
 		_, statErr := os.Lstat(interruptedPublish)
@@ -162,15 +115,13 @@ func TestIntegrationStorageIdentityInitializationV013Modes(t *testing.T) {
 			return "daemon-system-a"
 		})
 		cfg := storageIdentityIntegrationConfig(t, server.URL)
-		writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-		writeLegacyAuthorityStores(t, cfg)
 
 		_, err := InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.NoError(t, err)
 		_, err = InitializeStorageIdentityForConfig(
-			t.Context(), cfg, discardStorageIdentityLogger(), StorageIdentityInitializeNew,
+			t.Context(), cfg, discardStorageIdentityLogger(),
 		)
 		require.ErrorContains(t, err, "docker daemon identity changed during lineage proof")
 	})

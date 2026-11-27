@@ -16,166 +16,8 @@ import (
 	"github.com/manifest-network/fred/internal/backend"
 )
 
-func TestStorageIdentityContainerVolumeEvidenceRequiresExactContainerIdentity(t *testing.T) {
-	const (
-		leaseA = "11111111-1111-4111-8111-111111111111"
-		leaseB = "22222222-2222-4222-8222-222222222222"
-	)
-	tests := []struct {
-		name        string
-		volumeName  string
-		serviceName string
-		index       int
-		wantError   bool
-	}{
-		{name: "current", volumeName: canonicalVolumeName(leaseA, "web", 2), serviceName: "web", index: 2},
-		{
-			name: "legacy v0.13 form is not exact current identity", volumeName: "fred-" + leaseA + "-2",
-			serviceName: "app", index: 2, wantError: true,
-		},
-		{name: "foreign lease", volumeName: canonicalVolumeName(leaseB, "web", 2), serviceName: "web", index: 2, wantError: true},
-		{name: "wrong service", volumeName: canonicalVolumeName(leaseA, "worker", 2), serviceName: "web", index: 2, wantError: true},
-		{name: "wrong index", volumeName: canonicalVolumeName(leaseA, "web", 1), serviceName: "web", index: 2, wantError: true},
-		{name: "retained namespace", volumeName: retainedName(canonicalVolumeName(leaseA, "web", 2)), serviceName: "web", index: 2, wantError: true},
-		{name: "noncanonical index", volumeName: "fred-" + leaseA + "-web-02", serviceName: "web", index: 2, wantError: true},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			source := filepath.Join(root, test.volumeName, "data")
-			require.NoError(t, os.MkdirAll(source, 0o700))
-			cfg := DefaultConfig()
-			cfg.VolumeDataPath = root
-			cfg.SKUProfiles = map[string]SKUProfile{
-				"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 1024},
-			}
-			container := ContainerInfo{
-				ContainerID:   "container-a",
-				LeaseUUID:     leaseA,
-				SKU:           "stateful",
-				ServiceName:   test.serviceName,
-				InstanceIndex: test.index,
-				Mounts: []ContainerMount{{
-					Type: "bind", Source: source, Target: "/data",
-				}},
-			}
-
-			evidence, err := storageIdentityContainerVolumeEvidence(cfg, []ContainerInfo{container})
-			if test.wantError {
-				require.Error(t, err)
-				assert.Empty(t, evidence)
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, map[string]struct{}{test.volumeName: {}}, evidence)
-		})
-	}
-}
-
-func TestStorageIdentityContainerVolumeEvidenceRejectsCrossVolumeSymlink(t *testing.T) {
-	const (
-		leaseA = "11111111-1111-4111-8111-111111111111"
-		leaseB = "22222222-2222-4222-8222-222222222222"
-	)
-	root := t.TempDir()
-	volumeA := canonicalVolumeName(leaseA, "app", 0)
-	volumeB := canonicalVolumeName(leaseB, "app", 0)
-	require.NoError(t, os.Mkdir(filepath.Join(root, volumeA), 0o700))
-	require.NoError(t, os.MkdirAll(filepath.Join(root, volumeB, "data"), 0o700))
-	require.NoError(t, os.Symlink(
-		filepath.Join("..", volumeB, "data"),
-		filepath.Join(root, volumeA, "data"),
-	))
-	cfg := DefaultConfig()
-	cfg.VolumeDataPath = root
-	cfg.SKUProfiles = map[string]SKUProfile{
-		"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 1024},
-	}
-
-	_, err := storageIdentityContainerVolumeEvidence(cfg, []ContainerInfo{
-		{
-			ContainerID: "container-a", LeaseUUID: leaseA, SKU: "stateful",
-			ServiceName: "app", InstanceIndex: 0,
-			Mounts: []ContainerMount{{
-				Type: "bind", Source: filepath.Join(root, volumeA, "data"), Target: "/data",
-			}},
-		},
-		{
-			ContainerID: "container-b", LeaseUUID: leaseB, SKU: "stateful",
-			ServiceName: "app", InstanceIndex: 0,
-			Mounts: []ContainerMount{{
-				Type: "bind", Source: filepath.Join(root, volumeB, "data"), Target: "/data",
-			}},
-		},
-	})
-	require.ErrorContains(t, err, "is not a real directory")
-}
-
-func TestStorageIdentityContainerVolumeEvidenceRejectsWrongSourceSubtree(t *testing.T) {
-	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	root := t.TempDir()
-	volumeName := canonicalVolumeName(leaseUUID, "app", 0)
-	wrongSource := filepath.Join(root, volumeName, "other")
-	require.NoError(t, os.MkdirAll(wrongSource, 0o700))
-	cfg := DefaultConfig()
-	cfg.VolumeDataPath = root
-	cfg.SKUProfiles = map[string]SKUProfile{
-		"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 1024},
-	}
-
-	_, err := storageIdentityContainerVolumeEvidence(cfg, []ContainerInfo{{
-		ContainerID: "container-a", LeaseUUID: leaseUUID, SKU: "stateful",
-		ServiceName: "app", InstanceIndex: 0,
-		Mounts: []ContainerMount{{
-			Type: "bind", Source: wrongSource, Target: "/data",
-		}},
-	}})
-	require.ErrorContains(t, err, "does not match target-derived subtree")
-}
-
-func TestManagedVolumeEvidenceAuthorityPreservesExactV013Forms(t *testing.T) {
-	const leaseUUID = "019d1234-5678-7abc-8def-0123456789ab"
-	authority, err := managedVolumeEvidenceAuthorityForLease(
-		leaseUUID,
-		[]backend.LeaseItem{{SKU: "stateful", Quantity: 2}},
-	)
-	require.NoError(t, err)
-
-	for _, value := range []string{
-		canonicalVolumeName(leaseUUID, "app", 0),
-		retainedName(canonicalVolumeName(leaseUUID, "app", 1)),
-		fmt.Sprintf("fred-%s-0", leaseUUID),
-		fmt.Sprintf("fred-retained-%s-1", leaseUUID),
-	} {
-		name, parseErr := parseManagedVolumeName(value)
-		require.NoError(t, parseErr)
-		assert.True(t, authority.containsEither(name), value)
-	}
-
-	for _, value := range []string{
-		canonicalVolumeName(leaseUUID, "db", 0),
-		canonicalVolumeName(leaseUUID, "app", 2),
-		fmt.Sprintf("fred-%s-2", leaseUUID),
-	} {
-		name, parseErr := parseManagedVolumeName(value)
-		require.NoError(t, parseErr)
-		assert.False(t, authority.containsEither(name), value)
-	}
-
-	live, err := parseManagedVolumeName(canonicalVolumeName(leaseUUID, "app", 0))
-	require.NoError(t, err)
-	assert.False(t, authority.containsRetained(live), "retention rows cannot claim the live namespace")
-}
-
-func TestInitializeStorageIdentityRejectsMalformedManagedVolumeBeforePublication(t *testing.T) {
-	cfg := storageIdentityLegacyRetentionTestConfig(t)
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-
-	const malformed = "fred-11111111-1111-4111-8111-111111111111-app-01"
-	dockerClient := &mockDockerClient{
+func storageIdentityEmptyBackendDockerMock() *mockDockerClient {
+	return &mockDockerClient{
 		PingFn: func(context.Context) error { return nil },
 		DaemonInfoFn: func(context.Context) (DaemonSecurityInfo, error) {
 			return DaemonSecurityInfo{SystemID: "daemon-system-a"}, nil
@@ -184,64 +26,70 @@ func TestInitializeStorageIdentityRejectsMalformedManagedVolumeBeforePublication
 			return nil, nil
 		},
 	}
+}
+
+// assertStorageIdentityNotInitialized proves a refused initialization created
+// neither a marker nor an authoritative journal.
+func assertStorageIdentityNotInitialized(t *testing.T, cfg Config) {
+	t.Helper()
+	assertNoStorageIdentityMarkers(t, cfg)
+	for _, path := range []string{cfg.CallbackDBPath, cfg.ReleasesDBPath, cfg.RetentionDBPath} {
+		assert.NoFileExists(t, path)
+	}
+}
+
+func TestInitializeStorageIdentityRejectsMalformedManagedVolumeBeforePublication(t *testing.T) {
+	cfg := storageIdentityEvidenceTestConfig(t)
+
+	const malformed = "fred-11111111-1111-4111-8111-111111111111-app-01"
 	volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
 		return []string{malformed}, nil
 	}}
 
 	_, err := initializeStorageIdentityWithDependencies(
-		t.Context(), cfg, StorageIdentityInitializeAdopt, dockerClient, volumes,
+		t.Context(), cfg, storageIdentityEmptyBackendDockerMock(), volumes,
 	)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "name is invalid")
-	assertStorageIdentityAuthorityUnchanged(t, cfg, before)
+	assertStorageIdentityNotInitialized(t, cfg)
 }
 
-func TestStorageIdentityProofRejectsUnattestedManagedVolumeBeforePublication(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		run  func(context.Context, Config, storageIdentityProofClient, storageIdentityProofVolumes) error
-	}{
-		{
-			name: "read-only preflight",
-			run: func(ctx context.Context, cfg Config, dockerClient storageIdentityProofClient, volumes storageIdentityProofVolumes) error {
-				_, err := preflightWithDifferentialAudit(t, ctx, cfg, dockerClient, volumes)
-				return err
-			},
+func TestInitializeStorageIdentityRejectsUnattestedManagedVolumeBeforePublication(t *testing.T) {
+	cfg := storageIdentityEvidenceTestConfig(t)
+	name := canonicalVolumeName("11111111-1111-4111-8111-111111111111", "app", 0)
+	var attested bool
+	volumes := &mockVolumeManager{
+		ListFn: func() ([]string, error) { return []string{name}, nil },
+		AttestManagedVolumeFn: func(ctx context.Context, got managedVolumeName) error {
+			attested = true
+			assert.Equal(t, name, got.value())
+			return errors.New("plain directory has no quota substrate")
 		},
-		{
-			name: "initializer",
-			run: func(ctx context.Context, cfg Config, dockerClient storageIdentityProofClient, volumes storageIdentityProofVolumes) error {
-				_, err := initializeStorageIdentityWithDependencies(
-					ctx, cfg, StorageIdentityInitializeAdopt, dockerClient, volumes,
-				)
-				return err
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cfg := storageIdentityLegacyRetentionTestConfig(t)
-			writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-			writeLegacyAuthorityStores(t, cfg)
-			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-			name := canonicalVolumeName("11111111-1111-4111-8111-111111111111", "app", 0)
-			var attested bool
-			volumes := &mockVolumeManager{
-				ListFn: func() ([]string, error) { return []string{name}, nil },
-				AttestManagedVolumeFn: func(ctx context.Context, got managedVolumeName) error {
-					attested = true
-					assert.Equal(t, name, got.value())
-					return errors.New("plain directory has no quota substrate")
-				},
-			}
-			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-			defer cancel()
-
-			err := test.run(ctx, cfg, storageIdentityPreflightDockerMock(t), volumes)
-			require.ErrorContains(t, err, "plain directory has no quota substrate")
-			assert.True(t, attested)
-			assertStorageIdentityAuthorityUnchanged(t, cfg, before)
-		})
 	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	_, err := initializeStorageIdentityWithDependencies(
+		ctx, cfg, storageIdentityEmptyBackendDockerMock(), volumes,
+	)
+	require.ErrorContains(t, err, "plain directory has no quota substrate")
+	assert.True(t, attested)
+	assertStorageIdentityNotInitialized(t, cfg)
+}
+
+// A managed volume on the host means the backend is not empty, whatever the
+// journals say.
+func TestInitializeStorageIdentityRefusesBackendWithManagedVolume(t *testing.T) {
+	cfg := storageIdentityEvidenceTestConfig(t)
+	name := canonicalVolumeName("11111111-1111-4111-8111-111111111111", "app", 0)
+	volumes := &mockVolumeManager{ListFn: func() ([]string, error) { return []string{name}, nil }}
+
+	_, err := initializeStorageIdentityWithDependencies(
+		t.Context(), cfg, storageIdentityEmptyBackendDockerMock(), volumes,
+	)
+	require.ErrorContains(t, err, "new storage identity requires an empty backend")
+	assert.ErrorContains(t, err, "managed_volumes=1")
+	assertStorageIdentityNotInitialized(t, cfg)
 }
 
 func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testing.T) {
@@ -285,100 +133,79 @@ func TestAttestManagedVolumeInventoryPreservesNonVolumeNamespaceEntries(t *testi
 	}
 }
 
-func TestStorageIdentityAdoptionRejectsRetentionVolumeIdentityMismatch(t *testing.T) {
+// A mount source that reaches another lease's volume through a symlinked
+// component is not a subtree of the exact managed volume.
+func TestRequireManagedVolumeMountSourceRejectsCrossVolumeSymlink(t *testing.T) {
 	const (
-		source = "33333333-3333-4333-8333-333333333333"
-		other  = "44444444-4444-4444-8444-444444444444"
+		leaseA = "11111111-1111-4111-8111-111111111111"
+		leaseB = "22222222-2222-4222-8222-222222222222"
 	)
-	tests := []struct {
-		name       string
-		volumeName string
-	}{
-		{name: "wrong namespace", volumeName: canonicalVolumeName(source, "app", 0)},
-		{name: "wrong lease", volumeName: retainedName(canonicalVolumeName(other, "app", 0))},
-		{name: "wrong service", volumeName: retainedName(canonicalVolumeName(source, "db", 0))},
-		{name: "index outside quantity", volumeName: retainedName(canonicalVolumeName(source, "app", 1))},
-	}
+	root := t.TempDir()
+	volumeA := canonicalVolumeName(leaseA, "app", 0)
+	volumeB := canonicalVolumeName(leaseB, "app", 0)
+	require.NoError(t, os.Mkdir(filepath.Join(root, volumeA), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, volumeB, "data"), 0o700))
+	require.NoError(t, os.Symlink(
+		filepath.Join("..", volumeB, "data"),
+		filepath.Join(root, volumeA, "data"),
+	))
+	nameA, err := parseManagedVolumeName(volumeA)
+	require.NoError(t, err)
+	nameB, err := parseManagedVolumeName(volumeB)
+	require.NoError(t, err)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			cfg := storageIdentityLegacyRetentionTestConfig(t)
-			cfg.VolumeDataPath = t.TempDir()
-			writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-			writeLegacyAuthorityStores(t, cfg)
-			require.NoError(t, os.Mkdir(filepath.Join(cfg.VolumeDataPath, test.volumeName), 0o700))
-			row := []byte(`{"original_lease_uuid":"` + source +
-				`","tenant":"tenant-a","provider_uuid":"55555555-5555-4555-8555-555555555555",` +
-				`"items":[{"sku":"sku-stateful","quantity":1,"service_name":"app"}],` +
-				`"stack_manifest":{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}},` +
-				`"callback_url":"https://fred.example/callbacks/provision",` +
-				`"retained_volume_names":["` + test.volumeName + `"],"status":"active",` +
-				`"generation":0,"created_at":"2026-01-01T02:03:04Z",` +
-				`"restoring_since":"0001-01-01T00:00:00Z","reaping_since":"0001-01-01T00:00:00Z"}`)
-			writeRawLegacyRetentionRow(t, cfg.RetentionDBPath, source, row)
-			before := snapshotStorageIdentityAuthorityFiles(t, cfg)
-			volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
-				return []string{test.volumeName}, nil
-			}}
-
-			verdict, err := preflightWithDifferentialAudit(
-				t, t.Context(), cfg, storageIdentityPreflightDockerMock(t), volumes,
-			)
-			require.Error(t, err)
-			assert.Empty(t, verdict)
-			assert.ErrorContains(t, err, "is not an exact retained identity")
-			assertStorageIdentityAuthorityUnchanged(t, cfg, before)
-		})
-	}
+	err = requireManagedVolumeMountSource(root, filepath.Join(root, volumeA, "data"), nameA, "/data")
+	require.ErrorContains(t, err, "is not a real directory")
+	require.NoError(t,
+		requireManagedVolumeMountSource(root, filepath.Join(root, volumeB, "data"), nameB, "/data"),
+		"the real directory of the other volume is its own valid source")
 }
 
-func TestStorageIdentityAdoptionRejectsCrossLeaseContainerVolumeEvidence(t *testing.T) {
-	const (
-		leaseA       = "66666666-6666-4666-8666-666666666666"
-		leaseB       = "77777777-7777-4777-8777-777777777777"
-		providerUUID = "88888888-8888-4888-8888-888888888888"
-	)
-	cfg := storageIdentityLegacyRetentionTestConfig(t)
-	cfg.VolumeDataPath = t.TempDir()
-	writeLegacyCallbackStore(t, cfg.CallbackDBPath, nil)
-	writeLegacyAuthorityStores(t, cfg)
-	writeRawV013ReleaseHistory(t, cfg.ReleasesDBPath, leaseA, []v013ReleaseWire{{
-		Version:   1,
-		Manifest:  []byte(`{"services":{"app":{"image":"docker.io/library/alpine:3.22"}}}`),
-		Image:     "stack",
-		Status:    "active",
-		CreatedAt: time.Unix(1_700_000_000, 0),
-	}})
+// A mount source inside the right volume but under another subtree than the
+// one its container target derives is refused.
+func TestRequireManagedVolumeMountSourceRejectsWrongSourceSubtree(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	root := t.TempDir()
+	volume := canonicalVolumeName(leaseUUID, "app", 0)
+	wrongSource := filepath.Join(root, volume, "other")
+	require.NoError(t, os.MkdirAll(wrongSource, 0o700))
+	name, err := parseManagedVolumeName(volume)
+	require.NoError(t, err)
 
-	foreignVolume := canonicalVolumeName(leaseB, "app", 0)
-	foreignSource := filepath.Join(cfg.VolumeDataPath, foreignVolume, "data")
-	require.NoError(t, os.MkdirAll(foreignSource, 0o700))
-	dockerClient := &mockDockerClient{
-		PingFn: func(context.Context) error { return nil },
-		DaemonInfoFn: func(context.Context) (DaemonSecurityInfo, error) {
-			return DaemonSecurityInfo{SystemID: "daemon-system-a"}, nil
-		},
-		ListManagedContainersFn: func(context.Context) ([]ContainerInfo, error) {
-			return []ContainerInfo{{
-				ContainerID: "container-a", Name: canonicalVolumeName(leaseA, "app", 0),
-				LeaseUUID: leaseA, Tenant: "tenant-a", ProviderUUID: providerUUID,
-				BackendName: "docker", SKU: "sku-stateful", ServiceName: "app", InstanceIndex: 0,
-				CallbackURL: "https://fred.example/callbacks/provision",
-				Image:       "docker.io/library/alpine:3.22", Status: "exited",
-				Mounts: []ContainerMount{{Type: "bind", Source: foreignSource, Target: "/data"}},
-			}}, nil
-		},
+	err = requireManagedVolumeMountSource(root, wrongSource, name, "/data")
+	require.ErrorContains(t, err, "does not match target-derived subtree")
+}
+
+// Volume accounting recognizes a lease's volumes by name. A single unnamed
+// service owns both the service-aware names and the v0.13 names that end
+// directly in the instance index, up to its quantity and no further.
+func TestManagedVolumeEvidenceAuthorityPreservesExactV013Forms(t *testing.T) {
+	const leaseUUID = "019d1234-5678-7abc-8def-0123456789ab"
+	authority, err := managedVolumeEvidenceAuthorityForLease(
+		leaseUUID,
+		[]backend.LeaseItem{{SKU: "stateful", Quantity: 2}},
+	)
+	require.NoError(t, err)
+	contains := func(value string) bool {
+		name, parseErr := parseManagedVolumeName(value)
+		require.NoError(t, parseErr, value)
+		return authority.containsIdentity(managedVolumeEvidenceIdentityFromName(name))
 	}
-	volumes := &mockVolumeManager{ListFn: func() ([]string, error) {
-		return []string{foreignVolume}, nil
-	}}
-	before := snapshotStorageIdentityAuthorityFiles(t, cfg)
 
-	verdict, err := preflightWithDifferentialAudit(
-		t, t.Context(), cfg, dockerClient, volumes,
-	)
-	require.Error(t, err)
-	assert.Empty(t, verdict)
-	assert.ErrorContains(t, err, "expected exact live identity")
-	assertStorageIdentityAuthorityUnchanged(t, cfg, before)
+	for _, value := range []string{
+		canonicalVolumeName(leaseUUID, "app", 0),
+		retainedName(canonicalVolumeName(leaseUUID, "app", 1)),
+		fmt.Sprintf("fred-%s-0", leaseUUID),
+		fmt.Sprintf("fred-retained-%s-1", leaseUUID),
+	} {
+		assert.True(t, contains(value), value)
+	}
+	for _, value := range []string{
+		canonicalVolumeName(leaseUUID, "db", 0),
+		canonicalVolumeName(leaseUUID, "app", 2),
+		fmt.Sprintf("fred-%s-2", leaseUUID),
+		canonicalVolumeName("029d1234-5678-7abc-8def-0123456789ab", "app", 0),
+	} {
+		assert.False(t, contains(value), value)
+	}
 }

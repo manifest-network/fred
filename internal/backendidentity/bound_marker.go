@@ -116,38 +116,6 @@ func (pair *BoundMarkerPair) VerifyPaths() error {
 	return nil
 }
 
-// VerifyAbsent proves that neither exact marker entry exists while retaining
-// and re-attesting both physical parent directories. It is the read-only gate
-// used by a stopped-lineage adoption preflight: unlike initialization or
-// committed-marker recovery, it never publishes, removes, or repairs a file.
-func (pair *BoundMarkerPair) VerifyAbsent() error {
-	if !pair.valid() {
-		return fmt.Errorf("%w: bound marker pair is invalid", ErrInvalidMarkerBinding)
-	}
-	if err := pair.VerifyPaths(); err != nil {
-		return err
-	}
-	markers := []struct {
-		name   string
-		marker boundMarkerEntry
-	}{
-		{name: "primary", marker: pair.primary},
-		{name: "anchor", marker: pair.anchor},
-	}
-	for _, marker := range markers {
-		if _, err := marker.marker.entry.Lstat(); err == nil {
-			return fmt.Errorf(
-				"%w: %s marker already exists; adoption preflight requires an unsealed v0.13 lineage",
-				ErrMarkerBindingMismatch,
-				marker.name,
-			)
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("inspect %s backend storage identity marker: %w", marker.name, err)
-		}
-	}
-	return pair.VerifyPaths()
-}
-
 // Close revokes both retained physical-parent capabilities.
 func (pair *BoundMarkerPair) Close() error {
 	if pair == nil {

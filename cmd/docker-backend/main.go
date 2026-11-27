@@ -65,8 +65,8 @@ func main() {
 
 	// Bootstrap logger for startup messages (before config is loaded).
 	logOutput := io.Writer(os.Stdout)
-	if startup.preflightStorageIdentityAdoption || startup.dockerEffects.mode != dockerEffectsNone ||
-		startup.validateConfig || startup.auditStorageIdentityAdoption || startup.printHMACKeyIDs {
+	if startup.dockerEffects.mode != dockerEffectsNone ||
+		startup.validateConfig || startup.printHMACKeyIDs {
 		// Keep one-shot reports on stdout machine-readable. Diagnostics,
 		// including configuration and proof failures, remain visible on stderr.
 		logOutput = os.Stderr
@@ -125,40 +125,11 @@ func main() {
 		}
 		return
 	}
-	if startup.auditStorageIdentityAdoption {
-		auditCtx, auditCancel := context.WithTimeout(
-			context.Background(), startup.storageIdentityOperationTimeout,
-		)
-		audit, auditErr := docker.AuditStorageIdentityAdoptionForConfig(auditCtx, cfg, logger)
-		auditCancel()
-		os.Exit(storageIdentityAdoptionAuditExit(os.Stdout, logger, audit, auditErr))
-	}
-	if startup.preflightStorageIdentityAdoption {
-		preflightCtx, preflightCancel := context.WithTimeout(
-			context.Background(), startup.storageIdentityOperationTimeout,
-		)
-		verdict, preflightErr := docker.PreflightStorageIdentityAdoptionForConfig(
-			preflightCtx, cfg, logger,
-		)
-		preflightCancel()
-		if preflightErr != nil {
-			logger.Error("backend storage identity adoption preflight failed", "error", preflightErr)
-			os.Exit(1)
-		}
-		if verdictErr := writeStorageIdentityAdoptionVerdict(os.Stdout, verdict); verdictErr != nil {
-			logger.Error("write backend storage identity adoption verdict", "error", verdictErr)
-			os.Exit(1)
-		}
-		return
-	}
 	if startup.initializeStorageIdentity != "" {
 		identityCtx, identityCancel := context.WithTimeout(
 			context.Background(), startup.storageIdentityOperationTimeout,
 		)
-		identity, initializeErr := docker.InitializeStorageIdentityForConfig(
-			identityCtx, cfg, logger,
-			docker.StorageIdentityInitializationMode(startup.initializeStorageIdentity),
-		)
+		identity, initializeErr := docker.InitializeStorageIdentityForConfig(identityCtx, cfg, logger)
 		identityCancel()
 		if initializeErr != nil {
 			logger.Error("failed to initialize backend storage identity", "error", initializeErr)
@@ -321,62 +292,6 @@ func shutdownExitCode(startupErr, backendShutdownErr, storageAuthorityErr error)
 	return 0
 }
 
-// storageIdentityAdoptionAuditExit writes the audit as one JSON object and
-// returns the exit status: 0 when nothing blocks adoption, 3 when findings do,
-// and 1 when the audit itself could not complete (nothing is written then).
-func storageIdentityAdoptionAuditExit(
-	out io.Writer,
-	logger *slog.Logger,
-	audit docker.StorageIdentityAdoptionAudit,
-	auditErr error,
-) int {
-	if auditErr != nil {
-		logger.Error("storage identity adoption audit failed", "error", auditErr)
-		return 1
-	}
-	encoded, err := json.Marshal(audit)
-	if err != nil {
-		logger.Error("encode storage identity adoption audit", "error", err)
-		return 1
-	}
-	encoded = append(encoded, '\n')
-	if written, err := out.Write(encoded); err != nil || written != len(encoded) {
-		logger.Error("write storage identity adoption audit", "error", err)
-		return 1
-	}
-	switch {
-	case audit.Verdict == docker.StorageIdentityAdoptionReady && len(audit.Findings) == 0:
-		return 0
-	case audit.Verdict == docker.StorageIdentityAdoptionBlocked && len(audit.Findings) != 0:
-		return 3
-	default:
-		logger.Error("storage identity adoption audit is internally inconsistent",
-			"verdict", audit.Verdict, "findings", len(audit.Findings))
-		return 1
-	}
-}
-
-func writeStorageIdentityAdoptionVerdict(
-	out io.Writer,
-	verdict docker.StorageIdentityAdoptionVerdict,
-) error {
-	if out == nil {
-		return errors.New("storage identity adoption verdict output is required")
-	}
-	if verdict != docker.StorageIdentityAdoptionReady {
-		return fmt.Errorf("invalid storage identity adoption verdict %q", verdict)
-	}
-	line := string(verdict) + "\n"
-	written, err := io.WriteString(out, line)
-	if err != nil {
-		return fmt.Errorf("write storage identity adoption verdict: %w", err)
-	}
-	if written != len(line) {
-		return fmt.Errorf("write storage identity adoption verdict: %w", io.ErrShortWrite)
-	}
-	return nil
-}
-
 // parseFlags parses docker-backend's command-line arguments using a private
 // FlagSet (never the global flag.CommandLine). When -version is set it writes
 // the build-injected version to out and returns showVersion=true so main can
@@ -387,16 +302,17 @@ func writeStorageIdentityAdoptionVerdict(
 // Usage and parse errors go to the FlagSet's default output (stderr); -h/-help
 // surfaces as flag.ErrHelp so the caller can exit 0.
 type startupFlags struct {
-	configPath                       string
-	showVersion                      bool
-	initializeStorageIdentity        string
-	preflightStorageIdentityAdoption bool
-	storageIdentityOperationTimeout  time.Duration
-	dockerEffects                    dockerEffectsCommand
-	validateConfig                   bool
-	auditStorageIdentityAdoption     bool
-	printHMACKeyIDs                  bool
+	configPath                      string
+	showVersion                     bool
+	initializeStorageIdentity       string
+	storageIdentityOperationTimeout time.Duration
+	dockerEffects                   dockerEffectsCommand
+	validateConfig                  bool
+	printHMACKeyIDs                 bool
 }
+
+// storageIdentityModeNew is the only value -initialize-storage-identity takes.
+const storageIdentityModeNew = "new"
 
 func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	fs := flag.NewFlagSet("docker-backend", flag.ContinueOnError)
@@ -404,11 +320,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	showVer := fs.Bool("version", false, "print version information and exit")
 	initializeIdentity := fs.String(
 		"initialize-storage-identity", "",
-		"one-shot: seal lineage and exit; value must be new or adopt",
-	)
-	preflightAdoption := fs.Bool(
-		"preflight-storage-identity-adoption", false,
-		"one-shot read-only: verify a stopped v0.13 lineage is adoptable and exit",
+		"one-shot: seal the storage lineage of an empty backend and exit; value must be new",
 	)
 	identityOperationTimeout := fs.Duration(
 		"storage-identity-operation-timeout", defaultStorageIdentityOperationTimeout,
@@ -422,8 +334,6 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	effectsBackup := fs.String("docker-effects-backup", "", "new backup path required for Docker-effects repair; only valid with repair")
 	validateConfig := fs.Bool("validate-config", false,
 		"check the config file as startup would, without opening a store or touching Docker, and exit")
-	auditAdoption := fs.Bool("audit-storage-identity-adoption", false,
-		"one-shot read-only: report every shape that blocks v0.13 storage identity adoption as JSON; exit 0 clean, 3 findings, 1 failed")
 	printKeyIDs := fs.Bool("print-hmac-key-ids", false,
 		"one-shot read-only: print non-secret IDs of the request keys as JSON and exit")
 	if err := fs.Parse(args); err != nil {
@@ -432,10 +342,15 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	if *identityOperationTimeout <= 0 {
 		return startupFlags{}, errors.New("-storage-identity-operation-timeout must be positive")
 	}
+	if *initializeIdentity != "" && *initializeIdentity != storageIdentityModeNew {
+		return startupFlags{}, fmt.Errorf(
+			"-initialize-storage-identity must be %q: this release seals only an empty backend, and a v0.13 lineage is adopted by the final 0.14 release",
+			storageIdentityModeNew,
+		)
+	}
 	oneShotModes := 0
 	for _, requested := range []bool{
-		*preflightAdoption, *initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig,
-		*auditAdoption, *printKeyIDs,
+		*initializeIdentity != "", *inspectEffects, *repairEffects, *validateConfig, *printKeyIDs,
 	} {
 		if requested {
 			oneShotModes++
@@ -443,7 +358,7 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 	}
 	if oneShotModes > 1 {
 		return startupFlags{}, errors.New(
-			"storage-identity preflight, audit, initialization, Docker-effects inspection and repair, config validation, and key ID printing are mutually exclusive",
+			"storage-identity initialization, Docker-effects inspection and repair, config validation, and key ID printing are mutually exclusive",
 		)
 	}
 	repairArgumentsSupplied := false
@@ -460,15 +375,13 @@ func parseStartupFlags(args []string, out io.Writer) (startupFlags, error) {
 		fmt.Fprintf(out, "docker-backend version %s\n", version)
 	}
 	return startupFlags{
-		configPath:                       *cfgPath,
-		showVersion:                      *showVer,
-		initializeStorageIdentity:        *initializeIdentity,
-		preflightStorageIdentityAdoption: *preflightAdoption,
-		storageIdentityOperationTimeout:  *identityOperationTimeout,
-		dockerEffects:                    effects,
-		validateConfig:                   *validateConfig,
-		auditStorageIdentityAdoption:     *auditAdoption,
-		printHMACKeyIDs:                  *printKeyIDs,
+		configPath:                      *cfgPath,
+		showVersion:                     *showVer,
+		initializeStorageIdentity:       *initializeIdentity,
+		storageIdentityOperationTimeout: *identityOperationTimeout,
+		dockerEffects:                   effects,
+		validateConfig:                  *validateConfig,
+		printHMACKeyIDs:                 *printKeyIDs,
 	}, nil
 }
 

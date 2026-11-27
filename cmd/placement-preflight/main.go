@@ -5,8 +5,7 @@
 // quiesced, and then publishes a new placement authority. It binds complete
 // backend evidence to a height-pinned signer-free chain snapshot.
 // --print-fresh-confirmation prints the attestation that mode expects and
-// touches nothing. --inspect-releases is an offline, read-only scan of a
-// stopped backend's releases.db.
+// touches nothing.
 //
 // It does not convert a v0.13 placement database. The 0.14 line's
 // placement-preflight does; a provider upgrades through the final 0.14 release.
@@ -29,7 +28,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
 	"github.com/manifest-network/fred/internal/placementprobe"
@@ -163,8 +161,7 @@ func runWithDependencies(
 	// Suppress that unstructured write; main renders the returned error through
 	// writeCommandError, which cannot be used to forge a verdict line.
 	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "", "path to the stopped providerd configuration (required except with -inspect-releases)")
-	inspectReleases := flags.String("inspect-releases", "", "offline read-only scan of a stopped backend releases.db for current manifest admission policy violations; writes a JSON report")
+	configPath := flags.String("config", "", "path to the stopped providerd configuration")
 	proofTimeout := flags.Duration(
 		"proof-timeout",
 		defaultProofTimeout,
@@ -206,25 +203,6 @@ func runWithDependencies(
 		}
 		return nil
 	}
-	if *inspectReleases != "" {
-		var incompatible string
-		flags.Visit(func(f *flag.Flag) {
-			if f.Name != "inspect-releases" {
-				incompatible = f.Name
-			}
-		})
-		if incompatible != "" {
-			return fmt.Errorf("-inspect-releases cannot be combined with -%s", incompatible)
-		}
-		report, err := shared.InspectReleaseAdmissionReadOnly(*inspectReleases)
-		if err != nil {
-			return err
-		}
-		if err := json.NewEncoder(stdout).Encode(report); err != nil {
-			return fmt.Errorf("write release admission report: %w", err)
-		}
-		return nil
-	}
 	if *configPath == "" {
 		flags.Usage()
 		return fmt.Errorf("-config is required")
@@ -234,7 +212,7 @@ func runWithDependencies(
 	}
 	if !*initializeFresh && !*printFreshConfirmation {
 		return fmt.Errorf(
-			"a mode is required: -initialize-fresh, -print-fresh-confirmation, -inspect-releases or -version",
+			"a mode is required: -initialize-fresh, -print-fresh-confirmation or -version",
 		)
 	}
 	if *initializeFresh && *printFreshConfirmation {

@@ -647,7 +647,7 @@ cleanup phase even when every preceding phase consumes its cap. Transitional
 operations are deferred to periodic sweeps, not waited out during startup;
 one wedged daemon call cannot block indefinitely.
 
-The separate Docker storage-identity preflight and initializer share one
+The Docker storage-identity initializer runs under one
 `-storage-identity-operation-timeout` deadline (default `10m`) across
 context-aware Docker and filesystem-control-plane probes. It is cooperative,
 not a hard wall-clock interrupt for blocking local open, bbolt, or fsync work.
@@ -1313,19 +1313,12 @@ tenant/provider, item shape, manifest topology, resource profiles, and source
 generation and CAS-deletes that row. Failure returns before teardown; success
 leaves the close intent as the sole durable cleanup and identity owner.
 
-Historical v0.13 release histories can contain more than one Active row.
+Historical v0.13 release histories could contain more than one Active row:
 `RecordMigration` and every successful provision appended an active row without
-superseding the older one. That includes the re-provision of a lease whose
-containers died at runtime or across a reboot. v0.13 appended each row only
-after replacing the previous containers, so its LatestActive is the running
-generation. Only the stopped adoption path accepts these histories, and only
-from the bare v0.13 array: the `v013ReleaseHistory` type is minted solely by
-that decoder, and the v0.13 recognizers accept nothing else. One parser,
-`adoptV013ReleaseHistory`, produces the strict history that readiness
-inspection, the capacity proof and the binding transaction all consume. Binding
-rewrites the older active rows, and equivalent deploying retries after the
-latest active row, to `superseded` before a current store opens the history.
-The runtime decoder rejects any history with more than one active row. This
+superseding the older one. The 0.14 line's stopped adoption normalized those
+histories when it bound the store. This line reads only the result: nothing
+here accepts the bare v0.13 array, and the runtime decoder rejects any history
+with more than one active row. This
 release does not write a
 migration marker or attempt a live single-container-to-Compose conversion.
 Only an already stack-form v0.13 cohort can be adopted: strict inventory and
@@ -1450,7 +1443,7 @@ releases ownership. The durable row is the authority, while the periodic
 30-second sweep discovers startup work and retries dormant failed heads. Current outbox rows
 and compact terminal receipts carry a required wire version and reject duplicate,
 unknown, or future-schema fields recursively. Nothing decodes versionless v0.13
-callback rows: the stopped upgrade inspector only counts the rows in
+callback rows: the read-only inspector only counts the rows in
 `pending_callbacks`, and current runtime requires that bucket to be empty and
 never decodes or replays it. An
 unknown top-level `callbacks.db` bucket refuses current startup so a downgrade
@@ -1461,15 +1454,11 @@ level-triggered recovery pass; no restart has to infer whether teardown happened
 
 Release histories and retention entries have the same explicit current-row
 boundary: each is wrapped in a `schema_version: 1` envelope and rejects unknown,
-case-aliased, duplicate, future, or trailing data recursively. Their exact
-versionless v0.13 wire shapes are accepted only by stopped-process code: the
-read-only upgrade inspectors decode them, and the
-`InitializationProfileExisting` adoption transaction validates every row
-before rewriting any row or publishing the storage binding. A versionless
-identity-bound shape from an interrupted upgrade of an earlier development build
-is handled only while replaying that same pending marker transaction. Ordinary
-Open, Check, Verify, and runtime reads require the versioned form; they never
-reinterpret a versionless authority row as legacy data. Unknown top-level release
+case-aliased, duplicate, future, or trailing data recursively. Nothing on this line
+accepts their versionless v0.13 wire shapes: the 0.14 line's stopped adoption
+rewrote them. Initialization, Open, Check, Verify, and runtime reads all require
+the versioned form; they never reinterpret a versionless authority row as
+legacy data. Unknown top-level release
 or retention buckets likewise refuse startup.
 
 Docker recovery deliberately uses lease-isolated evidence rather than one
@@ -1554,7 +1543,7 @@ cannot expose phantom capacity or over-admit after a restart. This fail-closed
 leak is intentional: operator-visible over-counting is safer than reconstructing
 absence into permission to reuse tenant capacity.
 An active callbackless pre-label cohort cannot be assigned provider callback
-authority safely and is rejected by the mandatory stopped adoption preflight.
+authority safely and was rejected by the 0.14 line's stopped adoption.
 Callbackless historical cleanup/close evidence remains readable, but never
 authorizes zero-survivor recovery or maintenance.
 
@@ -1709,13 +1698,12 @@ non-regular file, or mode other than exact `0600`, but diagnostics is not bound
 to the storage UUID and is not re-attested at every transaction.
 
 Initialization is the only code path allowed to create or bind authoritative
-stores. Before reading fresh/existing evidence, the initializer retains typed
+stores. Before reading any evidence, the initializer retains typed
 directory capabilities for both marker parents and every authoritative journal
 parent. They bind the physical device/inode and make all later inspection,
 creation, and publication descriptor-relative; a rename, unmount, or same-path
 directory recreation cannot redirect the transaction. A pending anchor first
-records both the chosen storage UUID and whether the input is a wholly fresh set
-or a complete existing v0.13 set. Only after that anchor is durable does the
+records the chosen storage UUID and that the seal is a fresh one. Only after that anchor is durable does the
 marker coordinator mint the opaque `PendingStorage` capability accepted by
 authoritative-store preparation; a parsed or caller-supplied UUID cannot bind a
 store. Every capability copy shares one revocation state. The coordinator
@@ -1727,15 +1715,16 @@ cross-store evidence, publishes the primary marker, and finally commits the
 anchor. It returns `VerifiedStorage` only after final committed-marker and
 read-only store verification. This ordering is crash-resumable and idempotent:
 a rerun must use the
-persisted profile and exact identity, while a committed pair is
-verification-only and never repairs a missing or unbound store. Fresh input
-means every required store is absent; existing input means every required store
-is present. A mixed set is not guessed or completed. Existing adoption
-additionally requires a stopped backend, a drained legacy callback outbox,
-valid release/retention rows, and substrate evidence that agrees with the active
-releases.
+persisted exact identity, while a committed pair is
+verification-only and never repairs a missing or unbound store. Initialization
+seals only an empty backend: every required store is absent, and no managed
+container, managed volume, retention row or active release exists. A journal
+that exists without a storage identity is refused, as is a pending anchor
+written by a v0.13 adoption: only the final 0.14 release adopts a v0.13
+lineage. A journal that is already identity-bound while its marker pair is
+missing is refused too; the pair must be restored instead.
 
-That substrate evidence is concrete rather than name-based. Every managed name
+Managed-volume evidence is concrete rather than name-based. Every managed name
 first becomes one canonical typed component and must then be a real directory on the configured XFS root with a regular no-follow
 nonzero project-ID marker.
 Container evidence separately proves the label-derived volume and exact
@@ -1828,7 +1817,7 @@ every start). Such closes are skipped by periodic recovery, answered from
 memory by Deprovision, and left out of the close-age gauge that pages.
 
 Any ambiguous recovery preserves evidence
-and prevents readiness. Read-only preflight and initialization reject both
+and prevents readiness. Initialization rejects both
 create and delete forms rather than mutate the lineage being proved. Unattributed managed volumes are preserved;
 only an exact durable operation, close, or retention finalizer can destroy them.
 

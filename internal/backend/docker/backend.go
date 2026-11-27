@@ -1,15 +1,12 @@
 package docker
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -350,7 +347,7 @@ type Backend struct {
 	recoveryDockerReadTimeout time.Duration
 	// startupRecoveryTimeout bounds the complete startup convergence pass. It is
 	// intentionally independent of the caller's short readiness context because
-	// stopped v0.13 adoption and fleet recovery may legitimately outlive that
+	// fleet recovery may legitimately outlive that
 	// context, but it must still be finite if a daemon accepts requests and then
 	// stops responding.
 	startupRecoveryTimeout time.Duration
@@ -755,15 +752,6 @@ func (existingDockerStorageIdentity) resolve(
 	return probe.storageAuthority, nil
 }
 
-// StorageIdentityInitializationMode makes the operator's first-adoption claim
-// explicit. The zero value is invalid.
-type StorageIdentityInitializationMode string
-
-const (
-	StorageIdentityInitializeNew   StorageIdentityInitializationMode = "new"
-	StorageIdentityInitializeAdopt StorageIdentityInitializationMode = "adopt"
-)
-
 type dockerStorageInitializationPaths struct {
 	markers   *backendidentity.BoundMarkerPair
 	callbacks *shared.BoundAuthoritativeStorePath
@@ -846,29 +834,6 @@ func (paths *dockerStorageInitializationPaths) Close() error {
 	}
 	return errors.Join(errs...)
 }
-
-// StorageIdentityAdoptionVerdict is the stable machine-readable result of the
-// stopped-v0.13 read-only preflight. Its zero value is never returned on
-// success, so callers cannot mistake an incomplete check for admission.
-type StorageIdentityAdoptionVerdict string
-
-const (
-	// StorageIdentityAdoptionReady proves that the same descriptor-bound
-	// evidence used by adopt currently permits a seal. Initialization must still
-	// repeat the proof after the operator's backup because the substrate can
-	// change between commands.
-	StorageIdentityAdoptionReady StorageIdentityAdoptionVerdict = "ready_for_v0_13_storage_identity_adoption"
-)
-
-// ErrV013InterruptedDeprovision identifies a stopped legacy lineage that must
-// finish its exact close operation under v0.13 before it can be sealed.
-var ErrV013InterruptedDeprovision = errors.New("v0.13 lineage contains an interrupted deprovision finalization")
-
-// ErrV013UnresolvedClose identifies a stopped legacy lineage whose active
-// release outlived its container cohort without a retention finalizer. That
-// shape is compatible with more than one v0.13 close boundary, so neither
-// replay nor automatic journal repair is safe.
-var ErrV013UnresolvedClose = errors.New("v0.13 lineage contains an unresolved close boundary")
 
 type dockerStorageIdentityProof struct {
 	paths         *dockerStorageInitializationPaths
@@ -1021,96 +986,6 @@ func (proof *dockerStorageIdentityProof) verifyStableSubstrate(
 	return proof.paths.Verify()
 }
 
-// PreflightStorageIdentityAdoptionForConfig performs the exact stopped-v0.13
-// adoption evidence proof without publishing or recovering markers and without
-// binding or normalizing a journal. It is safe to run before the cutover backup;
-// a successful initializer repeats the proof at its own publication boundary.
-func PreflightStorageIdentityAdoptionForConfig(
-	ctx context.Context,
-	cfg Config,
-	logger *slog.Logger,
-) (StorageIdentityAdoptionVerdict, error) {
-	if ctx == nil {
-		return "", errors.New("storage identity adoption preflight context is required")
-	}
-	if logger == nil {
-		return "", errors.New("storage identity adoption preflight logger is required")
-	}
-	if err := cfg.Validate(); err != nil {
-		return "", fmt.Errorf("invalid config: %w", err)
-	}
-	if err := verifyConfiguredVolumeMount(cfg); err != nil {
-		return "", err
-	}
-	dockerClient, err := NewDockerClient(ctx, cfg.DockerHost, cfg.Name)
-	if err != nil {
-		return "", fmt.Errorf("create Docker client for storage identity preflight: %w", err)
-	}
-	defer func() { _ = dockerClient.Close() }()
-	volumes, err := newVolumeManager(
-		cfg.VolumeDataPath, cfg.VolumeFilesystem, cfg.GetMinAvgFileBytes(), logger,
-	)
-	if err != nil {
-		return "", fmt.Errorf("create volume manager for storage identity preflight: %w", err)
-	}
-	return preflightStorageIdentityAdoptionWithDependencies(
-		ctx, cfg, dockerClient, volumes,
-	)
-}
-
-func preflightStorageIdentityAdoptionWithDependencies(
-	ctx context.Context,
-	cfg Config,
-	dockerClient storageIdentityProofClient,
-	volumes storageIdentityProofVolumes,
-) (StorageIdentityAdoptionVerdict, error) {
-	proof, err := acquireDockerStorageIdentityProof(ctx, cfg, dockerClient, volumes)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = proof.Close() }()
-	if err := proof.verifyStableSubstrate(ctx, dockerClient, volumes); err != nil {
-		return "", err
-	}
-	if err := proof.paths.markers.VerifyAbsent(); err != nil {
-		return "", fmt.Errorf("preflight requires an unsealed v0.13 marker pair: %w", err)
-	}
-	profile, resuming, err := dockerStorageInitializationProfile(
-		cfg,
-		proof.paths,
-		proof.initialDaemon.SystemID,
-		StorageIdentityInitializeAdopt,
-	)
-	if err != nil {
-		return "", err
-	}
-	if resuming {
-		return "", errors.New("read-only adoption preflight refuses a pending storage identity initialization")
-	}
-	if profile != backendidentity.InitializationProfileExisting {
-		return "", errors.New("adoption preflight requires a complete existing v0.13 lineage")
-	}
-	if err := verifyStorageIdentityInitializationEvidence(
-		ctx,
-		cfg,
-		dockerClient,
-		volumes,
-		StorageIdentityInitializeAdopt,
-		profile,
-		false,
-		proof.paths,
-	); err != nil {
-		return "", err
-	}
-	if err := proof.verifyStableSubstrate(ctx, dockerClient, volumes); err != nil {
-		return "", err
-	}
-	if err := proof.paths.markers.VerifyAbsent(); err != nil {
-		return "", fmt.Errorf("marker pair changed during read-only adoption preflight: %w", err)
-	}
-	return StorageIdentityAdoptionReady, nil
-}
-
 // InitializeStorageIdentityForConfig is the explicit, one-shot storage-lineage
 // sealing operation. It validates and pins the Docker substrate, binds the
 // callback, release, and retention journals to one crash-resumable marker pair,
@@ -1121,17 +996,12 @@ func InitializeStorageIdentityForConfig(
 	ctx context.Context,
 	cfg Config,
 	logger *slog.Logger,
-	mode StorageIdentityInitializationMode,
 ) (backendidentity.ID, error) {
 	if ctx == nil {
 		return backendidentity.ID{}, errors.New("storage identity initialization context is required")
 	}
 	if logger == nil {
 		return backendidentity.ID{}, errors.New("storage identity initialization logger is required")
-	}
-	if mode != StorageIdentityInitializeNew && mode != StorageIdentityInitializeAdopt {
-		return backendidentity.ID{}, fmt.Errorf("storage identity initialization mode must be %q or %q",
-			StorageIdentityInitializeNew, StorageIdentityInitializeAdopt)
 	}
 	if err := cfg.Validate(); err != nil {
 		return backendidentity.ID{}, fmt.Errorf("invalid config: %w", err)
@@ -1150,7 +1020,7 @@ func InitializeStorageIdentityForConfig(
 	if err != nil {
 		return backendidentity.ID{}, fmt.Errorf("create volume manager for storage identity: %w", err)
 	}
-	return initializeStorageIdentityWithDependencies(ctx, cfg, mode, dockerClient, volumes)
+	return initializeStorageIdentityWithDependencies(ctx, cfg, dockerClient, volumes)
 }
 
 // initializeStorageIdentityWithDependencies contains the proof-and-publication
@@ -1161,7 +1031,6 @@ func InitializeStorageIdentityForConfig(
 func initializeStorageIdentityWithDependencies(
 	ctx context.Context,
 	cfg Config,
-	mode StorageIdentityInitializationMode,
 	dockerClient storageIdentityProofClient,
 	volumes storageIdentityProofVolumes,
 ) (backendidentity.ID, error) {
@@ -1220,30 +1089,29 @@ func initializeStorageIdentityWithDependencies(
 		}
 		return sealedID, nil
 	}
-	profile, resuming, err := dockerStorageInitializationProfile(
-		cfg, paths, initialDaemon.SystemID, mode,
-	)
+	resuming, err := requireFreshStorageInitialization(cfg, paths, initialDaemon.SystemID)
 	if err != nil {
 		return backendidentity.ID{}, err
 	}
-	if err := verifyStorageIdentityInitializationEvidence(
-		ctx, cfg, dockerClient, volumes, mode, profile, resuming, paths,
-	); err != nil {
+	if err := verifyFreshStorageIdentityEvidence(ctx, dockerClient, volumes, resuming, paths); err != nil {
 		return backendidentity.ID{}, err
 	}
 	if err := verifyStableSubstrate(); err != nil {
 		return backendidentity.ID{}, err
 	}
 	hooks := backendidentity.MarkerPairStoreHooks{
-		Profile: profile,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage, profile); err != nil {
+			if profile != backendidentity.InitializationProfileFresh {
+				return fmt.Errorf("unsupported backend storage initialization profile %q", profile)
+			}
+			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
 				return err
 			}
-			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage, profile); err != nil {
+			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage); err != nil {
 				return err
 			}
-			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage, profile)
+			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := shared.CheckBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
@@ -1255,9 +1123,7 @@ func initializeStorageIdentityWithDependencies(
 			if err := shared.CheckBoundRetentionStoreStorage(paths.retention, storage); err != nil {
 				return err
 			}
-			if err := verifyStorageIdentityInitializationEvidence(
-				ctx, cfg, dockerClient, volumes, mode, profile, true, paths,
-			); err != nil {
+			if err := verifyFreshStorageIdentityEvidence(ctx, dockerClient, volumes, true, paths); err != nil {
 				return err
 			}
 			if pinner, ok := volumes.(identityRootPinner); ok {
@@ -1296,594 +1162,11 @@ func initializeStorageIdentityWithDependencies(
 }
 
 // storageIdentityEvidenceClient is the read-only Docker capability required to
-// prove whether a substrate is empty or belongs to the stopped v0.13 lineage.
+// prove that a substrate is empty before it is sealed.
 // Keeping the initialization proof on this narrow interface prevents it from
 // acquiring container-mutation authority by accident.
 type storageIdentityEvidenceClient interface {
 	ListManagedContainersStrict(context.Context) ([]ContainerInfo, error)
-}
-
-// verifyStorageIdentityInitializationEvidence is the fail-fast verifier the
-// preflight and the initializer have always run: it stops at the first
-// refused shape.
-func verifyStorageIdentityInitializationEvidence(
-	ctx context.Context,
-	cfg Config,
-	dockerClient storageIdentityEvidenceClient,
-	volumes storageIdentityProofVolumes,
-	mode StorageIdentityInitializationMode,
-	profile backendidentity.InitializationProfile,
-	prepared bool,
-	paths *dockerStorageInitializationPaths,
-) error {
-	_, err := collectStorageIdentityInitializationEvidence(
-		ctx, cfg, dockerClient, volumes, mode, profile, prepared, paths, failFastAdoptionFindings{},
-	)
-	return err
-}
-
-// collectStorageIdentityInitializationEvidence runs every check in one fixed
-// order and reports each refused shape to findings. A fail-fast sink returns
-// the first; the audit's sink records it and the check moves on to the next
-// independent lease, retention, container, or volume. An error that is not a
-// finding (an unreadable journal or substrate) stops both.
-func collectStorageIdentityInitializationEvidence(
-	ctx context.Context,
-	cfg Config,
-	dockerClient storageIdentityEvidenceClient,
-	volumes storageIdentityProofVolumes,
-	mode StorageIdentityInitializationMode,
-	profile backendidentity.InitializationProfile,
-	prepared bool,
-	paths *dockerStorageInitializationPaths,
-	findings adoptionFindings,
-) (adoptionEvidence, error) {
-	var evidence adoptionEvidence
-	if paths == nil {
-		return evidence, errors.New("docker storage initialization paths are required")
-	}
-	callbackStore, err := shared.InspectBoundCallbackStoreReadOnly(paths.callbacks)
-	if err != nil {
-		return evidence, fmt.Errorf("inspect callback outbox before storage identity initialization: %w", err)
-	}
-	evidence.pendingCallbacks = callbackStore.Pending
-	if callbackStore.UpgradedSchema && !prepared {
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingUpgradedCallbackStore,
-			err:   errors.New("storage identity initialization refuses an already-upgraded callback store; restore the sealed marker pair instead of resealing this lineage"),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	if callbackStore.Pending != 0 {
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingPendingCallbacks,
-			err: fmt.Errorf(
-				"storage identity initialization requires a drained callback outbox; %d pending callbacks remain",
-				callbackStore.Pending,
-			),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	if profile == backendidentity.InitializationProfileExisting &&
-		(!callbackStore.Exists || !callbackStore.LegacySchema) {
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingIncompleteJournals,
-			err:   errors.New("existing storage identity requires an existing drained v0.13 callback store"),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	releases, err := shared.InspectBoundLegacyReleaseStoreReadOnly(paths.releases)
-	if err != nil {
-		return evidence, fmt.Errorf("inspect release journal before storage identity initialization: %w", err)
-	}
-	retentionStore, err := shared.InspectBoundRetentionStoreReadOnly(paths.retention)
-	if err != nil {
-		return evidence, fmt.Errorf("inspect retention journal before storage identity initialization: %w", err)
-	}
-	if profile == backendidentity.InitializationProfileExisting &&
-		(!releases.Exists || !retentionStore.Exists) {
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingIncompleteJournals,
-			err:   errors.New("existing storage identity requires complete v0.13 callback, release, and retention journals"),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	containers, err := dockerClient.ListManagedContainersStrict(ctx)
-	if err != nil {
-		return evidence, fmt.Errorf("inspect managed containers before storage identity initialization: %w", err)
-	}
-	if _, err := recoveredCallbackPairs(containers); err != nil {
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingCallbackCohort,
-			err:   fmt.Errorf("validate managed callback cohorts before storage identity initialization: %w", err),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	containersByLease := make(map[string][]ContainerInfo, len(releases.ActiveReleases))
-	for _, container := range containers {
-		containersByLease[container.LeaseUUID] = append(
-			containersByLease[container.LeaseUUID],
-			container,
-		)
-	}
-	retentions := retentionStore.Entries
-	retentionsByLease := make(map[string]*shared.RetentionEntry, len(retentions))
-	for index := range retentions {
-		retentionsByLease[retentions[index].OriginalLeaseUUID] = &retentions[index]
-	}
-	managedSet, err := attestManagedVolumeInventory(ctx, volumes)
-	if err != nil {
-		return evidence, fmt.Errorf("prove managed volume substrate before storage identity initialization: %w", err)
-	}
-	managedVolumeCountsByLease := make(map[string]int)
-	for _, volumeName := range managedSet {
-		managedVolumeCountsByLease[managedVolumeLeaseUUID(volumeName)]++
-	}
-	for _, leaseUUID := range slices.Sorted(maps.Keys(containersByLease)) {
-		if _, active := releases.ActiveLeaseUUIDs[leaseUUID]; active ||
-			retentionsByLease[leaseUUID] != nil ||
-			managedVolumeCountsByLease[leaseUUID] != 0 {
-			continue
-		}
-		if err := findings.add(adoptionFinding{
-			class: AdoptionFindingContainerWithoutAuthority, leaseUUID: leaseUUID,
-			err: fmt.Errorf(
-				"managed stack lease %q has containers but no release, retention, or managed-volume authority",
-				leaseUUID,
-			),
-		}); err != nil {
-			return evidence, err
-		}
-	}
-	for _, leaseUUID := range slices.Sorted(maps.Keys(releases.ActiveReleases)) {
-		release := releases.ActiveReleases[leaseUUID]
-		cohort := containersByLease[leaseUUID]
-		if len(cohort) == 0 {
-			retention := retentionsByLease[leaseUUID]
-			matches, matchErr := legacyReleaseMatchesInterruptedDeprovisionRetention(&release, retention)
-			if matchErr != nil {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingReleaseRetentionComparison, leaseUUID: leaseUUID,
-					err: fmt.Errorf(
-						"compare active v0.13 release %s with retention finalizer: %w",
-						leaseUUID,
-						matchErr,
-					),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			if matches {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingInterruptedDeprovision, leaseUUID: leaseUUID,
-					err: fmt.Errorf(
-						"%w: lease %s has an active release, no managed containers, and a matching %s retention; restart the complete matching v0.13 lineage in isolation and replay the exact close/deprovision event or request until it purges the stale active release while preserving the retention, then drain callbacks, stop it, take a new backup, and rerun the read-only preflight",
-						ErrV013InterruptedDeprovision,
-						leaseUUID,
-						retention.Status,
-					),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			if retention == nil {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingUnresolvedClose, leaseUUID: leaseUUID,
-					err: fmt.Errorf(
-						"%w: lease %s has an active release, no managed container cohort, no retention finalizer, and %d managed volumes in its exact canonical/retained namespace; this is compatible with a v0.13 crash after teardown but before retention or release finalization, and replaying deprovision can purge the release while stranding tenant data; restore the complete matching pre-close snapshot and restart its v0.13 lineage in isolation, or require height-pinned chain plus provider-inventory proof that the lease is terminal before making an explicit manual data-disposition and authority-repair decision; then stop, rerun the read-only preflight, and take a fresh backup",
-						ErrV013UnresolvedClose,
-						leaseUUID,
-						managedVolumeCountsByLease[leaseUUID],
-					),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-		}
-		authorityItems := slices.Clone(release.Items)
-		var authorityErr error
-		if len(authorityItems) == 0 {
-			authorityItems, authorityErr = deriveV013ActiveReleaseItems(&release, cohort)
-		}
-		if authorityErr != nil {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingReleaseItems, leaseUUID: leaseUUID,
-				err: fmt.Errorf(
-					"validate managed cohort for active v0.13 release %s: %w",
-					leaseUUID,
-					authorityErr,
-				),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		evidence.activeReleaseItems = append(evidence.activeReleaseItems, adoptionReleaseItems{
-			leaseUUID: leaseUUID, items: slices.Clone(authorityItems),
-		})
-		authorityProfiles, profileErr := resolveResourceProfilesForConfig(cfg, authorityItems)
-		if profileErr != nil {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingReleaseSKU, leaseUUID: leaseUUID,
-				err: fmt.Errorf(
-					"resolve startup release authority for active v0.13 release %s: %w",
-					leaseUUID,
-					profileErr,
-				),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		var legacyRuntimeAuthority *shared.LegacyRuntimeAuthority
-		if release.OperationID.IsZero() && release.RuntimeAuthority == nil &&
-			release.LegacyRuntimeAuthority == nil {
-			callbackURL, lifecycleCallbackURL, callbackErr := resolveV013ContainerCallbackURLs(cohort)
-			if callbackErr != nil {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingRuntimeAuthority, leaseUUID: leaseUUID,
-					err: fmt.Errorf(
-						"resolve startup runtime authority for active v0.13 release %s: %w",
-						leaseUUID,
-						callbackErr,
-					),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			identity := cohort[0]
-			frozen, freezeErr := shared.NewLegacyRuntimeAuthority(
-				identity.Tenant,
-				identity.ProviderUUID,
-				callbackURL,
-				lifecycleCallbackURL,
-			)
-			if freezeErr != nil {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingRuntimeAuthority, leaseUUID: leaseUUID,
-					err: fmt.Errorf(
-						"validate startup runtime authority for active v0.13 release %s: %w",
-						leaseUUID,
-						freezeErr,
-					),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			legacyRuntimeAuthority = &frozen
-		}
-		var capacityErr error
-		switch {
-		case len(release.Items) == 0:
-			if legacyRuntimeAuthority != nil {
-				capacityErr = releases.CheckLegacyActiveAuthorityAndRuntimeCapacity(
-					leaseUUID, release, authorityItems, authorityProfiles,
-					*legacyRuntimeAuthority,
-				)
-			} else {
-				capacityErr = releases.CheckLegacyActiveAuthorityCapacity(
-					leaseUUID, release, authorityItems, authorityProfiles,
-				)
-			}
-		case len(release.ResourceProfiles) == 0:
-			capacityErr = releases.CheckActiveResourceProfilesCapacity(
-				leaseUUID,
-				release,
-				authorityProfiles,
-			)
-		}
-		if capacityErr != nil {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingReleaseCapacity, leaseUUID: leaseUUID,
-				err: fmt.Errorf(
-					"active v0.13 release %s cannot fit its required startup authority backfill: %w",
-					leaseUUID,
-					capacityErr,
-				),
-			}); err != nil {
-				return evidence, err
-			}
-		}
-	}
-	evidenceVolumes, err := collectStorageIdentityContainerVolumeEvidence(cfg, containers, findings)
-	if err != nil {
-		return evidence, err
-	}
-
-	reapingLeases := make(map[string]managedVolumeEvidenceAuthority)
-	for _, retention := range retentions {
-		expectedVolumeNames, expectedErr := managedVolumeEvidenceAuthorityForLease(
-			retention.OriginalLeaseUUID,
-			retention.Items,
-		)
-		if expectedErr != nil {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingRetentionIdentity, leaseUUID: retention.OriginalLeaseUUID,
-				err: fmt.Errorf(
-					"derive exact managed-volume identities for retention %s: %w",
-					retention.OriginalLeaseUUID,
-					expectedErr,
-				),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		if retention.Status == shared.RetentionStatusReaping {
-			reapingLeases[retention.OriginalLeaseUUID] = expectedVolumeNames
-		}
-		if len(retention.ResourceProfiles) == 0 {
-			for _, item := range retention.Items {
-				if _, skuErr := cfg.GetSKUProfile(item.SKU); skuErr != nil {
-					if err := findings.add(adoptionFinding{
-						class: AdoptionFindingRetentionSKU, leaseUUID: retention.OriginalLeaseUUID,
-						err: fmt.Errorf(
-							"retention %s cannot resolve v0.13 SKU %q; restore the matching v0.13 SKU mapping and profile before adoption: %w",
-							retention.OriginalLeaseUUID,
-							item.SKU,
-							skuErr,
-						),
-					}); err != nil {
-						return evidence, err
-					}
-				}
-			}
-		}
-		if len(retention.RetainedVolumeNames) > 0 && cfg.VolumeDataPath == "" {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
-				err: fmt.Errorf("retention %s names stateful volumes but volume_data_path is empty",
-					retention.OriginalLeaseUUID),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		if len(retention.RetainedVolumeNames) > 0 {
-			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, cfg.VolumeDataPath); rootErr != nil {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
-					err: fmt.Errorf("retention %s cannot attest configured volume root: %w",
-						retention.OriginalLeaseUUID, rootErr),
-				}); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-		}
-		seenRetentionVolumes := make(map[string]struct{}, len(retention.RetainedVolumeNames))
-		for _, volumeName := range retention.RetainedVolumeNames {
-			retentionVolumeFinding := func(cause error) error {
-				return findings.add(adoptionFinding{
-					class: AdoptionFindingRetentionVolume, leaseUUID: retention.OriginalLeaseUUID,
-					subject: volumeName, err: cause,
-				})
-			}
-			managedName, parseErr := parseManagedVolumeName(volumeName)
-			if parseErr != nil {
-				if err := retentionVolumeFinding(fmt.Errorf("retention %s contains invalid managed volume name %q: %w",
-					retention.OriginalLeaseUUID, volumeName, parseErr)); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			if !expectedVolumeNames.containsRetained(managedName) {
-				if err := retentionVolumeFinding(fmt.Errorf(
-					"retention %s volume %q is not an exact retained identity for its source lease items",
-					retention.OriginalLeaseUUID,
-					volumeName,
-				)); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			if _, duplicate := seenRetentionVolumes[volumeName]; duplicate {
-				if err := retentionVolumeFinding(fmt.Errorf("retention %s contains duplicate managed volume name %q",
-					retention.OriginalLeaseUUID, volumeName)); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			seenRetentionVolumes[volumeName] = struct{}{}
-			volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
-			if _, statErr := os.Lstat(volumePath); statErr != nil {
-				if retention.Status == shared.RetentionStatusReaping && errors.Is(statErr, os.ErrNotExist) {
-					// v0.13 destroys one reaping volume at a time and leaves the
-					// original tombstone unchanged until the complete batch and
-					// final Delete succeed. A retryable partial reap therefore names
-					// already-destroyed volumes legitimately. Missing names explain
-					// no bytes; any surviving name below still must appear in the
-					// managed-volume inventory, and every unlisted managed volume is
-					// rejected by the reverse cross-check.
-					continue
-				}
-				if err := retentionVolumeFinding(fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
-					retention.OriginalLeaseUUID, volumeName, statErr)); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); rootErr != nil {
-				if err := retentionVolumeFinding(fmt.Errorf("retention %s volume %q is not present under configured volume root: %w",
-					retention.OriginalLeaseUUID, volumeName, rootErr)); err != nil {
-					return evidence, err
-				}
-				continue
-			}
-			evidenceVolumes[volumeName] = struct{}{}
-		}
-	}
-	// A v0.13 give-up tombstone intentionally has no stored destroy list. Its
-	// runtime finalizer derives the abandoned footprint from the canonical and
-	// retained namespaces belonging to OriginalLeaseUUID. Use that same strict
-	// namespace proof here: it preserves resumable give-up/partial-reap state,
-	// while the reverse cross-check below still rejects every volume outside an
-	// exact reaping lease identity. Index by UUID and scan the managed inventory
-	// once so an operator-controlled 100k-row journal cannot force O(R*V) work.
-	// Sorted, so the first refusal is the same on every run and the audit's
-	// first finding is always the preflight's error.
-	for _, volumeName := range slices.Sorted(maps.Keys(managedSet)) {
-		managedName := managedSet[volumeName]
-		leaseUUID := managedVolumeLeaseUUID(managedName)
-		expectedVolumeNames, explained := reapingLeases[leaseUUID]
-		if !explained {
-			continue
-		}
-		if !expectedVolumeNames.containsEither(managedName) {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingReapingVolume, leaseUUID: leaseUUID, subject: volumeName,
-				err: fmt.Errorf(
-					"reaping retention %s matched managed volume %q outside its exact source item identities",
-					leaseUUID,
-					volumeName,
-				),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		volumePath := filepath.Join(cfg.VolumeDataPath, volumeName)
-		if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, volumePath); rootErr != nil {
-			if err := findings.add(adoptionFinding{
-				class: AdoptionFindingReapingVolume, leaseUUID: leaseUUID, subject: volumeName,
-				err: fmt.Errorf("reaping retention %s cannot attest managed volume %q: %w",
-					leaseUUID, volumeName, rootErr),
-			}); err != nil {
-				return evidence, err
-			}
-			continue
-		}
-		evidenceVolumes[volumeName] = struct{}{}
-	}
-
-	switch mode {
-	case StorageIdentityInitializeNew:
-		if len(containers) != 0 || len(retentions) != 0 || len(managedSet) != 0 || len(releases.ActiveLeaseUUIDs) != 0 {
-			return evidence, findings.add(adoptionFinding{
-				class: AdoptionFindingNonEmptySubstrate,
-				err: fmt.Errorf("new storage identity requires an empty backend (containers=%d retentions=%d managed_volumes=%d); use adopt for a verified v0.13 lineage",
-					len(containers), len(retentions), len(managedSet)),
-			})
-		}
-	case StorageIdentityInitializeAdopt:
-		if len(containers) == 0 && len(retentions) == 0 && len(managedSet) == 0 {
-			return evidence, findings.add(adoptionFinding{
-				class: AdoptionFindingEmptySubstrate,
-				err: errors.New(
-					"adopt storage identity found a drained v0.13 callback outbox but no managed " +
-						"containers, retentions, or volumes; rerun with -initialize-storage-identity new " +
-						"only after independently confirming this is the expected empty v0.13 substrate " +
-						"(not lost state) and its legacy callback outbox was fully drained",
-				),
-			})
-		}
-		for _, volumeName := range slices.Sorted(maps.Keys(evidenceVolumes)) {
-			if _, exists := managedSet[volumeName]; !exists {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingMissingEvidenceVolume, subject: volumeName,
-					err: fmt.Errorf("adoption evidence names managed volume %q that is absent from configured root", volumeName),
-				}); err != nil {
-					return evidence, err
-				}
-			}
-		}
-		for _, volumeName := range slices.Sorted(maps.Keys(managedSet)) {
-			if _, explained := evidenceVolumes[volumeName]; !explained {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingUnexplainedVolume, subject: volumeName,
-					err: fmt.Errorf("managed volume %q has no strict live-container or retention evidence", volumeName),
-				}); err != nil {
-					return evidence, err
-				}
-			}
-		}
-		seenLeases := make(map[string]struct{})
-		for _, container := range containers {
-			if _, seen := seenLeases[container.LeaseUUID]; seen {
-				continue
-			}
-			seenLeases[container.LeaseUUID] = struct{}{}
-			if _, active := releases.ActiveLeaseUUIDs[container.LeaseUUID]; !active {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingLeaseWithoutRelease, leaseUUID: container.LeaseUUID,
-					err: fmt.Errorf("managed lease %s has no active v0.13 release authority", container.LeaseUUID),
-				}); err != nil {
-					return evidence, err
-				}
-			}
-		}
-		for _, leaseUUID := range slices.Sorted(maps.Keys(releases.ActiveLeaseUUIDs)) {
-			if _, live := seenLeases[leaseUUID]; !live {
-				if err := findings.add(adoptionFinding{
-					class: AdoptionFindingReleaseWithoutCohort, leaseUUID: leaseUUID,
-					err: fmt.Errorf("active v0.13 release %s has no managed container cohort", leaseUUID),
-				}); err != nil {
-					return evidence, err
-				}
-			}
-		}
-	}
-	return evidence, nil
-}
-
-// legacyReleaseMatchesInterruptedDeprovisionRetention recognizes the exact
-// cross-journal shape v0.13 can leave after committing a retention/volume rename
-// but before purging the prior active release. It is diagnostic authority only:
-// preflight always refuses the shape and never edits either journal. The
-// retention inspector has already validated identity, quantities, and manifest
-// topology; this comparison additionally proves that the release and retention
-// carry the same normalized manifest.
-func legacyReleaseMatchesInterruptedDeprovisionRetention(
-	release *shared.Release,
-	retention *shared.RetentionEntry,
-) (bool, error) {
-	if release == nil || retention == nil || release.Status != "active" ||
-		(retention.Status != shared.RetentionStatusActive &&
-			retention.Status != shared.RetentionStatusReaping) ||
-		retention.StackManifest == nil {
-		return false, nil
-	}
-	if !release.OperationID.IsZero() || len(release.Items) != 0 ||
-		len(release.ResourceProfiles) != 0 {
-		return false, nil
-	}
-	releaseManifest, err := manifest.ParseStoredPayload(release.Manifest)
-	if err != nil {
-		return false, fmt.Errorf("parse legacy active release manifest: %w", err)
-	}
-	if release.Image != "stack" {
-		legacyService := releaseManifest.Services[manifest.DefaultServiceName]
-		if len(releaseManifest.Services) != 1 || legacyService == nil ||
-			release.Image != legacyService.Image {
-			return false, nil
-		}
-	}
-	items := append([]backend.LeaseItem(nil), retention.Items...)
-	if err := backend.NormalizeProvisionRequest(&backend.ProvisionRequest{Items: items}); err != nil {
-		return false, fmt.Errorf("normalize retention items: %w", err)
-	}
-	if topologyMatches := manifest.ValidateStackAgainstItems(releaseManifest, items) == nil; !topologyMatches {
-		return false, nil
-	}
-	releaseJSON, err := json.Marshal(releaseManifest)
-	if err != nil {
-		return false, fmt.Errorf("marshal normalized release manifest: %w", err)
-	}
-	retentionJSON, err := json.Marshal(retention.StackManifest)
-	if err != nil {
-		return false, fmt.Errorf("marshal retention manifest: %w", err)
-	}
-	return bytes.Equal(releaseJSON, retentionJSON), nil
 }
 
 // managedVolumeEvidenceAuthority is the exact volume-name authority one
@@ -1975,15 +1258,6 @@ func managedVolumeEvidenceIdentityFromName(name managedVolumeName) managedVolume
 	}
 }
 
-func (a managedVolumeEvidenceAuthority) containsRetained(name managedVolumeName) bool {
-	identity := managedVolumeEvidenceIdentityFromName(name)
-	return identity.retained && a.containsIdentity(identity)
-}
-
-func (a managedVolumeEvidenceAuthority) containsEither(name managedVolumeName) bool {
-	return a.containsIdentity(managedVolumeEvidenceIdentityFromName(name))
-}
-
 func (a managedVolumeEvidenceAuthority) containsIdentity(identity managedVolumeEvidenceIdentity) bool {
 	if identity.leaseUUID != a.leaseUUID {
 		return false
@@ -2002,43 +1276,46 @@ func managedVolumeLeaseUUID(volumeName managedVolumeName) string {
 	return managedVolumeEvidenceIdentityFromName(volumeName).leaseUUID
 }
 
-func dockerStorageInitializationProfile(
+// requireFreshStorageInitialization reports whether an interrupted seal of an
+// empty backend is waiting to be resumed, and refuses every state that is not
+// an empty backend. Journals that exist without a storage identity were written
+// by v0.13, or by a v0.13 adoption that never finished; the final 0.14 release
+// adopts such a lineage, and this release does not.
+func requireFreshStorageInitialization(
 	cfg Config,
 	paths *dockerStorageInitializationPaths,
 	substrateID string,
-	mode StorageIdentityInitializationMode,
-) (backendidentity.InitializationProfile, bool, error) {
+) (resuming bool, err error) {
 	if paths == nil || paths.markers == nil {
-		return "", false, errors.New("docker storage initialization paths are required")
+		return false, errors.New("docker storage initialization paths are required")
 	}
 	profile, pending, err := paths.markers.PendingInitializationProfile(cfg.Name, substrateID)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	if pending {
-		if profile != backendidentity.InitializationProfileFresh &&
-			profile != backendidentity.InitializationProfileExisting {
-			return "", false, errors.New("pending backend initialization has no store profile")
+		if profile != backendidentity.InitializationProfileFresh {
+			return false, fmt.Errorf(
+				"pending backend initialization has store profile %q: only the final 0.14 release can finish adopting a v0.13 lineage",
+				profile,
+			)
 		}
-		if mode == StorageIdentityInitializeAdopt && profile != backendidentity.InitializationProfileExisting {
-			return "", false, errors.New("adopt mode cannot resume a fresh backend initialization")
-		}
-		return profile, true, nil
+		return true, nil
 	}
 	callbackStore, err := shared.InspectBoundCallbackStoreReadOnly(paths.callbacks)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
-	releases, err := shared.InspectBoundLegacyReleaseStoreReadOnly(paths.releases)
+	releases, err := shared.InspectBoundReleaseStoreReadOnly(paths.releases)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	retentions, err := shared.InspectBoundRetentionStoreReadOnly(paths.retention)
 	if err != nil {
-		return "", false, err
+		return false, err
 	}
 	if callbackStore.IdentityBound || releases.IdentityBound || retentions.IdentityBound {
-		return "", false, errors.New("authoritative journal is already identity-bound; restore its marker pair instead of resealing")
+		return false, errors.New("authoritative journal is already identity-bound; restore its marker pair instead of resealing")
 	}
 	present := 0
 	for _, exists := range []bool{callbackStore.Exists, releases.Exists, retentions.Exists} {
@@ -2046,150 +1323,66 @@ func dockerStorageInitializationProfile(
 			present++
 		}
 	}
-	switch present {
-	case 0:
-		if mode == StorageIdentityInitializeAdopt {
-			return "", false, errors.New("adopt storage identity requires complete existing v0.13 journals")
-		}
-		return backendidentity.InitializationProfileFresh, false, nil
-	case 3:
-		return backendidentity.InitializationProfileExisting, false, nil
-	default:
-		return "", false, fmt.Errorf("authoritative backend journals are incomplete (%d of 3 present)", present)
+	if present != 0 {
+		return false, fmt.Errorf(
+			"%d of 3 authoritative backend journals exist without a storage identity: this release seals only an empty backend, and a v0.13 lineage is adopted by the final 0.14 release",
+			present,
+		)
 	}
+	return false, nil
 }
 
-func storageIdentityContainerVolumeEvidence(
-	cfg Config,
-	containers []ContainerInfo,
-) (map[string]struct{}, error) {
-	return collectStorageIdentityContainerVolumeEvidence(cfg, containers, failFastAdoptionFindings{})
-}
-
-// collectStorageIdentityContainerVolumeEvidence reports a refused container
-// and moves on to the next one, or a refused mount and moves on to the next
-// mount, when findings keeps going.
-func collectStorageIdentityContainerVolumeEvidence(
-	cfg Config,
-	containers []ContainerInfo,
-	findings adoptionFindings,
-) (map[string]struct{}, error) {
-	evidenceVolumes := make(map[string]struct{})
-	for _, container := range containers {
-		containerFinding := func(cause error) error {
-			return findings.add(adoptionFinding{
-				class: AdoptionFindingContainerVolume, leaseUUID: container.LeaseUUID,
-				subject: container.ContainerID, err: cause,
-			})
-		}
-		profile, profileErr := cfg.GetSKUProfile(container.SKU)
-		if profileErr != nil {
-			if err := containerFinding(fmt.Errorf("resolve SKU for managed container %s before storage identity initialization: %w",
-				container.ContainerID, profileErr)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		stateful := profile.DiskMB > 0
-		if stateful && cfg.VolumeDataPath == "" {
-			if err := containerFinding(fmt.Errorf("managed stateful container %s exists but volume_data_path is empty",
-				container.ContainerID)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		for _, mount := range container.Mounts {
-			if mount.Type != "bind" {
-				continue
-			}
-			if cfg.VolumeDataPath == "" {
-				if err := containerFinding(fmt.Errorf("managed diskless container %s has a bind mount but volume_data_path is empty",
-					container.ContainerID)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			source := mount.Source
-			if rootErr := requireExistingPathUnderRoot(cfg.VolumeDataPath, source); rootErr != nil {
-				if err := containerFinding(fmt.Errorf("managed container %s mount %q is not owned by configured volume root: %w",
-					container.ContainerID, source, rootErr)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			relative, relErr := filepath.Rel(cfg.VolumeDataPath, source)
-			if relErr != nil || relative == "." || relative == ".." ||
-				strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-				if err := containerFinding(fmt.Errorf("managed container %s mount %q has no managed volume root",
-					container.ContainerID, source)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			volumeName := strings.Split(relative, string(filepath.Separator))[0]
-			managedName, parseErr := parseManagedVolumeName(volumeName)
-			if parseErr != nil {
-				if err := containerFinding(fmt.Errorf(
-					"managed container %s mount %q has invalid managed volume identity %q: %w",
-					container.ContainerID,
-					source,
-					volumeName,
-					parseErr,
-				)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			expectedName := canonicalVolumeName(
-				container.LeaseUUID,
-				container.ServiceName,
-				container.InstanceIndex,
-			)
-			expectedManagedName, expectedErr := parseManagedVolumeName(expectedName)
-			if expectedErr != nil {
-				if err := containerFinding(fmt.Errorf(
-					"managed container %s labels do not derive a valid managed volume identity %q: %w",
-					container.ContainerID,
-					expectedName,
-					expectedErr,
-				)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			if managedName != expectedManagedName {
-				if err := containerFinding(fmt.Errorf(
-					"managed container %s mount %q identifies volume %q, expected exact live identity %q from its lease, service, and instance labels",
-					container.ContainerID,
-					source,
-					managedName.value(),
-					expectedManagedName.value(),
-				)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			if mountErr := requireManagedVolumeMountSource(
-				cfg.VolumeDataPath,
-				source,
-				managedName,
-				mount.Target,
-			); mountErr != nil {
-				if err := containerFinding(fmt.Errorf(
-					"managed container %s mount %q does not prove volume %q: %w",
-					container.ContainerID,
-					source,
-					managedName.value(),
-					mountErr,
-				)); err != nil {
-					return nil, err
-				}
-				continue
-			}
-			evidenceVolumes[managedName.value()] = struct{}{}
-		}
+// verifyFreshStorageIdentityEvidence proves that the backend being sealed is
+// empty: a drained callback outbox, and no managed container, managed volume,
+// retention or active release. prepared is true once this initialization has
+// created and bound the journals itself.
+func verifyFreshStorageIdentityEvidence(
+	ctx context.Context,
+	dockerClient storageIdentityEvidenceClient,
+	volumes storageIdentityProofVolumes,
+	prepared bool,
+	paths *dockerStorageInitializationPaths,
+) error {
+	if paths == nil {
+		return errors.New("docker storage initialization paths are required")
 	}
-	return evidenceVolumes, nil
+	callbackStore, err := shared.InspectBoundCallbackStoreReadOnly(paths.callbacks)
+	if err != nil {
+		return fmt.Errorf("inspect callback outbox before storage identity initialization: %w", err)
+	}
+	if callbackStore.UpgradedSchema && !prepared {
+		return errors.New("storage identity initialization refuses an already-upgraded callback store; restore the sealed marker pair instead of resealing this lineage")
+	}
+	if callbackStore.Pending != 0 {
+		return fmt.Errorf(
+			"storage identity initialization requires a drained callback outbox; %d pending callbacks remain",
+			callbackStore.Pending,
+		)
+	}
+	releases, err := shared.InspectBoundReleaseStoreReadOnly(paths.releases)
+	if err != nil {
+		return fmt.Errorf("inspect release journal before storage identity initialization: %w", err)
+	}
+	retentionStore, err := shared.InspectBoundRetentionStoreReadOnly(paths.retention)
+	if err != nil {
+		return fmt.Errorf("inspect retention journal before storage identity initialization: %w", err)
+	}
+	containers, err := dockerClient.ListManagedContainersStrict(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect managed containers before storage identity initialization: %w", err)
+	}
+	managedSet, err := attestManagedVolumeInventory(ctx, volumes)
+	if err != nil {
+		return fmt.Errorf("prove managed volume substrate before storage identity initialization: %w", err)
+	}
+	if len(containers) != 0 || len(retentionStore.Entries) != 0 || len(managedSet) != 0 ||
+		len(releases.ActiveLeaseUUIDs) != 0 {
+		return fmt.Errorf(
+			"new storage identity requires an empty backend (containers=%d retentions=%d managed_volumes=%d active_releases=%d)",
+			len(containers), len(retentionStore.Entries), len(managedSet), len(releases.ActiveLeaseUUIDs),
+		)
+	}
+	return nil
 }
 
 // requireManagedVolumeMountSource binds Docker's lexical mount declaration to

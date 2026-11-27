@@ -71,9 +71,9 @@ func releaseSchemaHooks(
 	bound *BoundAuthoritativeStorePath,
 ) backendidentity.MarkerPairStoreHooks {
 	return backendidentity.MarkerPairStoreHooks{
-		Profile: backendidentity.InitializationProfileExisting,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return PrepareBoundReleaseStoreStorage(bound, storage, profile)
+			return PrepareBoundReleaseStoreStorage(bound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			return CheckBoundReleaseStoreStorage(bound, storage)
@@ -88,9 +88,9 @@ func retentionSchemaHooks(
 	bound *BoundAuthoritativeStorePath,
 ) backendidentity.MarkerPairStoreHooks {
 	return backendidentity.MarkerPairStoreHooks{
-		Profile: backendidentity.InitializationProfileExisting,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return PrepareBoundRetentionStoreStorage(bound, storage, profile)
+			return PrepareBoundRetentionStoreStorage(bound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			return CheckBoundRetentionStoreStorage(bound, storage)
@@ -120,7 +120,7 @@ func initializeBoundRetentionStore(t testing.TB) (string, backendidentity.Verifi
 		backendidentity.MarkerPairStoreHooks{
 			Profile: backendidentity.InitializationProfileFresh,
 			Prepare: func(pending backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-				return PrepareBoundRetentionStoreStorage(bound, pending, profile)
+				return PrepareBoundRetentionStoreStorage(bound, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				return CheckBoundRetentionStoreStorage(bound, pending)
@@ -350,89 +350,6 @@ func TestAuthorityStoreHealthyRejectsUnknownRootAddedAfterOpen(t *testing.T) {
 	}
 }
 
-func TestPrepareExistingUpgradesCompleteVersionlessReleaseJournal(t *testing.T) {
-	dbPath, pair, hooks := initializePendingSchemaStore(
-		t, releasesBucketName, releaseSchemaHooks,
-	)
-	leaseUUIDs := []string{
-		schemaTestLeaseUUID,
-		"22222222-2222-4222-8222-222222222222",
-	}
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		for _, leaseUUID := range leaseUUIDs {
-			value, marshalErr := json.Marshal([]Release{{
-				Version: 1, Manifest: []byte(`{"image":"alpine:3.22"}`),
-				Image:  "alpine:3.22",
-				Status: "active", CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-			}})
-			if marshalErr != nil {
-				return marshalErr
-			}
-			if putErr := bucket.Put([]byte(leaseUUID), value); putErr != nil {
-				return putErr
-			}
-		}
-		return nil
-	}))
-	require.NoError(t, db.Close())
-
-	_, err = pair.InitializeWithStores("docker-a", "daemon-a", hooks)
-	require.NoError(t, err)
-	db, err = bolt.Open(dbPath, 0o600, &bolt.Options{ReadOnly: true})
-	require.NoError(t, err)
-	require.NoError(t, db.View(func(tx *bolt.Tx) error {
-		for _, leaseUUID := range leaseUUIDs {
-			history, decodeErr := decodeReleaseHistory(
-				tx.Bucket(releasesBucketName).Get([]byte(leaseUUID)),
-			)
-			require.NoError(t, decodeErr)
-			require.Len(t, history, 1)
-			assert.Equal(t, "alpine:3.22", history[0].Image)
-		}
-		return nil
-	}))
-	require.NoError(t, db.Close())
-}
-
-func TestPrepareExistingRejectsIncompleteVersionlessReleaseJournalAtomically(t *testing.T) {
-	dbPath, pair, hooks := initializePendingSchemaStore(
-		t, releasesBucketName, releaseSchemaHooks,
-	)
-	validRaw := []byte(`[{
-		"version":1,
-		"manifest":"eyJpbWFnZSI6ImFscGluZTozLjIyIn0=",
-		"image":"alpine:3.22",
-		"status":"active",
-		"created_at":"2026-01-02T03:04:05Z"
-	}]`)
-	invalidRaw := []byte(`[{"version":1,"status":"active","legacy_migration":true}]`)
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(releasesBucketName)
-		if err := bucket.Put([]byte(schemaTestLeaseUUID), validRaw); err != nil {
-			return err
-		}
-		return bucket.Put(
-			[]byte("22222222-2222-4222-8222-222222222222"), invalidRaw,
-		)
-	}))
-	require.NoError(t, db.Close())
-
-	_, err = pair.InitializeWithStores("docker-a", "daemon-a", hooks)
-	require.ErrorContains(t, err, `unknown field "legacy_migration"`)
-	db, err = bolt.Open(dbPath, 0o600, &bolt.Options{ReadOnly: true})
-	require.NoError(t, err)
-	require.NoError(t, db.View(func(tx *bolt.Tx) error {
-		assert.Equal(t, validRaw, tx.Bucket(releasesBucketName).Get([]byte(schemaTestLeaseUUID)))
-		return nil
-	}))
-	require.NoError(t, db.Close())
-}
-
 func versionlessRetentionSchemaEntry(leaseUUID string) RetentionEntry {
 	return RetentionEntry{
 		OriginalLeaseUUID: leaseUUID,
@@ -452,82 +369,4 @@ func versionlessRetentionSchemaEntry(leaseUUID string) RetentionEntry {
 		Status:              RetentionStatusActive,
 		CreatedAt:           time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}
-}
-
-func TestPrepareExistingUpgradesCompleteVersionlessRetentionJournal(t *testing.T) {
-	dbPath, pair, hooks := initializePendingSchemaStore(
-		t, retentionBucketName, retentionSchemaHooks,
-	)
-	leaseUUIDs := []string{
-		schemaTestLeaseUUID,
-		"22222222-2222-4222-8222-222222222222",
-	}
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(retentionBucketName)
-		for _, leaseUUID := range leaseUUIDs {
-			value, marshalErr := json.Marshal(versionlessRetentionSchemaEntry(leaseUUID))
-			if marshalErr != nil {
-				return marshalErr
-			}
-			if putErr := bucket.Put([]byte(leaseUUID), value); putErr != nil {
-				return putErr
-			}
-		}
-		return nil
-	}))
-	require.NoError(t, db.Close())
-
-	_, err = pair.InitializeWithStores("docker-a", "daemon-a", hooks)
-	require.NoError(t, err)
-	db, err = bolt.Open(dbPath, 0o600, &bolt.Options{ReadOnly: true})
-	require.NoError(t, err)
-	require.NoError(t, db.View(func(tx *bolt.Tx) error {
-		for _, leaseUUID := range leaseUUIDs {
-			entry, decodeErr := decodeRetentionEntry(
-				tx.Bucket(retentionBucketName).Get([]byte(leaseUUID)),
-			)
-			require.NoError(t, decodeErr)
-			assert.Equal(t, leaseUUID, entry.OriginalLeaseUUID)
-			assert.NotEmpty(t, entry.ResourceProfiles)
-		}
-		return nil
-	}))
-	require.NoError(t, db.Close())
-}
-
-func TestPrepareExistingRejectsIncompleteVersionlessRetentionJournalAtomically(t *testing.T) {
-	dbPath, pair, hooks := initializePendingSchemaStore(
-		t, retentionBucketName, retentionSchemaHooks,
-	)
-	validRaw, err := json.Marshal(versionlessRetentionSchemaEntry(schemaTestLeaseUUID))
-	require.NoError(t, err)
-	invalidRaw := append(
-		[]byte(nil),
-		validRaw[:len(validRaw)-1]...,
-	)
-	invalidRaw = append(invalidRaw, []byte(`,"future":true}`)...)
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(retentionBucketName)
-		if err := bucket.Put([]byte(schemaTestLeaseUUID), validRaw); err != nil {
-			return err
-		}
-		return bucket.Put(
-			[]byte("22222222-2222-4222-8222-222222222222"), invalidRaw,
-		)
-	}))
-	require.NoError(t, db.Close())
-
-	_, err = pair.InitializeWithStores("docker-a", "daemon-a", hooks)
-	require.ErrorContains(t, err, `unknown field "future"`)
-	db, err = bolt.Open(dbPath, 0o600, &bolt.Options{ReadOnly: true})
-	require.NoError(t, err)
-	require.NoError(t, db.View(func(tx *bolt.Tx) error {
-		assert.Equal(t, validRaw, tx.Bucket(retentionBucketName).Get([]byte(schemaTestLeaseUUID)))
-		return nil
-	}))
-	require.NoError(t, db.Close())
 }

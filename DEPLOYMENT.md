@@ -1438,58 +1438,23 @@ starts.
 
 ### Upgrading from v0.13.x
 
-**This release line cannot complete this upgrade on its own.** Its
-`placement-preflight` no longer inspects or prepares a v0.13 placement
-database, and its `providerd` refuses one. Upgrade a v0.13 provider to the final
-0.14 release first, with that release's binaries and its copy of this guide,
-then upgrade from 0.14 as described under [Upgrades](#upgrades). What follows is
-kept for the backend half of the procedure, which this line's `docker-backend`
-still implements, and for how leases adopted from v0.13 behave afterwards.
+**This release line does not upgrade a v0.13 provider.** `placement-preflight`
+no longer inspects or prepares a v0.13 placement database, and `docker-backend`
+no longer adopts a v0.13 storage lineage: `-initialize-storage-identity` takes
+only `new`, and the `-preflight-storage-identity-adoption` and
+`-audit-storage-identity-adoption` modes are gone. `providerd` refuses a
+v0.13-layout placement database, and `-initialize-storage-identity new` refuses
+journals that exist without a storage identity.
 
-This procedure applies to every v0.13 release: v0.13.0, v0.13.1 and v0.13.2.
-The patch releases changed no placement, payload, release or callback store
-format and no providerd↔backend wire shape, so "v0.13.0" below names the state
-all three write. v0.13.1's `billing_only_skus` key is accepted unchanged.
+Upgrade a v0.13 provider to the final 0.14 release first, with that release's
+binaries and its copy of this guide, then upgrade from 0.14 as described under
+[Upgrades](#upgrades).
 
-**Regenerate and validate configuration before installing the new binaries.**
-The provider and backend loaders now reject unknown keys and additional YAML
-documents. Old `manifest-deploy` templates emitted provider
-`backends[].wildcard_domain` and Docker root-level `docker_port_range_start` /
-`docker_port_range_end`; none was consumed by v0.13, and the upgraded loaders
-reject them. Remove these keys from the producer templates and existing files.
-Keep Docker `ingress.wildcard_domain`, which still controls tenant ingress;
-the removed port-range keys never constrained Docker's host-port allocation.
-Removing those keys does not complete the authentication migration. In
-`manifest-deploy`, select `fred_config_profile: typed-authority` and provision
-the complete per-backend key map as described under
-[configuration profiles](https://github.com/manifest-network/manifest-deploy/blob/b9978512755b77032fe040f08f040fd58ec2d9e5/docs/fred-stopped-cutover.md#configuration-profiles).
-The `legacy-v0.13` profile still emits the provider's fleet-wide
-`callback_secret`, which upgraded production validation rejects. The target
-provider must instead use a unique `backends[].hmac_secret` for each backend,
-matching only that backend's `callback_secret`.
-Compare the complete rendered configurations with the target revision's
-examples and run that revision's real loaders, including every backend.
-The provider configuration must also reach the chain over certificate-verified
-gRPC TLS (`grpc_tls_enabled: true`, `grpc_tls_skip_verify: false`): the
-0.14 line's mandatory `placement-preflight` steps refuse plaintext or unverified
-chain gRPC. `grpc_tls_enabled` defaults to false and `production_mode: true`
-does not require it, so confirm the chain endpoint serves verifiable TLS
-before the fence.
-[The deployment compatibility gate](https://github.com/manifest-network/manifest-deploy/blob/b9978512755b77032fe040f08f040fd58ec2d9e5/ci/check_fred_compatibility.py)
-provides validation of the exact rendered files without starting services.
-Complete this check while the old fleet remains available, then use the stopped
-cutover below. Do not deploy the stricter binaries with the old rendered files
-or bypass validation by adding ignored fields to Fred's config types.
+The rest of this section is reference, not procedure. It describes what that
+0.14 cutover left behind and how leases adopted from v0.13 behave, because such
+leases still exist.
 
-**Live-fleet scope for this cutover.** The read-only deployment and manifest
-inventory verified on 2026-09-02 for ENG-632 found the serving production tenant
-fleet on `docker-backend` with XFS, matching
-[Components and topology](#components-and-topology) and the current
-[stateful-filesystem guidance](#stateful-workloads-disk_mb--0-skus). This
-is a point-in-time rollout fact, not a permanent support or compatibility
-promise: re-inventory the deployments immediately before executing the cutover
-and extend the proof plan if the fleet has changed. Local development
-environments are outside this production cutover gate.
+#### What the 0.14 cutover left in the placement database
 
 The v0.13 placement database is converted only by the 0.14 line's mandatory
 offline `placement-preflight -prepare` step. This line has no such step: normal
@@ -1508,215 +1473,26 @@ Preserve `placement_store_db_path`: inventory cannot reconstruct unresolved
 attempts, conflicts, historical negative evidence, or the immutable
 backend-name/storage bindings.
 
-The per-backend HMAC migration makes this a stopped provider/fleet cutover; do
-not roll a mixed-key fleet while the old providerd remains online. Quiesce and
-drain operations, including every legacy callback outbox to zero—pending
-pre-identity rows are not carried across the storage-identity seal—then remove
-provider ingress and stop the old providerd and all backends. Install the
-upgraded binaries without starting them, preserve the deployed v0.13 SKU and
-scratch configuration, and set each backend's existing `callback_secret` to a
-new unique value `K_i` of at least 32 bytes.
+#### Storage identity of a backend
 
-Before taking the cutover backup or publishing any storage-identity state, run
-the dedicated read-only proof against every stopped Docker backend:
+`docker-backend -initialize-storage-identity new` seals the storage lineage of
+an empty backend once, before its first start. All three authoritative paths
+(`callbacks.db`, `releases.db`, and `retention.db`) must be absent, and the
+backend must have no managed container and no managed volume directory. A
+journal that exists without a storage identity is a v0.13 lineage, or a v0.13
+adoption that never finished: `new` refuses it and names the final 0.14
+release, which adopts it. `new` is the only value the flag takes.
 
-```bash
-docker-backend -config /etc/fred/docker-backend.yaml \
-  -preflight-storage-identity-adoption
-```
-
-The preflight and initializer share
-`-storage-identity-operation-timeout` (default `10m`) as one cooperative
+`-storage-identity-operation-timeout` (default `10m`) is one cooperative
 cancellation deadline for context-aware Docker and filesystem-control-plane
-probes. Managed-volume substrate attestation is deliberately sequential, so
-large fleets or slow control planes may need a larger value, for example
-`-storage-identity-operation-timeout 30m`. This is not a hard wall-clock kill:
+probes. Managed-volume substrate attestation is deliberately sequential, so a
+slow control plane may need a larger value. This is not a hard wall-clock kill:
 blocking local open, bbolt, and fsync operations cannot be forcibly interrupted
 by a Go context. Deadline expiry makes the command unsuccessful at its next
-cancellation boundary, but does not prove rollback or completion. Preflight is
-read-only; initialization may have left a crash-resumable pending state or even
-completed the seal before a later check reports cancellation. Keep the lineage
-stopped and rerun the same initialization mode against unchanged input. Only
-exit status zero plus the exact success verdict authorizes the next cutover
-step.
-
-Require exit status zero and stdout containing only the exact checked verdict
-`ready_for_v0_13_storage_identity_adoption` followed by a newline. All startup
-and failure diagnostics go to stderr, and a short or failed stdout write makes
-the command fail. This mode acquires the same
-descriptor-bound journal parents, Docker `SystemID`, complete strict container
-inventory, release/retention evidence, and managed-volume inventory as the
-initializer, but it requires both marker entries to remain absent and has no
-marker/store mutation or recovery capability. It is mutually exclusive with
-`-initialize-storage-identity`. A success is a point-in-time proof, not a
-reservation: keep the old processes stopped, take the placement plus complete
-backend substrate/control-state backups only after every backend passes, and
-let `adopt` repeat the proof at its own publication boundary.
-
-The preflight stops at the first refused shape. To see every shape in one pass
-before the fence (for example against byte copies of the journals through a
-shadow config), run the read-only audit:
-
-```bash
-docker-backend -config /etc/fred/docker-backend.yaml \
-  -audit-storage-identity-adoption
-```
-
-It runs the preflight's checks in the same order but records each refused
-shape and moves on to the next independent lease, retention, container, or
-volume. Stdout is one JSON object: `verdict`
-(`ready_for_v0_13_storage_identity_adoption` or
-`v0_13_storage_identity_adoption_blocked`), `findings` (each with `class`,
-advisory `remedy`, optional `lease_uuid` and `subject`, and `message`), the
-v0.13 `items` adoption would freeze for each entry in `active_releases`, and
-`pending_callbacks`. The first finding's `message` is exactly the error the
-preflight reports. A shape that makes later checks meaningless, such as an
-unreadable journal or a sealed lineage, fails the audit instead. Exit status is
-0 when nothing blocks adoption, 3 when findings do, and 1 when the audit
-itself failed, which prints nothing on stdout. The audit authorizes nothing:
-only the preflight's verdict does.
-
-`stats.in_flight_provisions == 0` and a drained callback outbox are necessary
-but not sufficient. A v0.13 restore can leave a durable `status:"restoring"`
-row after a teardown, re-quarantine, or finalization failure even when no
-operation remains in memory, and v0.13 `/retentions` does not expose that
-status. The preflight reports the exact source, destination, and generation as
-`ErrLegacyRestoringRetention`; the upgraded binary cannot safely reconstruct
-the missing destination items/profile, typed operation ID, or exact callback
-pair. Do not edit the row or synthesize those facts. Instead, restore/restart
-the complete matching v0.13 lineage in isolation, let its retention reconciler
-commit or roll back the restore, drain callbacks again, stop it, rerun the
-read-only preflight, and take a fresh backup after it passes. A v0.13 `reaping`
-tombstone is different: names already destroyed by a partial reap may be absent
-and remain resumable, and a give-up tombstone can have an empty name list while
-canonical and retained volumes remain. The proof permits absent stored names
-only for `reaping` and derives that status's surviving footprint from the exact
-`fred-{original_lease_uuid}-` and `fred-retained-{original_lease_uuid}-`
-namespaces. Every managed volume outside those prefixes must still have strict
-live-container or retention evidence. Every legacy retention SKU must also
-resolve through the preserved v0.13 `sku_mapping` and `sku_profiles`; restore a
-removed mapping/profile before retrying rather than sealing a journal that
-cannot be accounted on first upgraded startup. Likewise, a positive v0.13 SKU
-`disk_mb` reservation does not prove that a container has a bind: v0.13 created
-a host volume only when image-volume or writable-path discovery required one. Release
-and container topology prove a legitimate bindless cohort; the reverse
-inventory check still refuses any unexplained managed volume.
-
-The managed-volume check proves more than a directory name. Every inventory
-entry must have the canonical live or retained lease/service/index grammar and
-must be backed by the quota substrate: an
-XFS directory with a regular no-follow nonzero project-ID marker. Container
-bind evidence must name the exact volume derived from its labels and the exact
-target-derived subtree (or `_wp` subtree), with no symlinked path component;
-lexically naming one volume while resolving into another is rejected. Repair or
-restore the matching stopped substrate rather than replacing a failed proof
-with a same-named plain directory or marker.
-
-The stopped proof and initialization commands never normalize private
-interrupted-volume-mutation evidence. A name of the form
-`.fred-xfs-stage-<project-id>-<managed-volume>` is an upgraded XFS create stage,
-not a bind-ready volume; both commands reject it without publishing or deleting
-it. Its parent-synced typed name is cleanup authority even if its only regular
-project marker was recovered empty, partially written, or zero-filled (up to
-the writer's ten-byte maximum); that weaker evidence is never publication
-authority. Such a stage cannot have been written by v0.13.0, so seeing one during an
-unsealed cutover means an upgraded process already mutated this root or the
-wrong snapshot was selected. Preserve the full marker/journal/volume evidence
-and restore the matching stopped snapshot; do not rename the stage to its final
-name or remove it to force a verdict. Likewise,
-`.fred-xfs-delete-<project-id>-<managed-volume>` is upgraded deletion authority
-that cannot originate from v0.13.0. Its paired final volume may already be
-markerless or absent, so deleting or editing the empty sibling could erase the
-only safe recovery proof. Preserve the complete snapshot and determine why an
-upgraded process reached this root.
-
-The preflight also rejects an interrupted v0.13 deprovision when the journals
-contain an active release, no managed container cohort, and a semantically
-matching `active` or `reaping` retention for the same lease. This is a safe,
-recognizable crash window after the retention/volume transition but before
-release purge; it is not permission for the upgraded binary to edit across
-journals. Restart the complete matching v0.13 lineage in isolation and replay
-the exact close/deprovision event or request until the stale active release is
-purged while the retention is preserved. Then drain callbacks, stop it, rerun
-the read-only preflight, and take a fresh backup. A zero-container active release
-with a present but divergent retention remains an unclassified inconsistency and
-is rejected without mutation.
-
-A distinct `ErrV013UnresolvedClose` refusal means an active release has no
-managed container cohort and no retention finalizer. The report includes the
-count of volumes still present in that lease's exact canonical/retained
-namespace. This shape is compatible with a v0.13 crash after container teardown
-but before retention or release finalization, whether or not volumes remain.
-Do **not** replay v0.13 deprovision: its absent-provision path can purge the
-release while leaving tenant volumes stranded with no durable owner. Restore a
-complete matching pre-close snapshot and recover that v0.13 lineage in
-isolation. If no such snapshot exists, require height-pinned chain and provider
-inventory proof that the lease is terminal, then make and record an explicit
-manual decision about the surviving data and journal authority. Stop the
-lineage, rerun the read-only preflight, and take a fresh backup only after that
-decision is complete.
-
-Only complete stack-form v0.13 Docker cohorts are supported by this upgrade.
-Any service-name-less pre-stack container, `-prev` remnant, authorityless
-migration generation, or partial topology fails preflight and startup before
-substrate mutation. This release deliberately performs no in-place conversion
-and infers no missing authority for those shapes. Restore a known-good supported
-snapshot or use a separate proof-bearing repair procedure before continuing.
-
-After the backup, inspect each stopped v0.13 backend's release history with the
-new binary's read-only tool, before storage-identity adoption:
-
-```bash
-placement-preflight -inspect-releases /var/lib/fred/releases.db
-```
-
-This standalone mode needs no provider configuration or network access and
-never edits the journal. Its JSON includes `histories`, `releases` and
-`findings` with `lease_uuid`, `version`, `status` and `policy_error`. Policy
-findings are advisory and return exit zero: valid historical manifests remain
-readable even if current provision/update admission rejects their labels or
-user syntax. Malformed structure, topology or journal identity returns nonzero
-and must be resolved before adoption; do not delete release history. Reserved
-legacy runtime labels are filtered when containers are materialized. Archive
-the report with the stopped backup.
-
-Then seal each existing v0.13 storage lineage exactly once before
-its first normal upgraded start:
-
-```bash
-docker-backend -config /etc/fred/docker-backend.yaml \
-  -initialize-storage-identity adopt
-```
-
-Use `-initialize-storage-identity new` for either a genuinely new backend or a
-provably empty, drained v0.13 lineage. A genuinely fresh Docker lineage requires
-all three authoritative paths (`callbacks.db`, `releases.db`, and
-`retention.db`) to be absent. An existing v0.13 lineage requires all three files
-to exist and decode successfully; `retention.db` is required even if
-`retain_on_close` was false. A partial set is neither fresh nor adoptable and is
-rejected rather than completed. The empty-v0.13 proof requires no managed
-containers, active releases, retained records, or managed volume directories
-and a fully drained legacy callback outbox. `new` also refuses operation,
-maintenance, or close intents, or evidence of an already-upgraded callback
-store.
-`adopt` rejects an empty lineage with guidance to use `new`; otherwise it
-requires strict and complete v0.13 container/retention/volume evidence beneath
-the configured active `volume_mount_path`, a drained v0.13 callback store, valid
-release history, and the strongest local cross-check v0.13 persisted between
-every live workload and its active release. That local proof requires exact
-lease/tenant/provider identity, coherent callback pairs, manifest service and
-image equality, one SKU and effective custom domain per service, unique dense
-instance indexes, and complete reverse volume ownership. A v0.13 release did
-not persist requested `Items`, so local Docker evidence alone cannot prove that
-the highest requested index is not missing. The initializer does not claim it
-can. First upgraded startup freezes the observed cohort and then exposes its
-exact `Items`; while providerd remains stopped, the mandatory placement
-preflight below compares SKU, quantity, service, and nonempty effective domain
-against the height-pinned chain items. That later result—not backend startup or
-storage sealing by itself—is the cutover authorization. On a mismatch, stop the
-backends and restore the complete pre-cutover backend backup; do not prepare or
-start providerd with the locally inferred row. The Docker daemon `SystemID`
-must remain the same before and after inspection.
+cancellation boundary, but does not prove rollback or completion:
+initialization may have left a crash-resumable pending state or even completed
+the seal before a later check reports cancellation. Keep the backend stopped
+and rerun the same command against unchanged input.
 
 If recovery encounters an unbackfilled v0.13 Release alongside a pending new
 provision, it can supersede that row only after strict identity-bound inventory
@@ -1743,17 +1519,14 @@ separate UUID and receipt-reservation ceilings: nested buckets, aggregate heads,
 and queued deliveries are logical records too. Ordinary runtime release validation streams all lease rows
 and retains only the 32 MiB per-record ceiling, so a healthy large fleet does
 not become unreadable merely because its aggregate release history exceeds
-256 MiB. If a stopped v0.13 lineage exceeds a cutover ceiling, keep it on the
-matching predecessor, drain completed work, and let that version's supported
-age cleanup prune disposable records before retrying. Do not hand-edit bbolt,
-delete a journal, or remove a load-bearing row to force adoption.
+256 MiB.
 
 Initialization is a crash-resumable lineage transaction. Before inspecting
-fresh/existing evidence, it binds the physical parent directory of both markers
+any evidence, it binds the physical parent directory of both markers
 and every authoritative journal (callbacks/releases/retention). All inspection, creation, and publication then uses those
 retained descriptors, and every parent pathname must continue to name the same
 device/inode. It first publishes a pending anchor containing the generated UUID
-and immutable fresh/existing profile. Only after that anchor is durable can its
+and its immutable profile. Only after that anchor is durable can its
 opaque pending capability create or bind an authoritative store; a bare UUID
 has no such authority. Copies share one revocation state, and the coordinator
 withdraws them on every exit and before the first committed-marker publication,
@@ -1764,8 +1537,7 @@ cross-store evidence, publishes the primary marker, and finally commits the
 anchor. A parent rename, unmount, or same-path directory recreation is rejected
 instead of redirecting the transaction. If interrupted, rerun the same command
 against the unchanged stopped input; the pending anchor forces the same profile
-and identity. Do not switch modes, delete one output, or restore only part of
-the set. Once both markers are committed, initialization is verification-only
+and identity. Do not delete one output or restore only part of the set. Once both markers are committed, initialization is verification-only
 and will never recreate, rebind, or repair a store.
 
 Normal startup loads a typed verified-storage capability from the marker pair,
@@ -1826,20 +1598,13 @@ held and retried while the backend serves; see
 delete the authority manually, and never create its final name while it
 remains.
 
-After configuring every backend key, set the same `K_i` only on that backend's
-matching providerd `backends[].hmac_secret` and remove the provider's top-level
-`callback_secret`. Start and verify all upgraded backends while keeping
-providerd stopped. The startup storage identity must match the exact durable
-backend name-to-storage-ID binding used by placement preparation. The mandatory
-drain means no pre-identity v0.13 callback row crosses this boundary; if one is
-restored afterward, current callback-store startup fails and health stays red
-until the old outbox is explicitly drained. If a legacy row is introduced into
-an already-open store, the sender leaves it queued rather than assigning the
-mounted lineage. Identity-bearing current-schema rows
-created after sealing retain their recorded identity and are signed with the
-current `K_i` at delivery. The placement database is then prepared with the 0.14
-line's `placement-preflight`. Start the upgraded providerd only after that
-preparation has produced its safe verdict.
+A pre-identity v0.13 callback row never belongs in a sealed callback store. If
+one is restored into it, callback-store startup fails and health stays red until
+the old outbox is explicitly drained. If a legacy row is introduced into an
+already-open store, the sender leaves it queued rather than assigning the
+mounted lineage. Identity-bearing current-schema rows created after sealing
+retain their recorded identity and are signed with the backend's current key at
+delivery.
 
 The marker detects replacement, not a simultaneously running full clone. A
 snapshot that includes both markers and complete Docker data or cluster state
@@ -1881,16 +1646,10 @@ without losing other lease identities; a stronger handoff wake transfers work
 after a canceled drainer releases ownership. The periodic 30-second sweep
 discovers rows committed before loop startup and retries dormant failed heads.
 
-At the initial stopped boundary, wait for `stats.in_flight_provisions` to reach
-zero and verify the single v0.13.0 providerd shutdown reports no remaining
-provision operations before running the backend adoption preflight described
-above. Take the stopped bbolt/substrate backup only after that preflight passes.
+#### Classifying a stopped placement file
 
-The placement database is prepared next, with the 0.14 line's
-`placement-preflight` and that release's copy of this guide. This line has
-neither the read-only inspection nor the `-prepare` mode.
+`placement-repair -classify` inspects a stopped placement file:
 
-`placement-repair -classify` still inspects a stopped placement file:
 
 ```bash
 placement-repair -config /etc/fred/config.yaml -classify
@@ -1927,6 +1686,8 @@ environmental errors and do not become a misleading schema verdict.
 `-classify` is local read-only inspection and rejects an explicitly supplied
 `-timeout`; supervise blocking filesystem I/O externally. If cancellation is
 observed before reporting, the command emits no stale safe report.
+
+#### After the cutover
 
 After preparation, replace v0.13.0 and start exactly one new providerd. Do not
 run the two providerd versions concurrently. Existing stack-form v0.13 tenant
@@ -1996,16 +1757,15 @@ topology using backend stats, and records its exact write-ahead attempt before
 dispatch. Inventory silence never clears an attempt or conflict in either path.
 
 The callback protocol can preserve state inherited from v0.13.0, but this does
-not make a mixed-version rollout supported. During the stopped cutover, upgrade
-every backend before providerd while all old processes remain fenced. Each new
-backend requires a drained legacy callback outbox and sealed storage identity,
-then recovers the operationless `callback_url` already embedded in a v0.13
-workload, derives its tokenless lifecycle route, and reports its generation
-class in internal provision inventory without exposing the URL. Mandatory
-offline preparation migrates the matching confirmed placement as an explicitly
-legacy owner before the new provider starts. Stack-form workloads keep reporting
-lifecycle observations without replacement. An absent or rebuilt placement
-database is never a recovery path for those workloads.
+not make a mixed-version rollout supported. The stopped cutover to 0.14 sealed
+each backend's storage identity over a drained legacy callback outbox and
+migrated each confirmed placement as an explicitly legacy owner. A backend on
+this line still serves a workload adopted that way: it reads the operationless
+`callback_url` embedded in the workload, derives its tokenless lifecycle route,
+and reports its generation class in internal provision inventory without
+exposing the URL. Stack-form workloads keep reporting lifecycle observations
+without replacement. An absent or rebuilt placement database is never a
+recovery path for those workloads.
 
 Compatibility preserves existing containers, reads, legacy lifecycle
 observations, and identity-preserving maintenance; it does not admit new
@@ -2033,7 +1793,7 @@ replacement Release; failure retains the previous route. The legacy lifecycle
 class rotates to typed only when a later genuine provision or restore supplies
 an operation-scoped callback capability that providerd also persists. An
 active callbackless pre-label cohort cannot be assigned provider callback
-authority safely and is rejected by the mandatory stopped adoption preflight;
+authority safely and was rejected by the 0.14 line's stopped adoption;
 callbackless historical cleanup/close evidence remains readable but never
 authorizes zero-survivor recovery or maintenance.
 
@@ -2075,8 +1835,7 @@ fail-closed residual authority: it cannot publish runtime success or failure,
 be reissued for maintenance, or mutate placement or chain state, and passive
 inventory cannot rotate it. Do not delete it merely because inventory is absent;
 it preserves authorization for a delayed exact deprovision observation.
-Tokenless decoding is confined to stopped adoption and authenticated callback
-ingress; no current provision, restore, maintenance, or reconciliation workflow
+Tokenless decoding is confined to authenticated callback ingress; no current provision, restore, maintenance, or reconciliation workflow
 can mint an empty operation or lifecycle identity.
 Complete backend inventory and
 level-triggered reconciliation recover only from positive backend evidence;
@@ -2415,15 +2174,11 @@ volumes, containers, and storage identity.
 Schema compatibility is store-specific; the bbolt files carry no single global
 schema version or automatic downgrade guard. Current release histories and
 retention entries each carry a strict `schema_version: 1` envelope, and their
-stores reject unknown top-level buckets. The stopped Existing-profile adoption
-transaction is the only path that accepts their exact versionless v0.13 wire
-shapes; it validates every row before atomically rewriting the complete bucket
-and binding it to the storage lineage. Ordinary startup and committed-marker
-verification reject versionless, unknown, case-aliased, duplicate, future, and
-trailing data rather than silently discarding authority. A pending-marker replay
-can also finish upgrading the exact versionless identity-bound shape written by
-an interrupted earlier development build, but that compatibility reader is not
-available to a live store. Placement and lifecycle-capability rows likewise
+stores reject unknown top-level buckets. Nothing on this line accepts their
+versionless v0.13 wire shapes; the 0.14 line's stopped adoption rewrote them.
+Initialization, ordinary startup and committed-marker verification reject
+versionless, unknown, case-aliased, duplicate, future, and trailing data rather
+than silently discarding authority. Placement and lifecycle-capability rows likewise
 carry explicit current schemas. Runtime Open and health checks reject raw or
 versionless placement rows, case aliases, duplicate or unknown fields, future
 schemas, trailing values, and malformed lifecycle capabilities. Nothing on

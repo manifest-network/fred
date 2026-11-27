@@ -239,16 +239,6 @@ func recoveredSnapshotAllocations(
 	return allocations, nil
 }
 
-// recoveredCallbackPairs validates callback labels as a complete lease cohort
-// before recovery chooses any sibling as its in-memory representative. Docker
-// list order is not an authority boundary: every sibling must carry the exact
-// same operation/lifecycle generation, or the lease is quarantined by failing
-// recovery deterministically. An all-empty v0.13 stack cohort remains
-// callbackless; mixing an empty sibling with a routed sibling is divergence.
-func recoveredCallbackPairs(containers []ContainerInfo) (map[string]recoveredCallbackPair, error) {
-	return recoveredCallbackPairsExcept(containers, nil)
-}
-
 func recoveredCallbackPairsExcept(
 	containers []ContainerInfo,
 	skippedLeases map[string]struct{},

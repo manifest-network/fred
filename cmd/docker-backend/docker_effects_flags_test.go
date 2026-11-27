@@ -42,14 +42,19 @@ func TestParseStartupFlagsDockerEffectsRepairPreservesExactAcknowledgement(t *te
 	assert.Equal(t, "/var/backups/fred/before-repair.db", startup.dockerEffects.backup)
 }
 
+// writerFunc adapts a function to io.Writer, for tests that fail or record a
+// write.
+type writerFunc func([]byte) (int, error)
+
+func (write writerFunc) Write(value []byte) (int, error) { return write(value) }
+
 func TestParseStartupFlagsRejectsConflictingOfflineModes(t *testing.T) {
 	modes := [][]string{
 		{"-inspect-unsettled-docker-effects"},
 		{"-repair-unsettled-docker-effects", "-docker-effects-acknowledgement", "exact-ack", "-docker-effects-backup", "/backup.db"},
-		{"-preflight-storage-identity-adoption"},
-		{"-initialize-storage-identity", "adopt"},
+		{"-initialize-storage-identity", "new"},
 		{"-validate-config"},
-		{"-audit-storage-identity-adoption"},
+		{"-print-hmac-key-ids"},
 	}
 	for i, first := range modes {
 		for _, second := range modes[i+1:] {
@@ -72,7 +77,7 @@ func TestParseStartupFlagsRejectsIncompleteOrMisplacedRepairInputs(t *testing.T)
 		{"-inspect-unsettled-docker-effects", "-docker-effects-backup", "/backup.db"},
 		{"-docker-effects-acknowledgement", ""},
 		{"-docker-effects-backup", "/backup.db"},
-		{"-preflight-storage-identity-adoption", "-docker-effects-backup", "/backup.db"},
+		{"-initialize-storage-identity", "new", "-docker-effects-backup", "/backup.db"},
 	} {
 		t.Run(args[0]+"_"+args[len(args)-1], func(t *testing.T) {
 			_, err := parseStartupFlags(args, io.Discard)
@@ -107,12 +112,12 @@ func TestWriteDockerEffectsResultPreservesStructuredInspectionAndRepair(t *testi
 
 func TestWriteDockerEffectsResultRejectsIncompleteOutput(t *testing.T) {
 	result := shared.DockerRecoveryRepairResult{Verdict: "DOCKER_EFFECTS_FENCED"}
-	err := writeDockerEffectsResult(preflightVerdictWriter(func(data []byte) (int, error) {
+	err := writeDockerEffectsResult(writerFunc(func(data []byte) (int, error) {
 		return len(data) - 1, nil
 	}), result)
 	require.ErrorIs(t, err, io.ErrShortWrite)
 	wantErr := errors.New("stdout unavailable")
-	err = writeDockerEffectsResult(preflightVerdictWriter(func([]byte) (int, error) {
+	err = writeDockerEffectsResult(writerFunc(func([]byte) (int, error) {
 		return 0, wantErr
 	}), result)
 	require.ErrorIs(t, err, wantErr)
@@ -142,7 +147,7 @@ func TestWriteDockerEffectsRepairOutcomeRequiresConfirmedCompleteOutput(t *testi
 	}
 	result := shared.DockerRecoveryRepairResult{Verdict: "DOCKER_EFFECTS_FENCED"}
 	require.NoError(t, writeDockerEffectsRepairOutcome(io.Discard, result, nil))
-	err := writeDockerEffectsRepairOutcome(preflightVerdictWriter(func(data []byte) (int, error) {
+	err := writeDockerEffectsRepairOutcome(writerFunc(func(data []byte) (int, error) {
 		return len(data) - 1, nil
 	}), result, nil)
 	require.ErrorIs(t, err, io.ErrShortWrite, "an incomplete stdout report must make the command fail")

@@ -1131,11 +1131,11 @@ func TestPutActiveMerged_RejectsResourceProfileDivergenceAndMalformedSnapshots(t
 	})
 }
 
-func TestRetentionEntry_LegacyJSONOmitsResourceProfiles(t *testing.T) {
-	raw := []byte(`{"original_lease_uuid":"legacy","items":[{"sku":"sku-1","quantity":1}]}`)
-	entry, err := decodeLegacyRetentionEntry(raw)
-	require.NoError(t, err)
-	assert.Empty(t, entry.ResourceProfiles)
+func TestRetentionEntry_WithoutResourceProfilesOmitsTheField(t *testing.T) {
+	entry := RetentionEntry{
+		OriginalLeaseUUID: "legacy",
+		Items:             []backend.LeaseItem{{SKU: "sku-1", Quantity: 1}},
+	}
 
 	encoded, err := marshalRetentionEntry(entry)
 	require.NoError(t, err)

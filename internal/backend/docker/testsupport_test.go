@@ -275,13 +275,13 @@ func newBoundOperationIntentTestStore(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				if err := shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile); err != nil {
+				if err := shared.PrepareBoundCallbackStoreStorage(boundPath, pending); err != nil {
 					return err
 				}
-				if err := shared.PrepareBoundReleaseStoreStorage(boundReleases, pending, profile); err != nil {
+				if err := shared.PrepareBoundReleaseStoreStorage(boundReleases, pending); err != nil {
 					return err
 				}
-				return shared.PrepareBoundRetentionStoreStorage(boundRetentions, pending, profile)
+				return shared.PrepareBoundRetentionStoreStorage(boundRetentions, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				if err := shared.CheckBoundCallbackStoreStorage(boundPath, pending); err != nil {
@@ -608,7 +608,7 @@ func newBoundReleaseStoreForTest(
 		backendidentity.MarkerPairStoreHooks{
 			Profile: backendidentity.InitializationProfileFresh,
 			Prepare: func(pending backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-				return shared.PrepareBoundReleaseStoreStorage(boundPath, pending, profile)
+				return shared.PrepareBoundReleaseStoreStorage(boundPath, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				return shared.CheckBoundReleaseStoreStorage(boundPath, pending)
@@ -671,13 +671,13 @@ func newBoundRetentionStoreForTest(
 		backendidentity.MarkerPairStoreHooks{
 			Profile: backendidentity.InitializationProfileFresh,
 			Prepare: func(pending backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending, profile); err != nil {
+				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending); err != nil {
 					return err
 				}
-				if err := shared.PrepareBoundReleaseStoreStorage(releaseBound, pending, profile); err != nil {
+				if err := shared.PrepareBoundReleaseStoreStorage(releaseBound, pending); err != nil {
 					return err
 				}
-				return shared.PrepareBoundRetentionStoreStorage(retentionBound, pending, profile)
+				return shared.PrepareBoundRetentionStoreStorage(retentionBound, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				if err := shared.CheckBoundCallbackStoreStorage(callbackBound, pending); err != nil {
@@ -1680,13 +1680,13 @@ func (testDockerStorageIdentity) resolve(
 	hooks := backendidentity.MarkerPairStoreHooks{
 		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage, profile); err != nil {
+			if err := shared.PrepareBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
 				return err
 			}
-			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage, profile); err != nil {
+			if err := shared.PrepareBoundReleaseStoreStorage(paths.releases, storage); err != nil {
 				return err
 			}
-			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage, profile)
+			return shared.PrepareBoundRetentionStoreStorage(paths.retention, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := shared.CheckBoundCallbackStoreStorage(paths.callbacks, storage); err != nil {
@@ -1765,7 +1765,7 @@ func openBoundCallbackStoreForBackendTest(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				return shared.PrepareBoundCallbackStoreStorage(boundPath, pending, profile)
+				return shared.PrepareBoundCallbackStoreStorage(boundPath, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				return shared.CheckBoundCallbackStoreStorage(boundPath, pending)
@@ -1834,13 +1834,13 @@ func openBoundCloseStoresForBackendTest(
 				pending backendidentity.PendingStorage,
 				profile backendidentity.InitializationProfile,
 			) error {
-				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending, profile); err != nil {
+				if err := shared.PrepareBoundCallbackStoreStorage(callbackBound, pending); err != nil {
 					return err
 				}
-				if err := shared.PrepareBoundReleaseStoreStorage(releaseBound, pending, profile); err != nil {
+				if err := shared.PrepareBoundReleaseStoreStorage(releaseBound, pending); err != nil {
 					return err
 				}
-				return shared.PrepareBoundRetentionStoreStorage(retentionBound, pending, profile)
+				return shared.PrepareBoundRetentionStoreStorage(retentionBound, pending)
 			},
 			Check: func(pending backendidentity.PendingStorage) error {
 				if err := shared.CheckBoundCallbackStoreStorage(callbackBound, pending); err != nil {

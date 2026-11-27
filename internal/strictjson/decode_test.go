@@ -1,7 +1,6 @@
 package strictjson
 
 import (
-	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -98,6 +97,8 @@ func TestDecodeObjectRejectsFramingAndSizeViolations(t *testing.T) {
 		want  string
 	}{
 		{name: "root array", value: []byte(`[]`), max: 10, want: "expected JSON object"},
+		{name: "object where an array belongs", value: []byte(`{"children":{}}`), max: 20, want: "expected JSON array"},
+		{name: "array where an object belongs", value: []byte(`{"child":[]}`), max: 20, want: "expected JSON object"},
 		{name: "trailing", value: []byte(`{} true`), max: 10, want: "unexpected data"},
 		{name: "size", value: []byte(`{"version":1}`), max: 2, want: "exceeds 2 bytes"},
 		{name: "invalid UTF-8", value: []byte{'{', '"', 0xff, '"', ':', '1', '}'}, max: 10, want: "not valid UTF-8"},
@@ -108,32 +109,5 @@ func TestDecodeObjectRejectsFramingAndSizeViolations(t *testing.T) {
 				t, DecodeObject(test.value, test.max, &document), test.want,
 			)
 		})
-	}
-}
-
-func TestDecodeArrayUsesTheSameExactBoundary(t *testing.T) {
-	var children []testChild
-	require.NoError(t, DecodeArray([]byte(`[{"name":"one"}]`), 1<<10, &children))
-	require.Equal(t, []testChild{{Name: "one"}}, children)
-	require.ErrorContains(
-		t,
-		DecodeArray([]byte(`[{"name":"one","Name":"two"}]`), 1<<10, &children),
-		`unknown field "Name"`,
-	)
-}
-
-func TestDecodeRawObjectRejectsUnknownDuplicateAndTrailingData(t *testing.T) {
-	allowed := map[string]struct{}{"version": {}}
-	object, err := DecodeRawObject([]byte(`{"version":1}`), 1<<10, allowed)
-	require.NoError(t, err)
-	assert.Equal(t, json.RawMessage("1"), object["version"])
-
-	for _, value := range []string{
-		`{"Version":1}`,
-		`{"version":1,"version":2}`,
-		`{"version":1} null`,
-	} {
-		_, err := DecodeRawObject([]byte(value), 1<<10, allowed)
-		require.Error(t, err)
 	}
 }

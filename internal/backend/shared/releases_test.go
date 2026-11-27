@@ -4,8 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -390,10 +390,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxRecordBytes: 1 << 20,
 				maxTotalBytes:  1 << 20,
 			})
-			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
-			)
-			return inspectErr
+			return inspectReleaseBucketWithObserver(tx, nil, budget.observe)
 		})
 		require.ErrorContains(t, err, "1-record cutover ceiling")
 		require.ErrorContains(t, err, "matching predecessor")
@@ -406,10 +403,7 @@ func TestReleaseStore_RuntimeInspectionStreamsPastOfflineAggregateLimits(t *test
 				maxRecordBytes: 1 << 20,
 				maxTotalBytes:  1,
 			})
-			_, inspectErr := inspectReleaseBucketWithObserver(
-				tx, nil, nil, nil, budget.observe, parseCurrentReleaseHistory,
-			)
-			return inspectErr
+			return inspectReleaseBucketWithObserver(tx, nil, budget.observe)
 		})
 		require.ErrorContains(t, err, "1-byte logical cutover ceiling")
 		require.ErrorContains(t, err, "matching predecessor")
@@ -1396,89 +1390,117 @@ func TestReleaseStore_DeployingAppendReservesActivationAndFailureCapacity(t *tes
 	})
 }
 
-func TestReleaseStoreInspection_ProvesLegacyBackfillCapacityBeforeMutation(t *testing.T) {
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440000"
-	manifestBytes := []byte(`{"image":"example.invalid/app:1"}`)
-	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
-	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
-	now := time.Now()
-	expected := Release{
-		Version: 2, Manifest: manifestBytes, Image: "example.invalid/app:1",
-		Status: "active", CreatedAt: now,
+// A strict history owns a deep copy of its rows: neither the caller's slice
+// nor a reader's copy can change a validated history.
+func TestStrictReleaseHistoryOwnsItsRows(t *testing.T) {
+	// The expectation is serialized before any mutation, so it shares no
+	// memory with the rows and stays independent of cloneReleaseHistory.
+	snapshot := func(releases []Release) string {
+		encoded, err := json.Marshal(releases)
+		require.NoError(t, err)
+		return string(encoded)
 	}
-	candidate := cloneRelease(expected)
-	candidate.Items = slices.Clone(items)
-	candidate.ResourceProfiles = CloneSKUResourceSnapshot(profiles)
-	candidateBytes, err := marshalReleaseHistory([]Release{candidate})
+	input := []Release{{
+		Version: 1, Manifest: []byte(`{"services":{"web":{"image":"nginx:1.27"}}}`),
+		Image: "stack", Status: "active",
+	}}
+	history, err := newStrictReleaseHistory(input)
 	require.NoError(t, err)
+	want := snapshot(history.strictReleases())
 
-	dbPath := filepath.Join(t.TempDir(), "legacy_backfill_capacity.db")
-	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	putRawReleaseHistory(t, store, leaseUUID, []Release{
-		{Version: 1, Image: "discardable", Status: "superseded", CreatedAt: now.Add(-time.Hour), Error: "historical detail"},
-		expected,
-	})
-	require.NoError(t, store.Close())
-
-	inspection, err := InspectReleaseStoreReadOnly(dbPath)
-	require.NoError(t, err)
-	require.NoError(t, inspection.checkLegacyActiveAuthorityCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		profiles,
-		len(candidateBytes),
-	))
-
-	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	require.NoError(t, store.backfillLegacyActiveAuthorityWithinLimit(
-		leaseUUID,
-		expected,
-		items,
-		profiles,
-		len(candidateBytes),
-	))
-	assert.Equal(t, candidateBytes, rawReleaseHistory(t, store, leaseUUID))
+	input[0].Status = "failed"
+	input[0].Manifest[0] = 'X'
+	read := history.strictReleases()
+	read[0].Status = "deploying"
+	read[0].Manifest[0] = 'Y'
+	assert.Equal(t, want, snapshot(history.strictReleases()))
 }
 
-func TestReleaseStoreInspection_RejectsIrreducibleProfileBackfillAtomically(t *testing.T) {
-	const leaseUUID = "550e8400-e29b-41d4-a716-446655440001"
-	items := []backend.LeaseItem{{SKU: "small", Quantity: 1, ServiceName: "app"}}
-	profiles := []SKUResourceSnapshot{{SKU: "small", CPUCores: 1, MemoryMB: 512, DiskMB: 1024}}
-	expected := Release{
-		Version:  1,
-		Manifest: []byte(`{"services":{"app":{"image":"example.invalid/app:1"}}}`),
-		Image:    "stack", Items: items, Status: "active", CreatedAt: time.Now(),
+// A corrupt stored history is reported with the lease and the release it
+// belongs to, so an operator can find the row.
+func TestReleaseInspectionIdentifiesLeaseForCorruptHistory(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	path := filepath.Join(t.TempDir(), "releases.db")
+	writeRawReleaseHistory(t, path, leaseUUID, []Release{{
+		Version: 1, Manifest: []byte(`{"services":{"web":null}}`), Image: "stack",
+		Status: "active", CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
+	}})
+	// The inspector reads the rows of an identity-bound journal only.
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		_, createErr := tx.CreateBucket(storeIdentityBucketName)
+		return createErr
+	}))
+	require.NoError(t, db.Close())
+
+	_, err = InspectReleaseStoreReadOnly(path)
+	require.ErrorContains(t, err, leaseUUID)
+	require.ErrorContains(t, err, "release 1")
+}
+
+// A bound journal can hold superseded and failed rows whose manifests predate
+// the current admission policy. The store opens it, verifies it healthy, and
+// reads the history back unchanged, with the latest active row.
+func TestReleaseStoreOpensAndReadsHistoricalPolicyRows(t *testing.T) {
+	const leaseUUID = "11111111-1111-4111-8111-111111111111"
+	path, storage := initializeBoundReleaseStore(t)
+	created := time.Unix(1_700_000_000, 0).UTC()
+	history := []Release{
+		{Version: 1, Manifest: []byte(`{"image":"nginx","labels":{"com.docker.compose.project":"legacy"}}`), Image: "nginx", Status: "superseded", CreatedAt: created},
+		// The label key holds U+212A KELVIN SIGN, not an ASCII K, as a
+		// historical row can.
+		{Version: 2, Manifest: []byte(`{"image":"nginx","labels":{"traefiK.enable":"true"}}`), Image: "nginx", Status: "failed", CreatedAt: created},
+		{Version: 3, Manifest: []byte(`{"services":{"web":{"image":"nginx","user":"1:2:3"}}}`), Image: "stack", Status: "active", CreatedAt: created},
 	}
-	dbPath := filepath.Join(t.TempDir(), "profile_backfill_capacity.db")
-	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
+	encoded, err := marshalReleaseHistory(history)
 	require.NoError(t, err)
-	wantRaw := putRawReleaseHistory(t, store, leaseUUID, []Release{expected})
-	require.NoError(t, store.Close())
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(releasesBucketName).Put([]byte(leaseUUID), encoded)
+	}))
+	require.NoError(t, db.Close())
+	store, err := OpenIdentityBoundReleaseStore(ReleaseStoreConfig{DBPath: path}, storage, newTestStorageAuthorityGate(t))
+	require.NoError(t, err)
+	defer store.Close()
+	require.NoError(t, store.Healthy())
+	rows, err := store.List(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, history, rows)
+	active, err := store.LatestActive(leaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, 3, active.Version)
+}
 
-	inspection, err := InspectReleaseStoreReadOnly(dbPath)
-	require.NoError(t, err)
-	err = inspection.checkActiveResourceProfilesCapacityWithinLimit(
-		leaseUUID,
-		expected,
-		profiles,
-		len(wantRaw),
+// The read-only inspector reports which leases hold an active release. Fresh
+// initialization counts them to refuse a backend that is not empty.
+func TestReleaseInspectionReportsLeasesWithAnActiveRelease(t *testing.T) {
+	const (
+		activeLease = "11111111-1111-4111-8111-111111111111"
+		failedLease = "22222222-2222-4222-8222-222222222222"
 	)
-	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
+	path, _ := initializeBoundReleaseStore(t)
+	created := time.Unix(1_700_000_000, 0).UTC()
+	manifestJSON := []byte(`{"services":{"web":{"image":"nginx"}}}`)
+	writeRawReleaseHistory(t, path, activeLease, []Release{
+		{Version: 1, Manifest: manifestJSON, Image: "stack", Status: "active", CreatedAt: created},
+	})
+	writeRawReleaseHistory(t, path, failedLease, []Release{
+		{Version: 1, Manifest: manifestJSON, Image: "stack", Status: "failed", CreatedAt: created},
+	})
 
-	store, err = newUnboundReleaseStoreForTest(ReleaseStoreConfig{DBPath: dbPath})
+	inspection, err := InspectReleaseStoreReadOnly(path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	err = store.backfillActiveResourceProfilesWithinLimit(
-		leaseUUID,
-		expected.Version,
-		expected.Items,
-		profiles,
-		len(wantRaw),
-	)
-	require.ErrorIs(t, err, ErrReleaseHistoryCapacity)
-	assert.Equal(t, wantRaw, rawReleaseHistory(t, store, leaseUUID))
+	require.True(t, inspection.IdentityBound)
+	require.Contains(t, inspection.ActiveLeaseUUIDs, activeLease)
+	require.NotContains(t, inspection.ActiveLeaseUUIDs, failedLease)
+}
+
+// A journal file that is not there is reported as missing, not opened empty.
+func TestOpenExistingBoltDBReportsAMissingFile(t *testing.T) {
+	db, info, err := openExistingBoltDB(filepath.Join(t.TempDir(), "missing.db"), true, false)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Nil(t, db)
+	require.Nil(t, info)
 }

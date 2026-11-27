@@ -35,50 +35,6 @@ func DecodeObject(value []byte, maxBytes int, destination any) error {
 	return requireEOF(decoder)
 }
 
-// DecodeArray is DecodeObject's top-level-array counterpart. It exists for
-// narrowly gated legacy formats whose historical root was an array.
-func DecodeArray(value []byte, maxBytes int, destination any) error {
-	if err := ValidateUniqueArray(value, maxBytes); err != nil {
-		return err
-	}
-	if err := validateExactShape(value, destination); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	return requireEOF(decoder)
-}
-
-// DecodeRawObject returns an exact object whose keys are constrained by
-// allowed. Values remain raw but are still recursively checked for duplicate
-// object fields and the document must contain exactly one value.
-func DecodeRawObject(
-	value []byte,
-	maxBytes int,
-	allowed map[string]struct{},
-) (map[string]json.RawMessage, error) {
-	if err := ValidateUniqueObject(value, maxBytes); err != nil {
-		return nil, err
-	}
-	var object map[string]json.RawMessage
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	if err := decoder.Decode(&object); err != nil {
-		return nil, err
-	}
-	if err := requireEOF(decoder); err != nil {
-		return nil, err
-	}
-	for name := range object {
-		if _, ok := allowed[name]; !ok {
-			return nil, fmt.Errorf("unknown field %q", name)
-		}
-	}
-	return object, nil
-}
-
 func validateExactShape(value []byte, destination any) error {
 	var decoded any
 	decoder := json.NewDecoder(bytes.NewReader(value))
@@ -200,16 +156,6 @@ func exactStructFields(typ reflect.Type) map[string]reflect.Type {
 // ValidateUniqueObject verifies one bounded object and rejects duplicate keys
 // recursively, including objects nested inside arrays.
 func ValidateUniqueObject(value []byte, maxBytes int) error {
-	return validateUniqueComposite(value, maxBytes, '{')
-}
-
-// ValidateUniqueArray verifies one bounded array and rejects duplicate object
-// keys recursively.
-func ValidateUniqueArray(value []byte, maxBytes int) error {
-	return validateUniqueComposite(value, maxBytes, '[')
-}
-
-func validateUniqueComposite(value []byte, maxBytes int, want json.Delim) error {
 	if len(value) > maxBytes {
 		return fmt.Errorf("JSON entry exceeds %d bytes", maxBytes)
 	}
@@ -222,33 +168,13 @@ func validateUniqueComposite(value []byte, maxBytes int, want json.Delim) error 
 	if err != nil {
 		return err
 	}
-	delimiter, ok := opening.(json.Delim)
-	if !ok || delimiter != want {
-		if want == '{' {
-			return errors.New("expected JSON object")
-		}
-		return errors.New("expected JSON array")
+	if delimiter, ok := opening.(json.Delim); !ok || delimiter != '{' {
+		return errors.New("expected JSON object")
 	}
-	if want == '{' {
-		err = validateUniqueObjectBody(decoder)
-	} else {
-		for index := 0; decoder.More(); index++ {
-			if err = validateUniqueValue(decoder); err != nil {
-				err = fmt.Errorf("decode array element %d: %w", index, err)
-				break
-			}
-		}
-		if err == nil {
-			err = consumeClosing(decoder, ']')
-		}
-	}
-	if err != nil {
+	if err := validateUniqueObjectBody(decoder); err != nil {
 		return err
 	}
-	if err := requireTokenEOF(decoder); err != nil {
-		return err
-	}
-	return nil
+	return requireTokenEOF(decoder)
 }
 
 func validateUniqueObjectBody(decoder *json.Decoder) error {

@@ -14,38 +14,22 @@ import (
 )
 
 // Go cannot stop a package's own code from building a struct literal or writing
-// an unexported field, so this guard enforces what the release-history parse
-// types document. Only the v0.13 array decoder mints a v013ReleaseHistory, and
-// only newStrictReleaseHistory and adoptV013ReleaseHistory mint a populated
-// strictReleaseHistory. A row field may appear only in its accessor method, as
-// the direct argument of cloneReleaseHistory, so no code can write, index into,
-// alias, or copy a history's rows except through that accessor. Only the
-// parsers and recognizers call the raw v0.13 accessor, so no writer can bind
-// v0.13 rows without passing strict validation.
+// an unexported field, so this guard enforces what strictReleaseHistory
+// documents. Only newStrictReleaseHistory mints a populated one, so every
+// history has passed validation. Its row field may appear only in its accessor
+// method, as the direct argument of cloneReleaseHistory, so no code can write,
+// index into, alias, or copy a history's rows except through that accessor.
 var releaseHistoryMinters = map[string]map[string]struct{}{
-	"v013ReleaseHistory": {"decodeLegacyReleaseHistory": {}},
-	"strictReleaseHistory": {
-		"newStrictReleaseHistory": {},
-		"adoptV013ReleaseHistory": {},
-	},
+	"strictReleaseHistory": {"newStrictReleaseHistory": {}},
 }
 
-// releaseHistoryRowFields maps each row field to the one accessor that may
-// read it. Cloning alone is not enough: a clone of raw v0.13 rows elsewhere
-// would bypass the rawV013RowReaders allowlist on the accessor.
+// releaseHistoryRowFields maps the row field to the one accessor that may read
+// it.
 var releaseHistoryRowFields = map[string]string{
-	"v013Rows":   "v013ReleaseHistory.v013Releases",
 	"strictRows": "strictReleaseHistory.strictReleases",
 }
 
-var rawV013RowReaders = map[string]struct{}{
-	"adoptV013ReleaseHistory":            {},
-	"parseStrictStoredReleaseHistory":    {},
-	"validateV013StoppedDeployingTails":  {},
-	"validateV013DuplicateActiveHistory": {},
-}
-
-func TestStoppedReleaseHistoryTypesStayAtTheirChokePoints(t *testing.T) {
+func TestStrictReleaseHistoryStaysAtItsChokePoints(t *testing.T) {
 	t.Parallel()
 
 	fset := token.NewFileSet()
@@ -73,22 +57,20 @@ func TestReleaseHistoryChokePointGuardFires(t *testing.T) {
 	t.Parallel()
 
 	const source = `package shared
-func bypass(history v013ReleaseHistory, strict strictReleaseHistory) strictReleaseHistory {
-	_ = v013ReleaseHistory{v013Rows: nil}
-	_ = []strictReleaseHistory{{strictRows: history.v013Releases()}}
+func bypass(strict strictReleaseHistory, rows []Release) strictReleaseHistory {
+	_ = strictReleaseHistory{strictRows: rows}
+	_ = []strictReleaseHistory{{strictRows: rows}}
 	result := strictReleaseHistory{}
-	result.normalizedFromV013 = true
 	strict.strictRows[0].Status = "active"
-	rows := history.v013Rows
-	rows[0] = Release{}
-	_ = cloneReleaseHistory(history.v013Rows)
+	alias := strict.strictRows
+	alias[0] = Release{}
+	_ = cloneReleaseHistory(strict.strictRows)
 	for range strict.strictRows {
 	}
 	return result
 }
-func (h v013ReleaseHistory) v013Releases() []Release { return cloneReleaseHistory(h.v013Rows) }
 func (h strictReleaseHistory) strictReleases() []Release { return cloneReleaseHistory(h.strictRows) }
-func (h strictReleaseHistory) v013Releases() []Release { return cloneReleaseHistory(h.strictRows) }`
+func (h strictReleaseHistory) otherReleases() []Release { return cloneReleaseHistory(h.strictRows) }`
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "bypass.go", source, 0)
 	require.NoError(t, err)
@@ -101,26 +83,24 @@ func (h strictReleaseHistory) v013Releases() []Release { return cloneReleaseHist
 		byLine[line] = append(byLine[line], violation)
 	}
 	for line, want := range map[int][]string{
-		3: {"v013ReleaseHistory literal outside"},
-		4: {"strictReleaseHistory literal outside", "reads raw v0.13 rows"},
-		6: {"assigns normalizedFromV013"},
+		3: {"strictReleaseHistory literal outside"},
+		4: {"strictReleaseHistory literal outside"},
+		6: {"strictRows read other than by strictReleaseHistory.strictReleases"},
 		7: {"strictRows read other than by strictReleaseHistory.strictReleases"},
-		8: {"v013Rows read other than by v013ReleaseHistory.v013Releases"},
-		// A deep copy outside the accessor still bypasses the reader allowlist.
-		10: {"v013Rows read other than by v013ReleaseHistory.v013Releases"},
-		11: {"strictRows read other than by strictReleaseHistory.strictReleases"},
-		// A same-named method on the wrong receiver gets no allowance.
-		17: {"strictRows read other than by strictReleaseHistory.strictReleases"},
+		// A deep copy outside the accessor is still a read outside it.
+		9:  {"strictRows read other than by strictReleaseHistory.strictReleases"},
+		10: {"strictRows read other than by strictReleaseHistory.strictReleases"},
+		// A different method on the same receiver gets no allowance.
+		15: {"strictRows read other than by strictReleaseHistory.strictReleases"},
 	} {
 		joined := strings.Join(byLine[line], "\n")
 		for _, fragment := range want {
 			assert.Contains(t, joined, fragment, "line %d", line)
 		}
 	}
-	// Line 5 is the zero value, and lines 15 and 16 are the two accessors. Line 9
-	// writes through an alias the guard already refused where it was taken
-	// (line 8).
-	for _, line := range []int{5, 9, 15, 16} {
+	// Line 5 is the zero value and line 14 is the accessor. Line 8 writes
+	// through an alias the guard already refused where it was taken (line 7).
+	for _, line := range []int{5, 8, 14} {
 		assert.Empty(t, byLine[line], "line %d", line)
 	}
 }
@@ -188,23 +168,11 @@ func releaseHistoryChokePointViolations(
 						}
 					}
 				}
-			case *ast.AssignStmt:
-				for _, target := range node.Lhs {
-					if selector, ok := target.(*ast.SelectorExpr); ok &&
-						selector.Sel.Name == "normalizedFromV013" {
-						report(selector, "assigns normalizedFromV013 after construction")
-					}
-				}
 			case *ast.SelectorExpr:
 				if accessor, guarded := releaseHistoryRowFields[node.Sel.Name]; guarded &&
 					(enclosing != accessor || !cloned[node]) {
 					report(node, "%s read other than by %s cloning it, in %q",
 						node.Sel.Name, accessor, enclosing)
-				}
-				if node.Sel.Name == "v013Releases" {
-					if _, ok := rawV013RowReaders[enclosing]; !ok {
-						report(node, "reads raw v0.13 rows outside the parsers in %q", enclosing)
-					}
 				}
 			}
 			return true

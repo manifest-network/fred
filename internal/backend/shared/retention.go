@@ -62,6 +62,11 @@ func inspectRetentionStoreReadOnlyFile(
 	inspection := RetentionStoreInspection{Exists: true}
 	err = db.View(func(tx *bolt.Tx) error {
 		inspection.IdentityBound = tx.Bucket(storeIdentityBucketName) != nil
+		if !inspection.IdentityBound {
+			// A journal without a storage identity was not written by this
+			// release line. Its existence is reported; its rows are not read.
+			return nil
+		}
 		return inspectRetentionBucket(tx, func(entry RetentionEntry) {
 			inspection.Entries = append(inspection.Entries, entry)
 		})
@@ -105,11 +110,6 @@ var (
 	ErrNoRetention = errors.New("no retained data for lease")
 	// ErrNotRestorable is returned when a retained lease is not in a restorable state.
 	ErrNotRestorable = errors.New("retained lease not in a restorable state")
-	// ErrLegacyRestoringRetention means an unbound v0.13 retention journal still
-	// contains a restore whose outcome was not resolved by the v0.13 reconciler.
-	// Current destination authority cannot be reconstructed from that wire shape,
-	// so storage-lineage adoption must stop before publishing a binding.
-	ErrLegacyRestoringRetention = errors.New("v0.13 retention journal contains an unresolved restoring record")
 )
 
 // RetentionEntry is a detached read DTO for one durable retention row. Its
@@ -171,27 +171,6 @@ type retentionEntryEnvelope struct {
 	Entry         RetentionEntry `json:"entry"`
 }
 
-// legacyRetentionEntryJSON is exactly the durable v0.13 record shape. It is
-// decoded only while the daemon is stopped and before storage identity is
-// bound; newer versionless fields cannot be smuggled through that adoption
-// boundary.
-type legacyRetentionEntryJSON struct {
-	OriginalLeaseUUID   string                  `json:"original_lease_uuid"`
-	Tenant              string                  `json:"tenant"`
-	Partition           string                  `json:"partition,omitempty"`
-	ProviderUUID        string                  `json:"provider_uuid"`
-	Items               []backend.LeaseItem     `json:"items"`
-	StackManifest       *manifest.StackManifest `json:"stack_manifest"`
-	CallbackURL         string                  `json:"callback_url"`
-	RetainedVolumeNames []string                `json:"retained_volume_names"`
-	Status              string                  `json:"status"`
-	NewLeaseUUID        string                  `json:"new_lease_uuid,omitempty"`
-	Generation          int                     `json:"generation"`
-	CreatedAt           time.Time               `json:"created_at"`
-	RestoringSince      time.Time               `json:"restoring_since,omitempty"`
-	ReapingSince        time.Time               `json:"reaping_since,omitempty"`
-}
-
 func marshalRetentionEntry(entry RetentionEntry) ([]byte, error) {
 	return json.Marshal(retentionEntryEnvelope{
 		SchemaVersion: authoritativeRowSchemaVersion,
@@ -225,62 +204,6 @@ func unmarshalRetentionEntry(value []byte, destination *RetentionEntry) error {
 	}
 	*destination = entry
 	return nil
-}
-
-func decodeLegacyRetentionEntry(value []byte) (RetentionEntry, error) {
-	var old legacyRetentionEntryJSON
-	if err := decodeStrictAuthoritativeObject(
-		value, maxAuthoritativeRecordBytes, &old,
-	); err != nil {
-		return RetentionEntry{}, err
-	}
-	return RetentionEntry{
-		OriginalLeaseUUID:   old.OriginalLeaseUUID,
-		Tenant:              old.Tenant,
-		Partition:           old.Partition,
-		ProviderUUID:        old.ProviderUUID,
-		Items:               old.Items,
-		StackManifest:       old.StackManifest,
-		CallbackURL:         old.CallbackURL,
-		RetainedVolumeNames: old.RetainedVolumeNames,
-		Status:              old.Status,
-		NewLeaseUUID:        old.NewLeaseUUID,
-		Generation:          old.Generation,
-		CreatedAt:           old.CreatedAt,
-		RestoringSince:      old.RestoringSince,
-		ReapingSince:        old.ReapingSince,
-	}, nil
-}
-
-var versionlessCurrentRetentionFields = map[string]struct{}{
-	"original_lease_uuid": {}, "tenant": {}, "partition": {},
-	"provider_uuid": {}, "items": {}, "resource_profiles": {},
-	"destination_items": {}, "destination_resource_profiles": {},
-	"destination_operation_id": {}, "destination_callback_url": {},
-	"destination_lifecycle_callback_url": {}, "stack_manifest": {},
-	"callback_url": {}, "retained_volume_names": {}, "status": {},
-	"new_lease_uuid": {}, "generation": {}, "created_at": {},
-	"restoring_since": {}, "reaping_since": {},
-}
-
-func upgradeVersionlessCurrentRetentionEntry(value []byte) (RetentionEntry, error) {
-	object, err := decodeExactRawJSONObject(
-		value, versionlessCurrentRetentionFields,
-	)
-	if err != nil {
-		return RetentionEntry{}, err
-	}
-	envelope, err := json.Marshal(struct {
-		SchemaVersion uint8                      `json:"schema_version"`
-		Entry         map[string]json.RawMessage `json:"entry"`
-	}{
-		SchemaVersion: authoritativeRowSchemaVersion,
-		Entry:         object,
-	})
-	if err != nil {
-		return RetentionEntry{}, err
-	}
-	return decodeRetentionEntry(envelope)
 }
 
 func validateRetentionEntryResourceProfiles(entry *RetentionEntry) error {
@@ -571,7 +494,6 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 	if bucket == nil {
 		return errors.New("retention bucket is missing")
 	}
-	identityBound := tx.Bucket(storeIdentityBucketName) != nil
 	budget := newStoppedAuthoritativeInspectionBudget()
 	return bucket.ForEach(func(key, value []byte) error {
 		if err := budget.observe(key, value); err != nil {
@@ -580,16 +502,7 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 		if value == nil {
 			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
 		}
-		var entry RetentionEntry
-		var err error
-		if identityBound {
-			// Binding commits the current wire schema. Its strict decoder already
-			// checks framing, size, recursive uniqueness and exact field names;
-			// probing for the legacy shape would repeat validation of every row.
-			entry, err = decodeRetentionEntry(value)
-		} else {
-			entry, err = decodeUnboundRetentionEntry(value)
-		}
+		entry, err := decodeRetentionEntry(value)
 		if err != nil {
 			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
 		}
@@ -600,22 +513,6 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 			return fmt.Errorf("validate retention record source with key length %d: %w", len(key), err)
 		}
 		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
-			// v0.13 could durably leave a restoring row after a failed teardown,
-			// re-quarantine, or finalization. That schema has no destination items,
-			// resource snapshot, typed operation ID, or operation/lifecycle callback
-			// pair. Inventing those facts would let the upgraded binary finalize or
-			// roll back a different operation. Recognize only the unbound, exact
-			// pre-authority shape and fail with an operator-actionable classification;
-			// identity-bound runtime stores retain the strict current-schema error.
-			if !identityBound && isLegacyRestoringRetentionEntry(&entry) {
-				return fmt.Errorf(
-					"%w: source %s destination %s generation %d; restart the complete matching v0.13 lineage in isolation and let its retention reconciler commit or roll back the restore, then drain callbacks, stop it, take a new backup, and retry adoption; do not edit this row or synthesize destination authority",
-					ErrLegacyRestoringRetention,
-					entry.OriginalLeaseUUID,
-					entry.NewLeaseUUID,
-					entry.Generation,
-				)
-			}
 			return fmt.Errorf("validate retention record with key length %d: %w", len(key), err)
 		}
 		if collect != nil {
@@ -623,42 +520,6 @@ func inspectRetentionBucket(tx *bolt.Tx, collect func(RetentionEntry)) error {
 		}
 		return nil
 	})
-}
-
-// decodeUnboundRetentionEntry is the stopped-journal compatibility boundary.
-// Runtime identity-bound reads never infer a schema from row contents.
-func decodeUnboundRetentionEntry(value []byte) (RetentionEntry, error) {
-	if err := validateUniqueJSONObject(value, maxAuthoritativeRecordBytes); err != nil {
-		return RetentionEntry{}, err
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(value, &fields); err != nil {
-		return RetentionEntry{}, err
-	}
-	if _, versioned := fields["schema_version"]; versioned {
-		return decodeRetentionEntry(value)
-	}
-	return decodeLegacyRetentionEntry(value)
-}
-
-// isLegacyRestoringRetentionEntry recognizes only fields that v0.13's
-// ClaimForRestore could persist. It is a diagnostic predicate, never migration
-// authority: callers always reject this shape and leave the journal untouched.
-func isLegacyRestoringRetentionEntry(entry *RetentionEntry) bool {
-	return entry != nil &&
-		entry.Status == RetentionStatusRestoring &&
-		entry.NewLeaseUUID != "" &&
-		entry.NewLeaseUUID != entry.OriginalLeaseUUID &&
-		entry.Generation > 0 &&
-		!entry.CreatedAt.IsZero() &&
-		!entry.RestoringSince.IsZero() &&
-		entry.ReapingSince.IsZero() &&
-		len(entry.ResourceProfiles) == 0 &&
-		len(entry.DestinationItems) == 0 &&
-		len(entry.DestinationResourceProfiles) == 0 &&
-		entry.DestinationOperationID.IsZero() &&
-		entry.DestinationCallbackURL == "" &&
-		entry.DestinationLifecycleCallbackURL == ""
 }
 
 func validateAuthoritativeRetentionIdentity(key []byte, entry *RetentionEntry) error {
@@ -682,173 +543,21 @@ func validateAuthoritativeRetentionIdentity(key []byte, entry *RetentionEntry) e
 	}
 }
 
-func normalizeLegacyRetentionBucketForAdoption(tx *bolt.Tx) error {
-	bucket := tx.Bucket(retentionBucketName)
-	if bucket == nil {
-		return errors.New("retention bucket is missing")
-	}
-	type rewrite struct {
-		key   []byte
-		value []byte
-	}
-	var rewrites []rewrite
-	budget := newStoppedAuthoritativeInspectionBudget()
-	if err := bucket.ForEach(func(key, value []byte) error {
-		if err := budget.observe(key, value); err != nil {
-			return err
-		}
-		if value == nil {
-			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
-		}
-		entry, err := decodeLegacyRetentionEntry(value)
-		if err != nil {
-			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
-		}
-		if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
-			return fmt.Errorf("validate retention record identity with key length %d: %w", len(key), err)
-		}
-		if err := validateRetentionSourceAuthorityForBinding(&entry); err != nil {
-			return fmt.Errorf("validate retention record source with key length %d: %w", len(key), err)
-		}
-		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
-			if isLegacyRestoringRetentionEntry(&entry) {
-				return fmt.Errorf(
-					"%w: source %s destination %s generation %d; restart the complete matching v0.13 lineage in isolation and let its retention reconciler commit or roll back the restore, then drain callbacks, stop it, take a new backup, and retry adoption; do not edit this row or synthesize destination authority",
-					ErrLegacyRestoringRetention,
-					entry.OriginalLeaseUUID,
-					entry.NewLeaseUUID,
-					entry.Generation,
-				)
-			}
-			return fmt.Errorf("validate retention record with key length %d: %w", len(key), err)
-		}
-		encoded, err := marshalRetentionEntry(entry)
-		if err != nil {
-			return fmt.Errorf("encode adopted retention record with key length %d: %w", len(key), err)
-		}
-		if len(encoded) > maxAuthoritativeRecordBytes {
-			return fmt.Errorf(
-				"adopted retention record with key length %d exceeds %d bytes",
-				len(key), maxAuthoritativeRecordBytes,
-			)
-		}
-		rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, rewrite := range rewrites {
-		if err := bucket.Put(rewrite.key, rewrite.value); err != nil {
-			return fmt.Errorf("rewrite v0.13 retention record: %w", err)
-		}
-	}
-	return nil
-}
-
-func upgradeVersionlessCurrentRetentionBucket(tx *bolt.Tx) error {
-	bucket := tx.Bucket(retentionBucketName)
-	if bucket == nil {
-		return errors.New("retention bucket is missing")
-	}
-	type rewrite struct {
-		key   []byte
-		value []byte
-	}
-	var rewrites []rewrite
-	var sawCurrent, sawVersionless bool
-	if err := bucket.ForEach(func(key, value []byte) error {
-		if value == nil {
-			return fmt.Errorf("retention record with key length %d is a nested bucket", len(key))
-		}
-		object, err := decodeExactRawJSONObject(
-			value,
-			map[string]struct{}{
-				"schema_version": {},
-				"entry":          {},
-			},
-		)
-		var entry RetentionEntry
-		if err == nil {
-			if _, versioned := object["schema_version"]; versioned {
-				sawCurrent = true
-				entry, err = decodeRetentionEntry(value)
-			} else {
-				err = errors.New("versioned retention envelope omits schema_version")
-			}
-		} else {
-			// A current-branch compatibility row is the entry object itself,
-			// and therefore cannot satisfy the two-field envelope allow-list.
-			sawVersionless = true
-			entry, err = upgradeVersionlessCurrentRetentionEntry(value)
-		}
-		if err != nil {
-			return fmt.Errorf("decode retention record with key length %d: %w", len(key), err)
-		}
-		if sawCurrent && sawVersionless {
-			return errors.New("retention journal mixes versioned and versionless records")
-		}
-		if err := validateAuthoritativeRetentionIdentity(key, &entry); err != nil {
-			return fmt.Errorf("validate retention identity with key length %d: %w", len(key), err)
-		}
-		if err := validateRetentionSourceAuthorityForBinding(&entry); err != nil {
-			return fmt.Errorf("validate retention source with key length %d: %w", len(key), err)
-		}
-		if err := validateRetentionEntryResourceProfiles(&entry); err != nil {
-			return fmt.Errorf("validate retention record with key length %d: %w", len(key), err)
-		}
-		if sawVersionless {
-			encoded, err := marshalRetentionEntry(entry)
-			if err != nil {
-				return fmt.Errorf("encode upgraded retention record with key length %d: %w", len(key), err)
-			}
-			rewrites = append(rewrites, rewrite{key: slices.Clone(key), value: encoded})
-		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	for _, rewrite := range rewrites {
-		if err := bucket.Put(rewrite.key, rewrite.value); err != nil {
-			return fmt.Errorf("upgrade versionless retention record: %w", err)
-		}
-	}
-	return nil
-}
-
 func PrepareBoundRetentionStoreStorage(
 	path *BoundAuthoritativeStorePath,
 	storage backendidentity.PendingStorage,
-	profile backendidentity.InitializationProfile,
 ) error {
 	if !storage.Valid() {
 		return errors.New("pending backend storage authority is required")
 	}
-	allowCreate, err := allowAuthoritativeStoreCreation(profile)
-	if err != nil {
-		return err
-	}
-	validate := func(tx *bolt.Tx) error {
-		if err := validateRetentionRootBuckets(tx); err != nil {
-			return err
-		}
-		if profile == backendidentity.InitializationProfileExisting {
-			if tx.Bucket(storeIdentityBucketName) == nil {
-				return normalizeLegacyRetentionBucketForAdoption(tx)
-			}
-			if err := verifyStoreIdentityBinding(
-				tx,
-				authoritativeStoreRetention,
-				storage.ID(),
-			); err != nil {
+	return initializeIdentityBoundBoltStoreBound(
+		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(),
+		func(tx *bolt.Tx) error {
+			if err := validateRetentionRootBuckets(tx); err != nil {
 				return err
 			}
-			return upgradeVersionlessCurrentRetentionBucket(tx)
-		}
-		return inspectRetentionBucket(tx, nil)
-	}
-	return initializeIdentityBoundBoltStoreBound(
-		path, retentionBucketName, "retention", authoritativeStoreRetention, storage.ID(), allowCreate,
-		validate,
+			return inspectRetentionBucket(tx, nil)
+		},
 	)
 }
 

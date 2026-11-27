@@ -318,8 +318,8 @@ their first normal start. For a genuinely new empty Docker backend, run
 `docker-backend -config docker-backend.yaml -initialize-storage-identity new`.
 Normal startup is
 verification-only and will not create or repair markers or authoritative
-journals. Existing v0.13 Docker storage instead uses the stopped-and-drained
-`adopt` cutover in [Deployment](DEPLOYMENT.md#upgrading-from-v013x).
+journals. Existing v0.13 Docker storage is adopted by the final 0.14 release,
+not by this one; see [Deployment](DEPLOYMENT.md#upgrading-from-v013x).
 
 The bundled Docker backend requires a positive `callback_max_age` (default
 `24h`). The age applies to typed lifecycle observations;
@@ -1390,18 +1390,12 @@ timeout, or lost response is not delivery success. When the shared budget
 expires, bundled backends defer to their 30-second durable replay loop instead
 of holding that lease's FIFO lock for consecutive application budgets.
 
-The v0.13.0 upgrade is a stopped cutover, not a rolling upgrade. Drain every old
-callback outbox, stop providerd and all backends, install the upgraded binaries
-without starting them, rotate to unique per-backend keys, and run each Docker
-backend's mandatory read-only `-preflight-storage-identity-adoption` proof
-before taking the cutover backup or sealing storage identity. Then restart
-every upgraded backend before the new providerd. Stack-form v0.13 Docker
-workloads stay in place; service-name-less pre-stack cohorts are unsupported and
-must be resolved before sealing. New backends recover the old operationless callback shape already
-embedded in migrated workloads, preserve its tokenless lifecycle route, and
-report a non-secret `legacy` generation in internal inventory. Mandatory offline
-preparation migrates the corresponding owner as legacy before the new provider
-opens it. A pre-identity callback row prevents current callback-store startup;
+A v0.13 provider is upgraded by the final 0.14 release, as a stopped cutover;
+this release line has neither half of that procedure. Stack-form v0.13 Docker
+workloads stayed in place through it. Backends recover the old operationless
+callback shape already embedded in those workloads, preserve its tokenless
+lifecycle route, and report a non-secret `legacy` generation in internal
+inventory. The 0.14 preparation migrated the corresponding owner as legacy. A pre-identity callback row prevents current callback-store startup;
 it is not carried across the cutover. An absent or rebuilt placement database is
 never a recovery path for those workloads. The reverse binary order is not
 lifecycle-compatible:
@@ -1418,9 +1412,10 @@ Every authoritative database must be an unsymlinked, single-link regular file
 with exact mode `0600`; initialization and normal startup reject an insecure
 restore, and runtime re-attestation withdraws the whole backend lineage on
 path/inode, link-count, or permission drift.
-Initialization accepts only an all-absent fresh set or a complete, valid,
-stopped and drained v0.13 set, records that choice in a crash-resumable pending
-anchor, and never completes a mixed set. Before evidence inspection it binds the
+Initialization seals only an empty backend: no authoritative journal, managed
+container or managed volume. It records the new identity in a crash-resumable
+pending anchor and refuses a journal that exists without a storage identity; a
+v0.13 lineage is adopted by the final 0.14 release. Before evidence inspection it binds the
 physical parent of both markers and every authoritative journal; subsequent I/O
 is descriptor-relative, so a parent rename, unmount, or same-path recreation
 cannot redirect initialization. Normal startup is verification-only: it will
@@ -1434,15 +1429,9 @@ other than exact `0600`, but it is not storage-UUID-bound or continuously
 re-attested. Back up and restore the marker pair, complete authoritative-store
 set, and substrate together; a
 matching complete snapshot retains the same lineage, so fence the original
-before starting its restored copy. The preflight's only successful stdout is
-`ready_for_v0_13_storage_identity_adoption`; it fails closed on unresolved
-v0.13 restore/deprovision crash windows instead of inventing missing authority.
-Only complete stack-form v0.13 cohorts are supported. A service-name-less
-pre-stack container, `-prev` remnant, authorityless migration generation, or
-partial topology is rejected before mutation; the upgraded backend has no
-in-place converter for those shapes.
-See [Deployment](DEPLOYMENT.md#upgrading-from-v013x) for the complete cutover,
-repair, and rollback procedure.
+before starting its restored copy.
+See [Deployment](DEPLOYMENT.md#upgrading-from-v013x) for what a v0.13 cutover
+left behind and how adopted leases behave.
 
 **Idempotency:**
 If a callback is received for a lease that has already been processed (no longer in-flight),

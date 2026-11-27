@@ -200,10 +200,11 @@ lease-local and retryable; other leases remain available.
 When recovery records maintenance Success followed by runtime Failed, both
 rows are maintenance-derived exact deliveries; removing only the Success head
 does not release the fence.
-The legacy v0.13 lease-keyed queue must be empty before upgrade: current startup
+The legacy v0.13 lease-keyed queue must be empty: current startup
 and health refuse a nonempty old bucket, and the current sender never invents a
-storage identity for an old row. See `DEPLOYMENT.md` for the stopped cutover;
-rolling either direction across this callback-store boundary is unsupported.
+storage identity for an old row. The final 0.14 release performs that stopped
+cutover; rolling either direction across this callback-store boundary is
+unsupported.
 
 Provision/restore admission also commits an immutable per-lease Pending operation row,
 including the exact resolved CPU/memory/durable-disk/scratch profiles, before its first
@@ -394,40 +395,21 @@ protected authority alone exceeds the cap, admission fails before mutation.
 Before the first normal start of a genuinely new empty backend, run
 `docker-backend -config docker-backend.yaml -initialize-storage-identity new`
 once. Normal startup is verification-only and never creates, repairs, or binds a
-missing marker or authoritative journal. Existing v0.13 state must use the
-stopped-and-drained `adopt` workflow in `DEPLOYMENT.md`.
+missing marker or authoritative journal. Existing v0.13 state is adopted by the
+final 0.14 release: this one seals only an empty backend and refuses journals
+that exist without a storage identity.
 
-Before the cutover backup or `adopt`, run the upgraded binary without starting
-the service:
-
-```bash
-docker-backend -config docker-backend.yaml \
-  -preflight-storage-identity-adoption
-```
-
-Require exit status zero and the sole stdout line
-`ready_for_v0_13_storage_identity_adoption`. This proof is read-only and leaves
-both markers absent. It reports unresolved v0.13 restoring records and exact
-interrupted deprovision shapes rather than synthesizing the operation authority
-those records lack; follow the isolated-v0.13 repair procedure in
-`DEPLOYMENT.md`, then stop, preflight, and back up again.
-Both this preflight and `-initialize-storage-identity {new|adopt}` accept
+`-initialize-storage-identity new` accepts
 `-storage-identity-operation-timeout` (default `10m`). The deadline is shared
 across context-aware Docker and filesystem-control-plane probes but is
 cooperative: a blocking local open, bbolt operation, or fsync cannot be
 interrupted mid-syscall. A timeout is failure, not proof of rollback; keep the
-lineage stopped and rerun the same mode against unchanged input.
-An active legacy release with neither containers nor a retention finalizer is a
-different unresolved-close refusal: never replay deprovision against it, because
-that can purge the release while stranding remaining tenant volumes. Restore a
-complete pre-close snapshot or follow Deployment's chain-proven manual data
-decision procedure.
+backend stopped and rerun the same command against unchanged input.
 
-The supported v0.13 upgrade shape is an ordinary stack-form cohort with a
-complete service label and coherent tokenless callback identity. Any pre-stack
+A lease adopted from v0.13 is an ordinary stack-form cohort with a complete
+service label and coherent tokenless callback identity. Any pre-stack
 container, `-prev` rollback remnant, authorityless migration generation, or
-other partial topology fails the read-only preflight and normal startup before
-mutation. This release intentionally has no in-place converter or inference
+other partial topology fails normal startup before mutation. This release intentionally has no in-place converter or inference
 path for those shapes; restore a known-good supported snapshot or use a separate
 proof-bearing repair procedure.
 
@@ -472,7 +454,7 @@ keep the previous active route. Either committed authority class can rebuild a
 conservative Failed projection and full allocation with zero survivors, without
 minting a replacement Release or guessing from mutable configuration.
 An active callbackless pre-label cohort cannot be assigned provider callback
-authority safely and is rejected by the mandatory stopped adoption preflight.
+authority safely and was rejected by the 0.14 line's stopped adoption.
 Callbackless historical cleanup/close evidence remains readable, but never
 authorizes zero-survivor recovery or maintenance.
 
@@ -1399,7 +1381,7 @@ select these production defaults.
 2. **Classify maintenance WALs lease by lease** -- decode the complete maintenance-intent journal, then re-read and classify each exact row under that lease's command fence. A live actor that owns the same `maintenance_id` remains the serial owner: recovery takes a lease only while its actor is idle. Recovery then joins the exact source/target Release with a fresh bounded strict Docker inventory; it never relies on one fleet-wide point-in-time snapshot and never reruns Compose. It retires the idle actor first and writes the converged projection directly (`applyMaintenanceProjectionWithoutActor`), so the next live command builds a fresh actor from it. Expected readiness waits and known lease-local observation conflicts retain the exact WAL and transitional projection while sibling recovery proceeds. Global or unclassified failures abort the pass before ordinary projection can reinterpret a mixed source/target cohort. Partial-target cleanup revalidates and removes immutable Docker IDs individually, so an error on a later sibling may leave safe idempotent progress while the WAL remains for the next pass; reusable names are never cleanup authority.
 3. **List managed containers** -- filters by `fred.managed=true` label for the ordinary projection.
 4. **Stabilize lifecycle authority** -- recovery holds the exclusive side of a backend-local snapshot guard from ordinary managed-container inventory through close/restore durable-authority reads and matching provision/pool publication. Live Deprovision and Restore paths hold the shared side only for authority capture and durable handoffs, not destructive substrate work. Load every close intent before ordinary callback-label or release-cohort validation. Containers owned by a close are deliberately excluded from those exact-cohort checks because teardown may already have removed some or all siblings. Provision validation remains available, but its short accepted-intent-to-projection handoff can wait for the current snapshot publication; Restore admission or final rollback may wait at its corresponding handoff.
-5. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing stack-form v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; a pre-stack cohort is rejected. A callbackless cohort gets no callback authority, because none can be minted safely; it stays on the older conservative path (the stopped adoption audit already refuses an active one). Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and runtime-authority backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays tokenless; its independent UUIDv4 `maintenance_id` is exact replacement journal/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
+5. **Validate ordinary callback and release cohorts** -- every sibling must carry one coherent callback pair. Current releases must carry complete matching typed runtime authority. A complete callback-bearing stack-form v0.13 cohort is CAS-fenced with a distinct `LegacyRuntimeAuthority` that freezes its canonical principal and tokenless pair without manufacturing an operation ID; a pre-stack cohort is rejected. A callbackless cohort gets no callback authority, because none can be minted safely; it stays on the older conservative path (the 0.14 line's stopped adoption already refused an active one). Either authority's exact `Items` and resource profiles must match the observed service/SKU/index/domain/image set; a mismatch fails the lease closed. With no survivors, it reconstructs the exact identity, callback route, topology, and conservative allocation as Failed. A still-unbackfilled v0.13 stack row is derived only from a complete, identity-consistent, dense cohort and exact active manifest, then receives the whole-release and runtime-authority backfills before any operation may erase its last container. The first and every subsequent restart, update, or custom-domain replacement stays tokenless; its independent UUIDv4 `maintenance_id` is exact replacement journal/cohort identity, not provider callback authority. Only a later genuine provision or restore rotates callback authority to typed. A pending operation intent owns its own generation transition and resource snapshot and is classified separately during startup.
 6. **Group by lease UUID** -- ordinary containers are grouped into provision records. The highest `FailCount` across containers in a lease is used (handles partial re-provisions).
 7. **Rebuild close owners** -- a full close publishes a conservative `deprovisioning` projection and full resource reservation solely from its immutable journal snapshot, even with zero survivors. Cleanup-only closes reserve their durable topology without publishing a tenant provision.
 8. **Rebuild restore destination authority** -- a source `restoring` finalizer

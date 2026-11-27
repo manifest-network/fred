@@ -257,7 +257,7 @@ func initializeBoundCallbackStore(t testing.TB) (string, backendidentity.Verifie
 	hooks := backendidentity.MarkerPairStoreHooks{
 		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return PrepareBoundCallbackStoreStorage(bound, storage, profile)
+			return PrepareBoundCallbackStoreStorage(bound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			return CheckBoundCallbackStoreStorage(bound, storage)
@@ -286,7 +286,7 @@ func initializeBoundReleaseStore(t *testing.T) (string, backendidentity.Verified
 	hooks := backendidentity.MarkerPairStoreHooks{
 		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return PrepareBoundReleaseStoreStorage(bound, storage, profile)
+			return PrepareBoundReleaseStoreStorage(bound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			return CheckBoundReleaseStoreStorage(bound, storage)
@@ -506,7 +506,7 @@ func TestBoundAuthoritativeStoreNeverPublishesIntoReplacementParent(t *testing.T
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
 			require.NoError(t, os.Rename(parent, retired))
 			require.NoError(t, os.Mkdir(parent, 0o700))
-			return PrepareBoundCallbackStoreStorage(bound, storage, profile)
+			return PrepareBoundCallbackStoreStorage(bound, storage)
 		},
 		Check: func(storage backendidentity.PendingStorage) error {
 			if err := CheckBoundCallbackStoreStorage(bound, storage); err != nil {
@@ -537,7 +537,7 @@ func TestRetentionBindingRejectsRedirectedRecordIdentity(t *testing.T) {
 		Status:            RetentionStatusActive,
 	}))
 	require.NoError(t, store.Close())
-	legacy, err := json.Marshal(legacyRetentionEntryJSON{
+	redirected, err := marshalRetentionEntry(RetentionEntry{
 		OriginalLeaseUUID: "11111111-1111-4111-8111-111111111111",
 		ProviderUUID:      "22222222-2222-4222-8222-222222222222",
 		Status:            RetentionStatusActive,
@@ -548,7 +548,7 @@ func TestRetentionBindingRejectsRedirectedRecordIdentity(t *testing.T) {
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(retentionBucketName)
 		require.NoError(t, bucket.Delete([]byte("11111111-1111-4111-8111-111111111111")))
-		return bucket.Put([]byte("33333333-3333-4333-8333-333333333333"), legacy)
+		return bucket.Put([]byte("33333333-3333-4333-8333-333333333333"), redirected)
 	}))
 	require.NoError(t, db.Close())
 
@@ -566,12 +566,13 @@ func TestReleaseBindingRejectsImpossibleHistory(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.append("11111111-1111-4111-8111-111111111111", Release{Status: "active"}))
 	require.NoError(t, store.Close())
+	impossible, err := marshalReleaseHistory([]Release{{Version: 0, Status: "unknown"}})
+	require.NoError(t, err)
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
 	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(releasesBucketName).Put(
-			[]byte("11111111-1111-4111-8111-111111111111"),
-			[]byte(`[{"version":0,"status":"unknown"}]`),
+			[]byte("11111111-1111-4111-8111-111111111111"), impossible,
 		)
 	}))
 	require.NoError(t, db.Close())
@@ -582,180 +583,14 @@ func TestReleaseBindingRejectsImpossibleHistory(t *testing.T) {
 	assert.ErrorContains(t, err, "non-increasing version")
 }
 
-func TestReleaseBindingNormalizesWireFaithfulV013RecordMigrationHistory(t *testing.T) {
-	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	writeRawReleaseHistory(t, dbPath, leaseUUID, []Release{
-		{
-			Version: 1, Manifest: []byte(`{"image":"nginx:1.25"}`),
-			Image: "nginx:1.25", Status: "active", CreatedAt: createdAt,
-		},
-		{
-			Version:  2,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`),
-			Image:    "stack", Status: "active", CreatedAt: createdAt.Add(time.Minute),
-		},
-		{
-			Version:  3,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:2"}}}`),
-			Image:    "stack", Status: "failed", CreatedAt: createdAt.Add(2 * time.Minute),
-		},
-	})
-
-	_, err := InspectReleaseStoreReadOnly(dbPath)
-	require.ErrorContains(t, err, "2 active records",
-		"current runtime inspection must never accept duplicate active authority")
-	bound, err := BindAuthoritativeStorePath(dbPath)
-	require.NoError(t, err)
-	inspection, err := InspectBoundLegacyReleaseStoreReadOnly(bound)
-	require.NoError(t, err)
-	require.NoError(t, bound.Close())
-	require.True(t, inspection.RequiresLegacyNormalization)
-	require.Equal(t, 2, inspection.ActiveReleases[leaseUUID].Version,
-		"v0.13 LatestActive made the migrated row authoritative even with a failed tail")
-
-	require.NoError(t, prepareExistingBoundStoreForTest(
-		t, dbPath, PrepareBoundReleaseStoreStorage,
-	))
-	strict, err := InspectReleaseStoreReadOnly(dbPath)
-	require.NoError(t, err)
-	require.True(t, strict.IdentityBound)
-	require.False(t, strict.RequiresLegacyNormalization)
-	releases := readRawReleaseHistory(t, dbPath, leaseUUID)
-	require.Len(t, releases, 3)
-	assert.Equal(t, "superseded", releases[0].Status)
-	assert.Equal(t, "active", releases[1].Status)
-	assert.Equal(t, "failed", releases[2].Status)
-}
-
-func TestReleaseBindingNormalizesSemanticallyIdenticalV013DeployingTail(t *testing.T) {
-	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	dbPath := filepath.Join(t.TempDir(), "releases.db")
-	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	writeRawReleaseHistory(t, dbPath, leaseUUID, []Release{
-		{
-			Version:  1,
-			Manifest: []byte(`{"image":"nginx:1.25","env":{"MODE":"safe"},"command":["serve"]}`),
-			Image:    "nginx:1.25", Status: "active", CreatedAt: createdAt,
-		},
-		{
-			Version:  2,
-			Manifest: []byte(`{"services":{"app":{"command":["serve"],"env":{"MODE":"safe"},"image":"nginx:1.25"}}}`),
-			Image:    "stack", Status: "deploying", CreatedAt: createdAt.Add(time.Minute),
-		},
-		{
-			Version:  3,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:2"}}}`),
-			Image:    "stack", Status: "failed", CreatedAt: createdAt.Add(2 * time.Minute),
-		},
-		{
-			Version:  4,
-			Manifest: []byte(`{"services":{"app":{"env":{"MODE":"safe"},"image":"nginx:1.25","command":["serve"]}}}`),
-			Image:    "stack", Status: "deploying", CreatedAt: createdAt.Add(3 * time.Minute),
-		},
-	})
-
-	bound, err := BindAuthoritativeStorePath(dbPath)
-	require.NoError(t, err)
-	inspection, err := InspectBoundLegacyReleaseStoreReadOnly(bound)
-	require.NoError(t, err)
-	require.NoError(t, bound.Close())
-	require.True(t, inspection.RequiresLegacyNormalization)
-	require.Equal(t, 1, inspection.ActiveReleases[leaseUUID].Version)
-
-	require.NoError(t, prepareExistingBoundStoreForTest(
-		t, dbPath, PrepareBoundReleaseStoreStorage,
-	))
-	releases := readRawReleaseHistory(t, dbPath, leaseUUID)
-	require.Len(t, releases, 4)
-	assert.Equal(t, "active", releases[0].Status)
-	assert.Equal(t, "superseded", releases[1].Status,
-		"an equivalent stopped deploying generation carries no distinct workload authority")
-	assert.Equal(t, "failed", releases[2].Status)
-	assert.Equal(t, "superseded", releases[3].Status,
-		"every equivalent post-active deploying retry is normalized")
-}
-
-func TestReleaseBindingRejectsAmbiguousV013DeployingTailWithoutMutation(t *testing.T) {
-	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	for _, test := range []struct {
-		name    string
-		history []Release
-	}{
-		{
-			name: "same image and topology but different environment",
-			history: []Release{
-				{
-					Version:  1,
-					Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25","env":{"MODE":"old"}}}}`),
-					Image:    "stack", Status: "active",
-				},
-				{
-					Version:  2,
-					Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25","env":{"MODE":"new"}}}}`),
-					Image:    "stack", Status: "deploying",
-				},
-			},
-		},
-		{
-			name: "one of multiple deploying rows differs",
-			history: []Release{
-				{
-					Version: 1, Manifest: []byte(`{"image":"nginx:1.25"}`),
-					Image: "nginx:1.25", Status: "active",
-				},
-				{
-					Version:  2,
-					Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`),
-					Image:    "stack", Status: "deploying",
-				},
-				{
-					Version:  3,
-					Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25","command":["other"]}}}`),
-					Image:    "stack", Status: "deploying",
-				},
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			dbPath := filepath.Join(t.TempDir(), "releases.db")
-			writeRawReleaseHistory(t, dbPath, leaseUUID, test.history)
-			before, err := os.ReadFile(dbPath)
-			require.NoError(t, err)
-
-			bound, err := BindAuthoritativeStorePath(dbPath)
-			require.NoError(t, err)
-			_, inspectErr := InspectBoundLegacyReleaseStoreReadOnly(bound)
-			require.NoError(t, bound.Close())
-			require.Error(t, inspectErr)
-			assert.ErrorContains(t, inspectErr, "deploying")
-
-			err = prepareExistingBoundStoreForTest(t, dbPath, PrepareBoundReleaseStoreStorage)
-			require.Error(t, err)
-			after, readErr := os.ReadFile(dbPath)
-			require.NoError(t, readErr)
-			assert.Equal(t, before, after,
-				"ambiguous stopped update authority must not be normalized or identity-bound")
-		})
-	}
-}
-
-func TestReleasePreparationWrongExistingBindingLeavesLegacyHistoryUnchanged(t *testing.T) {
+func TestReleasePreparationWrongExistingBindingLeavesHistoryUnchanged(t *testing.T) {
 	dbPath, _ := initializeBoundReleaseStore(t)
 	const leaseUUID = "11111111-1111-4111-8111-111111111111"
-	createdAt := time.Now().UTC()
-	writeRawReleaseHistory(t, dbPath, leaseUUID, []Release{
-		{
-			Version: 1, Manifest: []byte(`{"image":"nginx:1"}`),
-			Image: "nginx:1", Status: "active", CreatedAt: createdAt,
-		},
-		{
-			Version:  2,
-			Manifest: []byte(`{"services":{"app":{"image":"nginx:1"}}}`),
-			Image:    "stack", Status: "active", CreatedAt: createdAt.Add(time.Minute),
-		},
-	})
+	writeRawReleaseHistory(t, dbPath, leaseUUID, []Release{{
+		Version:  1,
+		Manifest: []byte(`{"services":{"app":{"image":"nginx:1"}}}`),
+		Image:    "stack", Status: "active", CreatedAt: time.Now().UTC(),
+	}})
 	before, err := os.ReadFile(dbPath)
 	require.NoError(t, err)
 	bound, err := BindAuthoritativeStorePath(dbPath)
@@ -769,9 +604,9 @@ func TestReleasePreparationWrongExistingBindingLeavesLegacyHistoryUnchanged(t *t
 	defer func() { require.NoError(t, pair.Close()) }()
 
 	_, err = pair.InitializeWithStores("docker-b", "daemon-b", backendidentity.MarkerPairStoreHooks{
-		Profile: backendidentity.InitializationProfileExisting,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return PrepareBoundReleaseStoreStorage(bound, storage, profile)
+			return PrepareBoundReleaseStoreStorage(bound, storage)
 		},
 		Check:  func(backendidentity.PendingStorage) error { return nil },
 		Verify: func(backendidentity.VerifiedStorage) error { return nil },
@@ -780,12 +615,12 @@ func TestReleasePreparationWrongExistingBindingLeavesLegacyHistoryUnchanged(t *t
 	after, readErr := os.ReadFile(dbPath)
 	require.NoError(t, readErr)
 	assert.Equal(t, before, after,
-		"a foreign pending marker must not normalize an already-bound release journal")
+		"a foreign pending marker must not rewrite an already-bound release journal")
 }
 
 func writeRawReleaseHistory(t *testing.T, dbPath, leaseUUID string, releases []Release) {
 	t.Helper()
-	encoded, err := json.Marshal(releases)
+	encoded, err := marshalReleaseHistory(releases)
 	require.NoError(t, err)
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
@@ -821,7 +656,6 @@ func prepareExistingBoundStoreForTest(
 	prepare func(
 		*BoundAuthoritativeStorePath,
 		backendidentity.PendingStorage,
-		backendidentity.InitializationProfile,
 	) error,
 ) error {
 	t.Helper()
@@ -839,9 +673,9 @@ func prepareExistingBoundStoreForTest(
 	}
 	defer func() { _ = pair.Close() }()
 	_, err = pair.InitializeWithStores("docker-a", "daemon-a", backendidentity.MarkerPairStoreHooks{
-		Profile: backendidentity.InitializationProfileExisting,
+		Profile: backendidentity.InitializationProfileFresh,
 		Prepare: func(storage backendidentity.PendingStorage, profile backendidentity.InitializationProfile) error {
-			return prepare(bound, storage, profile)
+			return prepare(bound, storage)
 		},
 		Check:  func(backendidentity.PendingStorage) error { return nil },
 		Verify: func(backendidentity.VerifiedStorage) error { return nil },
