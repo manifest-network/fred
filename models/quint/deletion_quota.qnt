@@ -2,8 +2,9 @@
 // stay bounded and counted, and can its project ID reach another volume while
 // it still has usage?
 //
-// One old volume owns project 1 with a block limit of 2 and one byte of
-// content. A leftover writer may still hold a file of it open: a rename does
+// One old volume owns project 1 with a block limit of 2. It starts with one
+// byte of content, or with three: usage can be above a limit that was set or
+// lowered after the bytes were written. A leftover writer may still hold a file of it open: a rename does
 // not close descriptors, and a deleted file that is still open keeps charging
 // its project. The destroy renames the volume to a tombstone whose name
 // records a size. Cleanup detaches the tombstone's root from the project,
@@ -18,6 +19,7 @@
 // Each constant is one rule of the plan. A variant that turns one off is a
 // negative control.
 //   - BOUND_IS_CEILING: the size is max(used, limit), not the measured usage.
+//   - BOUND_COUNTS_EXCESS: the ceiling is max(used, limit), not the limit alone.
 //   - CLEAR_NEEDS_ZERO: the limit is cleared only at zero usage.
 //   - REMOVE_NEEDS_ZERO: the tombstone stays until usage is zero and the
 //     limit is cleared.
@@ -30,6 +32,7 @@
 // resource, and a crash between two steps of one cleanup.
 module deletionQuota {
   const BOUND_IS_CEILING: bool
+  const BOUND_COUNTS_EXCESS: bool
   const CLEAR_NEEDS_ZERO: bool
   const REMOVE_NEEDS_ZERO: bool
   const DETACH_ROOT: bool
@@ -60,14 +63,16 @@ module deletionQuota {
   pure val CREATORS = Set(1, 2)
   pure val IDS = Set(1, 2, 3)
   pure val LIMIT = 2
-  pure val CAP = 3      // what an unlimited writer can reach in this model
+  pure val CAP = 4      // what an unlimited writer can reach in this model
 
   val used = (if (s.tree) 1 else 0) + s.open
   val tomb = s.old == TombTagged or s.old == TombDetached
   // Blocks and inodes: the tree, an open file, or a root still in the project.
   val charged = s.tree or s.writer or s.old == TombTagged or s.old == Live
   val populated1 = charged or s.limit
-  val counted = if (s.old == Live) LIMIT else if (tomb) s.bound else 0
+  // What admission counts for the deleted volume. A live volume is counted by
+  // its lease's reservation, which this model does not question.
+  val counted = if (tomb) s.bound else 0
 
   def taken(c: int): Set[int] = (if (s.old == Gone) Set() else Set(1))
     .union(CREATORS.map(o => s.claimed.get(o)))
@@ -78,14 +83,18 @@ module deletionQuota {
     CREATORS.exists(o => o != c and s.claimed.get(o) == p),
   }
 
-  action init = s' = {
-    old: Live, tree: true, writer: true, open: 0, limit: true, bound: 0,
-    phase: Map(1 -> Idle, 2 -> Idle),
-    cand: Map(1 -> 0, 2 -> 0),
-    skip: Map(1 -> Set(), 2 -> Set()),
-    reserved: Set(),
-    claimed: Map(1 -> 0, 2 -> 0),
-    inherited: false,
+  action init = {
+    nondet excess = Set(true, false).oneOf()
+    s' = {
+      old: Live, tree: true, writer: true, limit: true, bound: 0,
+      open: if (excess) 2 else 0,
+      phase: Map(1 -> Idle, 2 -> Idle),
+      cand: Map(1 -> 0, 2 -> 0),
+      skip: Map(1 -> Set(), 2 -> Set()),
+      reserved: Set(),
+      claimed: Map(1 -> 0, 2 -> 0),
+      inherited: false,
+    }
   }
 
   // The writer grows its open file as far as the limit, or the cap, allows.
@@ -104,7 +113,10 @@ module deletionQuota {
     s' = {
       ...s,
       old: TombTagged,
-      bound: if (BOUND_IS_CEILING) { if (used > LIMIT) used else LIMIT } else used,
+      bound:
+        if (not(BOUND_IS_CEILING)) used
+        else if (BOUND_COUNTS_EXCESS and used > LIMIT) used
+        else LIMIT,
     },
   }
 
@@ -200,8 +212,9 @@ module deletionQuota {
     removeTombstone, pick, kernelRead, claim, restart,
   }
 
-  // Admission counts at least what the old project can still charge.
-  val boundCovers = used <= counted
+  // Once the volume is deleted, admission counts at least what its project
+  // can still charge.
+  val boundCovers = s.old == Live or used <= counted
 
   // No project is handed to a new volume while it still has usage or a limit.
   val noInheritedUsage = not(s.inherited)
@@ -219,7 +232,8 @@ module deletionQuota {
 module plan {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -227,7 +241,8 @@ module plan {
 module measuredBound {
   import deletionQuota(
     BOUND_IS_CEILING = false, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -235,7 +250,8 @@ module measuredBound {
 module clearLimitEarly {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = false, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -244,7 +260,8 @@ module clearLimitEarly {
 module removeTombstoneEarly {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = false,
-    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -252,7 +269,8 @@ module removeTombstoneEarly {
 module noReuseGuard {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = false,
-    DETACH_ROOT = true, KERNEL_CHECK = false, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = false, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -260,7 +278,8 @@ module noReuseGuard {
 module tombstoneRuleOnly {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = true, KERNEL_CHECK = false, RESERVE = true
+    DETACH_ROOT = true, KERNEL_CHECK = false, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -268,7 +287,8 @@ module tombstoneRuleOnly {
 module unreservedAllocator {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = false
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = false,
+    BOUND_COUNTS_EXCESS = true
   ).*
 }
 
@@ -276,6 +296,16 @@ module unreservedAllocator {
 module rootStaysTagged {
   import deletionQuota(
     BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
-    DETACH_ROOT = false, KERNEL_CHECK = true, RESERVE = true
+    DETACH_ROOT = false, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = true
+  ).*
+}
+
+// Mutant: the name records the limit alone, although usage can exceed it.
+module limitOnlyBound {
+  import deletionQuota(
+    BOUND_IS_CEILING = true, CLEAR_NEEDS_ZERO = true, REMOVE_NEEDS_ZERO = true,
+    DETACH_ROOT = true, KERNEL_CHECK = true, RESERVE = true,
+    BOUND_COUNTS_EXCESS = false
   ).*
 }

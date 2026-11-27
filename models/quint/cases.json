@@ -474,5 +474,19 @@
     "invariant": "neverReclaimed",
     "expect_violation": false,
     "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "unlockedStartupPublish",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "limitOnlyBound",
+    "invariant": "boundCovers",
+    "expect_violation": true,
+    "step": "step"
   }
 ]

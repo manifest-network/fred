@@ -79,6 +79,11 @@ pool does not serve before the first publication. `tombstoneRuleOnly` drops the
 allocator's kernel check; it holds because a tombstone stays until usage is
 zero. Both rules are a second layer in these models, not the only guard.
 
+`unlockedStartupPublish` keeps the counterexample behind one rule the plan had
+not stated: a destroy's publication takes the lock of every refresh, also
+before the first full refresh. `limitOnlyBound` starts the volume above its
+limit, where a size equal to the limit alone is too small.
+
 `ackByProjectID` needs the `recycledKeyWitness` schedule: random sampling at
 the default budget does not find it. `neverBothDone` and `neverReclaimed` are
 reachability controls: a violation shows that the good end state can be reached.

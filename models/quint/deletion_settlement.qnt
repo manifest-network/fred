@@ -25,6 +25,8 @@
 //   - ACK_BY_TOKEN: an acknowledgment names one deletion, not a project ID.
 //   - RETURN_AFTER_PUBLISH: a destroy answers only after its own publication.
 //   - RESTART_UNCOUNTED: after a restart every tombstone is uncounted.
+//   - PUBLISH_LOCK: a destroy's publication takes the lock of every refresh,
+//     also before a process's first full refresh.
 //
 // Not modeled: sizes and quota (deletion_quota.qnt), cleanup steps and their
 // failure classes, executor fairness, storage identity checks, and a new
@@ -36,6 +38,7 @@ module deletionSettlement {
   const ACK_BY_TOKEN: bool
   const RETURN_AFTER_PUBLISH: bool
   const RESTART_UNCOUNTED: bool
+  const PUBLISH_LOCK: bool
 
   // Volatile: renamed, parent directory not synced yet.
   type Tomb = NoTomb | Volatile | Durable | Reclaimed
@@ -176,12 +179,13 @@ module deletionSettlement {
 
   // Before a process's first full refresh, a destroy's publication publishes
   // no term and acknowledges nothing. The destroy still answers. Startup's own
-  // reap runs in that window. It takes the same lock as every publication, so
-  // it cannot overtake a refresh whose snapshot is already taken.
+  // reap runs in that window. With the lock it cannot overtake a refresh whose
+  // snapshot is already taken.
   action destroyPublishEarly = {
     nondet l = LEASES.oneOf()
     all {
-      s.up, not(s.poolReady), not(s.snapActive), s.call.get(l) == Attempted,
+      s.up, not(s.poolReady), s.call.get(l) == Attempted,
+      PUBLISH_LOCK implies not(s.snapActive),
       s' = {
         ...s,
         call: s.call.set(l, Returned),
@@ -394,7 +398,8 @@ module deletionSettlement {
 module plan {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -402,7 +407,8 @@ module plan {
 module absenceOnly {
   import deletionSettlement(
     GUARD_READERS = false, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -410,7 +416,8 @@ module absenceOnly {
 module ackBeforeDurable {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = false, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -418,7 +425,8 @@ module ackBeforeDurable {
 module noAckOnReclaim {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = false,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -427,7 +435,8 @@ module noAckOnReclaim {
 module ackByProjectID {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = false, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = false, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -435,7 +444,8 @@ module ackByProjectID {
 module returnBeforePublish {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = false, RESTART_UNCOUNTED = true
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = false, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = true
   ).*
 }
 
@@ -443,6 +453,17 @@ module returnBeforePublish {
 module restartCounted {
   import deletionSettlement(
     GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
-    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = false
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = false,
+    PUBLISH_LOCK = true
+  ).*
+}
+
+// Mutant: before the first full refresh, a destroy answers without waiting for
+// a refresh whose snapshot is already taken.
+module unlockedStartupPublish {
+  import deletionSettlement(
+    GUARD_READERS = true, ACK_NEEDS_DURABLE = true, ACK_ON_RECLAIM = true,
+    ACK_BY_TOKEN = true, RETURN_AFTER_PUBLISH = true, RESTART_UNCOUNTED = true,
+    PUBLISH_LOCK = false
   ).*
 }
