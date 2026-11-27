@@ -209,6 +209,29 @@ func requireConflictRepairAuthoritiesWithBackup(
 	return ctx, plan, drain, probe, backup
 }
 
+func boundExactBackupTarget(t *testing.T, path string) *ExactBackupTarget {
+	t.Helper()
+	target, err := BindExactBackupTarget(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, target.Close()) })
+	return target
+}
+
+func corruptExactBackupInPlace(t *testing.T, target *ExactBackupTarget) {
+	t.Helper()
+	require.NotNil(t, target)
+	file, err := os.OpenFile(target.Path(), os.O_RDWR, 0) // #nosec G304 -- test-owned path
+	require.NoError(t, err)
+	var first [1]byte
+	_, err = file.ReadAt(first[:], 0)
+	require.NoError(t, err)
+	first[0] ^= 0xff
+	_, err = file.WriteAt(first[:], 0)
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+}
+
 func requireExactRepairBackup(t *testing.T, repair *AttemptRepair) *ExactBackupTarget {
 	t.Helper()
 	target := boundExactBackupTarget(
@@ -714,39 +737,7 @@ func TestAttemptRepairCandidateMatchesExplicitLegacyForPreservedLegacyOwner(t *t
 	writeRawRecords(t, dbPath, map[string][]byte{
 		repairLease: []byte(`{"backend":"backend-a","set_at":"2026-08-27T12:00:00Z"}`),
 	})
-	preparer, err := OpenLegacyUpgradePreparer(dbPath)
-	require.NoError(t, err)
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	inventories := map[string]BackendInventory{
-		"backend-a": {
-			StorageIdentity:        testBackendStorageID("backend-a"),
-			Provisions:             []string{repairLease},
-			ProvisionProviderUUIDs: map[string]string{repairLease: freshTestProviderUUID},
-			ProvisionItems: map[string][]backend.LeaseItem{
-				repairLease: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
-			},
-			Retentions: []string{},
-		},
-	}
-	chainProof := chainProofForProvider(t, freshTestProviderUUID, repairLease)
-	backupPath := filepath.Join(filepath.Dir(dbPath), "placements.v013.bak")
-	backupTarget := boundExactBackupTarget(t, backupPath)
-	capability, err := preparer.AuthorizePreparation(
-		ctx, freshTestProviderUUID, []string{"backend-a"}, inventories,
-		chainProof, backupTarget, LegacyPreparationDrainAttestation,
-	)
-	require.NoError(t, err)
-	_, err = preparer.PrepareContext(
-		ctx,
-		freshTestProviderUUID,
-		[]string{"backend-a"},
-		inventories,
-		chainProof,
-		capability,
-	)
-	require.NoError(t, err)
-	require.NoError(t, preparer.Close())
+	adoptV013PlacementsForTest(t, dbPath, freshTestProviderUUID, "backend-a")
 	store, err := OpenStore(dbPath, freshTestProviderUUID)
 	require.NoError(t, err)
 	requireTestAdmission(t, store)

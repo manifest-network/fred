@@ -17,9 +17,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
@@ -1015,9 +1015,8 @@ func (p Placement) AttemptMetadata() AttemptMetadata {
 	}
 }
 
-// record is the current bbolt representation. v0.13 raw names and the
-// pre-ENG-335 {backend,set_at} object are accepted only by the stopped
-// preparation path; a live Store requires this explicit schema boundary.
+// record is the current bbolt representation. A Store reads no other: v0.13
+// raw names and the pre-ENG-335 {backend,set_at} object are unusable rows.
 type record struct {
 	Schema                 uint8               `json:"schema"`
 	Backend                string              `json:"backend"`
@@ -1198,10 +1197,21 @@ func WithFencedBackends(names []string) Option {
 	}
 }
 
-// OpenStore opens an existing, fully prepared placement authority without
+// ErrPreparationRequired means the placement database is empty or still has the
+// v0.13 layout. This release cannot convert a v0.13 database: only the 0.14
+// line's placement-preflight can, so a provider upgrades through the final 0.14
+// release first.
+var ErrPreparationRequired = errors.New("placement database is not in the current layout")
+
+func canonicalLeaseUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+// OpenStore opens an existing placement authority in the current layout without
 // creating a file, bucket, schema, or migration write. Production startup uses
-// this boundary: an absent/empty database or a v0.13 database that has not been
-// sealed by placement-preflight fails before any durable byte can change.
+// this boundary: an absent or empty database, or one still in the v0.13 layout,
+// fails before any durable byte can change.
 func OpenStore(dbPath, providerUUID string, opts ...Option) (*Store, error) {
 	if dbPath == "" {
 		return nil, fmt.Errorf("placement db path is required")
@@ -1256,7 +1266,7 @@ func OpenStore(dbPath, providerUUID string, opts ...Option) (*Store, error) {
 	if err := db.View(func(tx *bolt.Tx) error {
 		if tx.Bucket(metadataBucketName) == nil {
 			return fmt.Errorf(
-				"%w: run placement-preflight --prepare against the stopped v0.13 database",
+				"%w: a v0.13 database is converted by the final 0.14 release, not by this one",
 				ErrPreparationRequired,
 			)
 		}
@@ -1472,79 +1482,8 @@ func loadStoreWithExpectedAuthority(
 	return s, nil
 }
 
-// migrateLegacyConfirmedRevisions upgrades the unambiguous confirmed-owner
-// records written by v0.13 and earlier onto the revisioned schema. All records
-// are examined before any write so new revisions start strictly above every
-// existing durable revision. The caller's bbolt update transaction makes the
-// entire migration atomic, including revision exhaustion or a failed Put.
-//
-// Attempts, conflicts, and unusable records deliberately remain byte-for-byte
-// untouched. None of them is safe to turn into an exact confirmed-owner
-// capability merely because it predates record revisions.
-func migrateLegacyConfirmedRevisions(tx *bolt.Tx) error {
-	b := tx.Bucket(bucketName)
-	if b == nil {
-		return errors.New("placements bucket missing")
-	}
-
-	type migration struct {
-		leaseUUID string
-		placement Placement
-	}
-	var migrations []migration
-	var revision uint64
-	if err := b.ForEach(func(k, v []byte) error {
-		leaseUUID := string(k)
-		// v0.13 selected the object decoder only when the first byte was
-		// '{'. Consequently printable raw backend names such as "null",
-		// "true", "123", and "[]" were valid even though they are also
-		// valid non-object JSON roots. The current decoder deliberately rejects
-		// those roots, so the one-time migration must reuse the strict historical
-		// decoder after the preflight/epoch proof instead of silently leaving a
-		// previously confirmed owner unusable. Object rows continue through the
-		// current structural decoder so their historical SetAt value is retained.
-		p := decodeRecord(leaseUUID, v)
-		if _, lost := p.LostBackend(); p.unusable && !lost {
-			legacy, legacyErr := decodeV013PlacementForMigration(v)
-			if legacyErr == nil {
-				p = legacy
-			}
-		}
-		if p.revision > revision {
-			revision = p.revision
-		}
-		if leaseUUID != "" && p.revision == 0 && p.State() == StateConfirmed &&
-			p.Attempt == "" && !p.Conflict {
-			migrations = append(migrations, migration{
-				leaseUUID: leaseUUID,
-				placement: p,
-			})
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("scan legacy placement revisions: %w", err)
-	}
-
-	for _, migration := range migrations {
-		if revision == math.MaxUint64 {
-			return errors.New("placement revision exhausted during legacy migration")
-		}
-		revision++
-		migration.placement.revision = revision
-		encoded, err := encodePlacement(migration.placement)
-		if err != nil {
-			return fmt.Errorf("encode migrated placement %q: %w", migration.leaseUUID, err)
-		}
-		if err := b.Put([]byte(migration.leaseUUID), encoded); err != nil {
-			return fmt.Errorf("write migrated placement %q: %w", migration.leaseUUID, err)
-		}
-	}
-	return nil
-}
-
 // decodeRecord parses only the explicit current schema. Legacy raw names and
-// versionless pre-ENG-335 objects remain present but Unusable outside the
-// stopped preparation transaction.
+// versionless pre-ENG-335 objects remain present but Unusable.
 func decodeRecord(leaseUUID string, v []byte) Placement {
 	r, fields, err := decodeCurrentPlacementRecord(v)
 	if err != nil {
@@ -1759,42 +1698,6 @@ func decodeOperationID(value string) (operation.OperationID, error) {
 		return operation.OperationID{}, fmt.Errorf("invalid persisted operation identity: %w", err)
 	}
 	return id, nil
-}
-
-func validLegacyBackendName(v []byte) bool {
-	if !utf8.Valid(v) {
-		return false
-	}
-	for _, r := range string(v) {
-		if !unicode.IsPrint(r) {
-			return false
-		}
-	}
-	return true
-}
-
-// decodeV013PlacementForMigration is callable only from the stopped,
-// database-wide preparation transaction. decodeV013PreflightPlacement owns the
-// exact historical raw-vs-object grammar and field allow-list; this helper
-// additionally preserves ENG-335's set_at timestamp while minting the current
-// schema and revision.
-func decodeV013PlacementForMigration(value []byte) (Placement, error) {
-	backendName, err := decodeV013PreflightPlacement(value)
-	if err != nil {
-		return Placement{}, err
-	}
-	placement := Placement{Backend: backendName}
-	if value[0] != '{' {
-		return placement, nil
-	}
-	fields, err := decodeUniqueJSONObject(value)
-	if err != nil {
-		return Placement{}, err
-	}
-	if err := json.Unmarshal(fields["set_at"], &placement.SetAt); err != nil {
-		return Placement{}, fmt.Errorf("decode v0.13 placement set_at: %w", err)
-	}
-	return placement, nil
 }
 
 // decodeLostRecord accepts a lost placement only in the exact shape the

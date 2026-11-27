@@ -4,7 +4,7 @@
 
 Fred is the Manifest Network **provider daemon**: it watches the chain for lease events and drives provisioning through pluggable backends. `providerd` and a backend are **separate processes** over HTTP, HMAC-SHA256-authenticated in both directions (`X-Fred-Signature`; canonical string = timestamp + method + request URI + sha256(body)). Fred → backend is a request; backend → Fred a callback. Changing one side's wire shape means changing the other **and** `BACKEND_GUIDE.md`.
 
-`make all` builds five binaries; `providerd`, `docker-backend`, the offline `placement-preflight` inspector/preparer/initializer, and the offline `placement-repair` tool are released. `placement-preflight` is read-only by default; only explicit `-prepare` or `-initialize-fresh` modes write. `mock-backend` is for dev/E2E. `cmd/loadtest` and `cmd/lease-token` have no make target — `go run ./cmd/<name>`.
+`make all` builds five binaries; `providerd`, `docker-backend`, the offline `placement-preflight` initializer, and the offline `placement-repair` tool are released. `placement-preflight` creates the placement database of a provider that has never run (`-initialize-fresh`); it has no default mode and does not convert a v0.13 database, which is the 0.14 line's job. `mock-backend` is for dev/E2E. `cmd/loadtest` and `cmd/lease-token` have no make target — `go run ./cmd/<name>`.
 
 ## Commands
 

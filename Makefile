@@ -247,7 +247,7 @@ help:
 	@echo "  build            - Build providerd"
 	@echo "  build-mock       - Build mock-backend for testing"
 	@echo "  build-docker     - Build docker-backend"
-	@echo "  build-placement-preflight - Build the placement inspector, preparer, and fresh initializer"
+	@echo "  build-placement-preflight - Build the fresh placement initializer"
 	@echo "  build-placement-repair    - Build the offline placement inspector and exact repair tool"
 	@echo "  install          - Install binaries to GOPATH/bin"
 	@echo "  clean            - Clean build artifacts"

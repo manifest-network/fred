@@ -219,7 +219,7 @@ func runWithDependencies(
 	leaseUUID := flags.String("lease", "", "exact canonical lease UUID")
 	backendName := flags.String("backend", "", "exact attempted or selected backend name")
 	operationText := flags.String("operation-id", "", "exact canonical attempted operation UUIDv4")
-	classifyAuthority := flags.Bool("classify", false, "classify the stopped authority across the v0.13 preparation boundary (offline)")
+	classifyAuthority := flags.Bool("classify", false, "classify the stopped authority file: one complete current authority, or not (offline)")
 	listRecords := flags.Bool("list", false, "list every durable placement row read-only (offline)")
 	inspectRecord := flags.Bool("inspect", false, "inspect the exact -lease row read-only (offline)")
 	resolveConflict := flags.Bool("resolve-conflict", false, "resolve one exact durable conflict to -backend")

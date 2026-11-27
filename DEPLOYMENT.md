@@ -1401,7 +1401,7 @@ Fred releases are tagged on GitHub with binaries via `goreleaser`. The release p
 
 1. Tag a release on GitHub. `goreleaser` publishes `providerd`,
    `docker-backend`, the offline `placement-preflight`
-   inspector/preparer/initializer, and the offline `placement-repair` tool as
+   initializer, and the offline `placement-repair` tool as
    binary archives, plus a single Docker
    image — `ghcr.io/manifest-network/fred` — which contains `providerd` plus
    both placement tools. The image still starts `providerd` by default; invoke
@@ -1438,6 +1438,14 @@ starts.
 
 ### Upgrading from v0.13.x
 
+**This release line cannot complete this upgrade on its own.** Its
+`placement-preflight` no longer inspects or prepares a v0.13 placement
+database, and its `providerd` refuses one. Upgrade a v0.13 provider to the final
+0.14 release first, with that release's binaries and its copy of this guide,
+then upgrade from 0.14 as described under [Upgrades](#upgrades). What follows is
+kept for the backend half of the procedure, which this line's `docker-backend`
+still implements, and for how leases adopted from v0.13 behave afterwards.
+
 This procedure applies to every v0.13 release: v0.13.0, v0.13.1 and v0.13.2.
 The patch releases changed no placement, payload, release or callback store
 format and no providerd↔backend wire shape, so "v0.13.0" below names the state
@@ -1463,7 +1471,7 @@ Compare the complete rendered configurations with the target revision's
 examples and run that revision's real loaders, including every backend.
 The provider configuration must also reach the chain over certificate-verified
 gRPC TLS (`grpc_tls_enabled: true`, `grpc_tls_skip_verify: false`): the
-mandatory `placement-preflight` steps below refuse plaintext or unverified
+0.14 line's mandatory `placement-preflight` steps refuse plaintext or unverified
 chain gRPC. `grpc_tls_enabled` defaults to false and `production_mode: true`
 does not require it, so confirm the chain endpoint serves verifiable TLS
 before the fence.
@@ -1483,46 +1491,22 @@ promise: re-inventory the deployments immediately before executing the cutover
 and extend the proof plan if the fleet has changed. Local development
 environments are outside this production cutover gate.
 
-The v0.13 placement database is migrated only by the mandatory offline
-`placement-preflight -prepare` step below. Normal upgraded startup is read-only
-with respect to schema: it refuses an unprepared file rather than performing a
-first-open migration. Preparation binds the database to the exact configured
-provider UUID and observed backend storage identities, then atomically assigns
-unambiguous v0.13.0 `{backend,set_at}` owners typed record revisions and an
+The v0.13 placement database is converted only by the 0.14 line's mandatory
+offline `placement-preflight -prepare` step. This line has no such step: normal
+startup refuses an absent, empty, or v0.13-layout file rather than performing a
+first-open migration, and `placement-repair -classify` reports a v0.13-layout
+file as `mixed_or_incomplete`. That preparation bound the database to the exact
+configured provider UUID and observed backend storage identities, and gave each
+unambiguous v0.13.0 `{backend,set_at}` owner a typed record revision and an
 explicit ID-empty legacy lifecycle binding. Fred does not mint a bearer
 capability that the existing backend never received; the binding becomes typed
 only after a later exact operation distributes and confirms the paired
-lifecycle URL. Ambiguous, malformed, or otherwise unusable records remain
-fail-closed.
-
-Historical raw backend-name rows use v0.13's exact first-byte grammar during
-the one-time migration. Printable configured names such as `null`, `true`,
-`123`, or `[]` remain raw names rather than being reinterpreted as JSON scalar
-values; object-form rows retain their original `set_at` timestamp.
-
-Lifecycle adoption runs before record-revision migration and
-requires a database-wide first-open epoch: both
-`placement_lifecycle_capabilities` and `placement_metadata` must be absent at
-transaction entry, no placement row may already carry a revision, and the
-individual owner must be revision-zero and confirmed. Once either new bucket
-has existed, no missing row is backfilled—even if an unsupported downgrade
-later writes a revision-zero placement—because Fred cannot prove it did not
-replace formerly typed authority. The epoch proof is database-wide: one
-nonzero-revision row, or one JSON-object-shaped row whose revision header cannot
-be decoded, disqualifies legacy adoption for every otherwise valid revision-zero
-row because Fred cannot prove the whole file is pristine v0.13.0 state. A
-semantically invalid but decodable revision-zero row is quarantined lease-locally
-and does not disqualify another clean owner. The successful offline preparation
-creates the new schema boundary, so repairing a disqualifying row afterward
-cannot rerun adoption. A placement whose capability is missing or corrupt is
+lifecycle URL. A placement whose capability is missing or corrupt is
 quarantined for lifecycle callbacks on that lease rather than downgraded to
-tokenless authority; it does not prevent unrelated leases from loading. This is
-an in-place migration of the exact v0.13.0 placement database, not an inventory
-backfill. Preserve `placement_store_db_path`: inventory cannot reconstruct
-unresolved attempts, conflicts, historical negative evidence, or the immutable
-backend-name/storage bindings. Normal upgraded startup refuses an absent,
-empty, or unprepared replacement database rather than self-binding whatever
-same-name endpoints current configuration happens to resolve.
+tokenless authority; it does not prevent unrelated leases from loading.
+Preserve `placement_store_db_path`: inventory cannot reconstruct unresolved
+attempts, conflicts, historical negative evidence, or the immutable
+backend-name/storage bindings.
 
 The per-backend HMAC migration makes this a stopped provider/fleet cutover; do
 not roll a mixed-key fleet while the old providerd remains online. Quiesce and
@@ -1853,12 +1837,9 @@ until the old outbox is explicitly drained. If a legacy row is introduced into
 an already-open store, the sender leaves it queued rather than assigning the
 mounted lineage. Identity-bearing current-schema rows
 created after sealing retain their recorded identity and are signed with the
-current `K_i` at delivery. With the
-placement authority still stopped, run `placement-repair -classify` and require
-`pristine_v0_13` before the first preparation; use the same command to resolve
-any later ambiguous preparation outcome. Then run the read-only preflight and
-mandatory preparation below. Start the upgraded providerd only after those
-checks produce the required safe verdicts.
+current `K_i` at delivery. The placement database is then prepared with the 0.14
+line's `placement-preflight`. Start the upgraded providerd only after that
+preparation has produced its safe verdict.
 
 The marker detects replacement, not a simultaneously running full clone. A
 snapshot that includes both markers and complete Docker data or cluster state
@@ -1904,75 +1885,12 @@ At the initial stopped boundary, wait for `stats.in_flight_provisions` to reach
 zero and verify the single v0.13.0 providerd shutdown reports no remaining
 provision operations before running the backend adoption preflight described
 above. Take the stopped bbolt/substrate backup only after that preflight passes.
-After the upgraded,
-per-backend-keyed backends are running and inventory-ready, keep providerd
-stopped and its placement file offline. First classify that exact file; a normal
-first cutover must report `pristine_v0_13`. Then run the read-only
-`placement-preflight` inspection from the new release against the exact
-configuration intended for the cutover, followed by mandatory preparation with
-a new backup destination. Both read the chain and require the
-certificate-verified chain gRPC described at the start of this section:
 
-```bash
-placement-repair -config /etc/fred/config.yaml -classify
-placement-preflight -config /etc/fred/config.yaml
-placement-preflight -config /etc/fred/config.yaml \
-  -prepare -backup /var/backups/fred/placements-v0.13-pre-identity.db \
-  -attest-drained 'I attest provider ingress, delayed backend requests/effects, and callback replay are stopped and drained'
-```
+The placement database is prepared next, with the 0.14 line's
+`placement-preflight` and that release's copy of this guide. This line has
+neither the read-only inspection nor the `-prepare` mode.
 
-Require exit status zero and the exact mode-specific final verdict from each
-preflight command: `READY_TO_PREPARE:` for the default read-only inspection and
-`PREPARED_FOR_CUTOVER:` for `-prepare`. Do not accept a generic `PASS` substring
-or any token found in error text. The command renders top-level errors as one
-prefixed, JSON-quoted physical line, including remote response bodies, so
-newlines and terminal controls cannot manufacture a verdict.
-
-Supply the same `PROVIDER_*` environment overrides as the service when the
-configuration depends on them. Default mode opens the existing
-`placement_store_db_path` read-only, runs bbolt's full physical page/freelist
-consistency checker, and holds its shared bbolt lock while it
-uses each backend's configured `hmac_secret`, HTTP timeout, and TLS/mTLS settings
-to fetch every page of `/provisions` and `/retentions` concurrently from every
-configured backend. Every page must carry one stable storage ID and the two
-inventory endpoints must agree. Under that same lock, the tool uses a
-signer-free gRPC client to fetch the configured provider's complete all-state
-lease index at one pinned positive block height; it has no keyring or transaction
-surface. Certificate-verified gRPC TLS is required because this
-membership is provider-binding authority. An intentionally local development
-chain may use the exact `-confirm-insecure-chain` operator attestation documented
-above, including with a shared `production_mode: true` template; the tool rejects
-plaintext or skip-verify evidence without that phrase and rejects the phrase when
-certificate verification is active. Default mode never
-creates a database or bucket and never starts a write transaction. `-prepare`
-first binds the backup parent's physical device/inode, before any remote
-evidence. It then reacquires the stopped file exclusively, repeats the proof and
-physical check, creates, fsyncs, byte-verifies, and physically validates the
-no-overwrite backup through that retained directory descriptor, and atomically
-migrates lifecycle/revision metadata
-and pins the provider UUID plus exact active name-to-storage-ID map while
-leaving the admission baseline empty. A running providerd prevents either mode
-from acquiring its lock; an unreachable or incomplete backend, chain-query
-failure, expiration of `-proof-timeout` (two minutes by default), or any
-discrepancy below exits nonzero without printing the applicable cutover
-verdict. That timeout bounds
-remote inventory/chain proof and cancellable validation only. File open, exact
-backup copy, fsync, bbolt commit, close, and stdout are blocking storage/process
-operations; supervise the offline command with the deployment service/process
-manager and never assume those operations were safely canceled by
-`-proof-timeout`. Proof freshness is nevertheless checked immediately before
-and after the backup and at transaction commit admission. A descriptor-relative
-`renameat2(RENAME_NOREPLACE)` is the backup publication boundary: it cannot
-overwrite an existing entry and leaves no second crash-visible name. The tool
-retains the published inode identity and rechecks both that inode and its parent
-device/inode before migration, after mutation, and before its final verdict. Any
-later validation, sync, close, or temporary-file cleanup error belonging to
-backup publication, or any later
-proof/capability failure before migration commit, is `BACKUP PUBLISHED`. No
-preparation mutation committed; preserve the artifact, rerun the default read-only preflight, and
-choose a new `-backup` path. A bbolt `Commit` error is instead `OUTCOME UNKNOWN`:
-pages or a meta page may already be visible, so preserve both databases and
-classify the live file without retrying or restoring blindly. Run:
+`placement-repair -classify` still inspects a stopped placement file:
 
 ```bash
 placement-repair -config /etc/fred/config.yaml -classify
@@ -2000,118 +1918,15 @@ report (including its newline) is hard-limited to 1 MiB. It validates
 the placement, storage-identity, and lifecycle relationships without exposing
 operation or lifecycle IDs, callback URLs, tokens, secrets, payloads, tenant
 data, or raw row values. Exit status is zero only for
-`pristine_v0_13` (the preparation commit did not become visible) or
-`prepared_current` (one complete current authority is visible).
-`mixed_or_incomplete` and `corrupt` reports are emitted but exit nonzero; keep
+`prepared_current` (one complete current authority is visible). A file still
+in the v0.13 layout is `mixed_or_incomplete`: this line does not read that
+layout. `mixed_or_incomplete` and `corrupt` reports are emitted but exit nonzero; keep
 the daemon stopped and preserve both files for investigation. Missing files,
 permission failures, a live-writer lock, or a path/inode change are
 environmental errors and do not become a misleading schema verdict.
 `-classify` is local read-only inspection and rejects an explicitly supplied
 `-timeout`; supervise blocking filesystem I/O externally. If cancellation is
 observed before reporting, the command emits no stale safe report.
-
-A successful commit
-is synced and physically checked on the open handle, then closed, reopened
-read-only, and physically and semantically reverified before
-`PREPARED_FOR_CUTOVER`; any failure
-after the definite commit is `PREPARED:`. Do not mistake blocking storage work
-for a safely canceled operation:
-
-The exact `-attest-drained` statement is mandatory. Current backends do not
-expose an administrative generation/epoch that could let this tool remotely
-fence delayed work, so this is an operator-established causal boundary, not a
-claim that point-in-time inventory proves quiescence. After the proof is
-collected, the preparer mints a short-lived opaque capability bound to its exact
-exclusive session and proof cancellation scope, provider UUID, canonical live database path, topology and
-storage/inventory digest, height-pinned chain membership, and canonical backup
-destination. It expires no later than `-proof-timeout`. The target and expiry are
-rechecked before backup, immediately before mutation, and inside the bbolt write
-transaction; changing any bound fact or allowing the capability to expire leaves
-the published backup intact and refuses the migration.
-The capability is consumed immediately before exact-backup creation. It also
-binds the backup parent's physical identity, so renaming, unmounting, or
-recreating that directory cannot redirect publication after remote evidence was
-collected. Copies share the same one-shot state. Any backup or later failure
-therefore requires a new complete proof, drain attestation, capability, and
-no-overwrite backup path; only failures before that admission boundary may
-reuse the still-live proof.
-
-1. Every surviving backend-reported lease has exactly one unambiguous confirmed
-   placement row, and every confirmed placement intended to survive is present
-   in the backend inventory.
-2. Each row names the exact backend that reported the lease and is still a
-   revision-zero v0.13.0 record. A missing row, backend mismatch, attempt,
-   conflict, malformed record, or already-revisioned record is not eligible for
-   automatic legacy adoption. The revision-epoch check is global: one
-   nonzero-revision row, or one `{`-prefixed row whose revision header cannot be
-   decoded, invalidates the first-open provenance proof for every owner in the
-   file, not just that lease. Other malformed revision-zero rows remain
-   lease-local but are still ineligible themselves.
-3. Every placement or backend-inventory survivor—including a retention-only
-   lease—appears in the pinned all-state chain snapshot for the exact configured
-   provider. Each provision inventory preserves its backend-reported provider
-   UUID; every non-empty reported value must also equal the configured provider.
-   Empty provider values remain valid evidence for old v0.13 backend records,
-   but cannot substitute for chain membership. For every live provision, the
-   complete backend-reported `Items` must also equal the pinned chain workload
-   in SKU, quantity, and normalized service name. Item order is not authority;
-   a single historical unnamed service normalizes to `app`. A nonempty observed
-   effective custom domain must equal the chain value, while an empty observed
-   domain may represent v0.13's documented DNS-readiness deferral. This exact
-   quantity check is what detects a locally dense but truncated Docker cohort;
-   terminal chain-only history remains membership evidence and is not forced
-   through current live-workload quantity/service validation.
-4. Both `placement_lifecycle_capabilities` and `placement_metadata` are absent.
-   Their joint first creation, combined with the absence of any revisioned row
-   or JSON-object-shaped row whose revision header cannot be decoded, is the
-   one-time provenance proof that permits Fred to adopt revision-zero owners as
-   ID-empty legacy bindings before assigning revisions.
-
-Abort the cutover on any discrepancy. If either new bucket already exists, any
-placement row is revisioned, or any JSON-object-shaped row has an undecodable
-revision header, the file has already crossed (or cannot prove it has not
-crossed) the first-open boundary; neither preparation nor upgraded startup will
-backfill missing bindings. Stop and restore the known-good v0.13 snapshot, then
-repeat the preflight. Do not attempt
-to repair coverage from passive inventory or proceed with an empty replacement
-database.
-
-Only exit status zero together with the exact `PREPARED_FOR_CUTOVER:` verdict
-from `-prepare` authorizes the provider cutover. Preparation
-ends in-place old-binary rollback: reverting to v0.13 requires restoring the
-emitted backup, and that backup must never be restored after upgraded side
-effects begin. Normal upgraded startup opens only an existing fully prepared
-database and performs no schema/bootstrap write.
-
-`-prepare` also reports its outcome for automation. The last stdout line is
-`{"outcome":"<name>"}` (after the verdict, in the same write, on success), and the
-exit status names the same outcome:
-
-| Exit | `outcome` | Meaning | Next step |
-|---|---|---|---|
-| 0 | `prepared` | Prepared and every postcondition verified | Cut over |
-| 10 | `not_mutated` | Neither the database nor the backup path changed | Rerun the read-only preflight, then `-prepare` |
-| 11 | `backup_published` | The exact backup exists; no preparation committed | Keep the backup; rerun with a new `-backup` path |
-| 12 | `outcome_unknown` | The commit returned an error | Keep providerd stopped; `placement-repair -classify` |
-| 13 | `prepared_unverified` | Committed, but a later sync, close, verification, or report failed | Keep providerd stopped; `placement-repair -classify` |
-
-Once `-prepare` is accepted, every failure uses this table, including a missing
-`-config` or `-backup`, a wrong `-attest-drained`, and a configuration that
-fails to load (all `not_mutated`). Status 1 means the command line was rejected
-first (an unknown flag, a bad flag value, or a positional argument), or the run
-did not use `-prepare`. A failure before the preparation capability is consumed
-writes nothing, so it is always `not_mutated`; a disagreement between the
-command's durable status and the preparer's error classes resolves toward the
-more severe outcome.
-
-`PREPARED_FOR_CUTOVER` is the final verdict line and the complete verdict is issued in one write after
-the prepared database closes. If the command instead exits with a `PREPARED:`
-error, the migration transaction already succeeded before a later sync, close,
-or verdict-reporting failure. Do not blindly rerun `-prepare`, do not infer that
-the v0.13 rows remain, and do not start `providerd`. Immediately run
-`placement-repair -config /etc/fred/config.yaml -classify` against the stopped file,
-preserve both it and the mandatory backup, and resolve storage health and the
-actual durable state before choosing forward progress or a safe restore.
 
 After preparation, replace v0.13.0 and start exactly one new providerd. Do not
 run the two providerd versions concurrently. Existing stack-form v0.13 tenant
@@ -2611,9 +2426,9 @@ an interrupted earlier development build, but that compatibility reader is not
 available to a live store. Placement and lifecycle-capability rows likewise
 carry explicit current schemas. Runtime Open and health checks reject raw or
 versionless placement rows, case aliases, duplicate or unknown fields, future
-schemas, trailing values, and malformed lifecycle capabilities. Only the
-stopped v0.13 preparation path accepts the historical raw/backend-object
-placement grammar. A structurally current placement with contradictory
+schemas, trailing values, and malformed lifecycle capabilities. Nothing on
+this line accepts the historical raw/backend-object placement grammar; the 0.14
+line's stopped preparation converted it. A structurally current placement with contradictory
 cross-field authority remains per-lease unusable, fail-closed evidence rather
 than being dropped during cleanup. A confirmed revisioned placement with a
 missing capability is isolated the same way and passive inventory cannot mint a
@@ -2705,8 +2520,9 @@ docker run -d --name providerd \
 keyring mount is writable because first-boot sub-signer derivation writes to
 it. Set `placement_store_db_path` (for example `/var/lib/fred/placements.db`)
 inside the mounted data directory; providerd will not start without it, and the
-database must first be prepared or initialized with `placement-preflight`,
-which the image also contains (`--entrypoint /placement-preflight`). Put any
+database must first be initialized with `placement-preflight -initialize-fresh`
+(a provider that has never run) or carried over from 0.14. The image also
+contains that tool (`--entrypoint /placement-preflight`). Put any
 configured `token_tracker_db_path` or `payload_store_db_path` there too; the
 providerd image does not declare a default data volume. The image runs as UID
 65532, which must be able to read the keyring and write the data directory.

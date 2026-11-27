@@ -2557,7 +2557,7 @@ or hard-linked—stop and preserve both database paths. A
 `BACKUP PUBLISHED` means the destination inode crossed the atomic no-overwrite
 publication boundary and no mutation committed; a later backup verification
 may have failed, so inspect it read-only before treating it as a rollback
-image. `PREPARED:`/`COMMITTED:` means mutation committed before a later
+image. `COMMITTED:` means mutation committed before a later
 verification failed; `INITIALIZED:`, from `placement-preflight -initialize-fresh`,
 means the new database was published before a later check failed, so do not
 rerun the initializer; `OUTCOME UNKNOWN` means the commit result cannot be

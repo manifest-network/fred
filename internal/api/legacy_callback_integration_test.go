@@ -13,7 +13,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/chain/chaintest"
@@ -24,64 +23,26 @@ import (
 	"github.com/manifest-network/fred/internal/testutil"
 )
 
-func legacyMaintenanceLifecycleStore(
+// adoptedLeaseStore returns a store in which leaseUUID is owned by backendName
+// under the tokenless lifecycle generation, as a lease adopted from v0.13 is.
+// The backend's inventory reports that generation, and the store is then
+// opened twice more so the authority is read back from disk, not from the
+// process that recorded it.
+func adoptedLeaseStore(
 	t *testing.T,
 	leaseUUID, backendName string,
 ) *placement.Store {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte("placements"))
-		if err != nil {
-			return err
-		}
-		value, err := json.Marshal(struct {
-			Backend string    `json:"backend"`
-			SetAt   time.Time `json:"set_at"`
-		}{
-			Backend: backendName,
-			SetAt:   time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC),
-		})
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(leaseUUID), value)
-	}))
-	require.NoError(t, db.Close())
-
-	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
-	require.NoError(t, err)
-	chainProof, err := placementstore.LegacyUpgradeChainProof(
-		placementstore.ProviderUUID, leaseUUID,
-	)
-	require.NoError(t, err)
-	backupTarget, err := placement.BindExactBackupTarget(dbPath + ".v013.backup")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
-	inventories := map[string]placement.BackendInventory{
-		backendName: {
-			StorageIdentity:        testAPIBackendStorageID(backendName),
-			Provisions:             []string{leaseUUID},
-			ProvisionProviderUUIDs: map[string]string{leaseUUID: ""},
-			ProvisionItems: map[string][]backend.LeaseItem{
-				leaseUUID: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+	seedAPIPlacementOwners(t, dbPath, map[string][]backend.ProvisionInfo{
+		backendName: {{
+			LeaseUUID: leaseUUID, BackendName: backendName,
+			Status: backend.ProvisionStatusReady,
+			LifecycleGeneration: &backend.LifecycleGenerationObservation{
+				Kind: backend.LifecycleGenerationLegacy,
 			},
-			Retentions: []string{},
-		},
-	}
-	capability, err := preparer.AuthorizePreparation(
-		t.Context(), placementstore.ProviderUUID, []string{backendName}, inventories,
-		chainProof, backupTarget, placement.LegacyPreparationDrainAttestation,
-	)
-	require.NoError(t, err)
-	_, err = preparer.PrepareContext(
-		t.Context(), placementstore.ProviderUUID, []string{backendName}, inventories,
-		chainProof, capability,
-	)
-	require.NoError(t, err)
-	require.NoError(t, preparer.Close())
+		}},
+	})
 	routes, err := placement.NewCallbackRouteFactory("https://fred.example.test")
 	require.NoError(t, err)
 	store, err := placement.OpenStore(
@@ -90,7 +51,7 @@ func legacyMaintenanceLifecycleStore(
 	require.NoError(t, err)
 	require.Equal(t, placement.LifecycleVerdictLegacy,
 		store.CurrentLifecycle(leaseUUID).Verdict(),
-		"the prepared v0.13 authority must survive its first online open",
+		"the tokenless authority must survive a restart",
 	)
 	require.NoError(t, store.Close())
 	store, err = placement.OpenStore(
@@ -101,23 +62,22 @@ func legacyMaintenanceLifecycleStore(
 	return store
 }
 
-// TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager composes the real
-// first-upgrade boundary. legacyMaintenanceLifecycleStore writes the v0.13
-// revision-zero JSON directly to disk, runs explicit offline preparation, and
-// reopens the resulting authority through two online process generations. The
-// migrated capability must authorize the old tokenless callback URL through
-// HMAC HTTP ingress and Manager's synchronous callback application, reject a
-// stale typed identity, and retire terminal authority exactly once.
-func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
+// TestAdoptedLease_LegacyCallbackCrossesSignedHTTPAndManager follows the
+// callbacks of a lease adopted from v0.13. Its backend still holds the bare
+// callback URL it was given before the upgrade, so every callback arrives with
+// no operation_id or lifecycle_id. The tokenless capability must authorize that
+// URL through HMAC HTTP ingress and Manager's synchronous callback application,
+// reject a stale typed identity, and retire terminal authority exactly once.
+func TestAdoptedLease_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	const backendName = "backend-a"
 	leaseUUID := testutil.ValidUUID1
 	providerUUID := placementstore.ProviderUUID
 	proofVerifier, proofConsumer := hmacauth.NewCallbackProofBoundary()
 
-	placements := legacyMaintenanceLifecycleStore(t, leaseUUID, backendName)
+	placements := adoptedLeaseStore(t, leaseUUID, backendName)
 	require.Equal(t, placement.LifecycleVerdictLegacy,
 		placements.CurrentLifecycle(leaseUUID).Verdict(),
-		"the first open must adopt the revision-zero v0.13 placement",
+		"the adopted lease must hold tokenless lifecycle authority",
 	)
 
 	backendNode := backend.NewMockBackend(backend.MockBackendConfig{Name: backendName})
@@ -202,7 +162,7 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 			assert.Equal(t, status, event.Status)
 			return event
 		case <-time.After(time.Second):
-			t.Fatalf("timed out waiting for migrated legacy %s event", status)
+			t.Fatalf("timed out waiting for adopted lease %s event", status)
 			return backend.LeaseStatusEvent{}
 		}
 	}
@@ -219,7 +179,7 @@ func TestV013Upgrade_LegacyCallbackCrossesSignedHTTPAndManager(t *testing.T) {
 	// authority, even when its signature and storage identity are otherwise valid.
 	send(testCallbackURI+"?lifecycle_id=123e4567-e89b-42d3-a456-426614174099",
 		backend.CallbackPayload{Status: backend.CallbackStatusSuccess})
-	requireNoEvent("stale typed callback against migrated tokenless authority")
+	requireNoEvent("stale typed callback against tokenless authority")
 	require.Equal(t, placement.LifecycleVerdictLegacy,
 		placements.CurrentLifecycle(leaseUUID).Verdict())
 

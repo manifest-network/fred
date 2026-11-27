@@ -47,7 +47,7 @@ func TestInspectReleasesIsOfflineReadOnlyAndReportsHistoricalRows(t *testing.T) 
 	after, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, before, after)
-	for _, incompatible := range []string{"-prepare", "-initialize-fresh", "-config=unused", "-backup=unused"} {
+	for _, incompatible := range []string{"-initialize-fresh", "-config=unused", "-proof-timeout=1s"} {
 		err = runWithDependencies(context.Background(), []string{"-inspect-releases", path, incompatible}, &stdout, &stderr, commandDependencies{})
 		require.ErrorContains(t, err, "cannot be combined")
 	}

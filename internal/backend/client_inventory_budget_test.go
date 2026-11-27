@@ -99,3 +99,20 @@ func TestInventoryWalkDeadlineIncludesSuccessfulPages(t *testing.T) {
 		require.Equal(t, 100*time.Millisecond, time.Since(started))
 	})
 }
+
+// A page that arrives after the caller gave up is not accepted: the walk ends
+// with the caller's cancellation and returns no prefix.
+func TestInventoryWalkRejectsAPageThatArrivesAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	items, identity, err := walkKeysetPages(ctx, "cancelled inventory", false, time.Minute, func(context.Context, string) (inventoryPage[struct{}], error) {
+		calls++
+		cancel()
+		return inventoryPage[struct{}]{items: []struct{}{{}}, next: "000000001", bodyBytes: 40}, nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "cancelled inventory:")
+	require.Nil(t, items)
+	require.Equal(t, backendidentity.ID{}, identity)
+	require.Equal(t, 1, calls)
+}

@@ -32,51 +32,6 @@ func (emptyChainSnapshot) BlockHeight() int64      { return 1 }
 func (emptyChainSnapshot) TotalLeases() int        { return 0 }
 func (emptyChainSnapshot) BlockingLeaseCount() int { return 0 }
 
-type legacyChainSnapshot struct {
-	providerUUID string
-	leaseUUIDs   []string
-	leaseItems   map[string][]backend.LeaseItem
-}
-
-func (snapshot legacyChainSnapshot) Valid() bool             { return true }
-func (snapshot legacyChainSnapshot) ProviderUUID() string    { return snapshot.providerUUID }
-func (snapshot legacyChainSnapshot) BlockHeight() int64      { return 1 }
-func (snapshot legacyChainSnapshot) TotalLeases() int        { return len(snapshot.leaseUUIDs) }
-func (snapshot legacyChainSnapshot) BlockingLeaseCount() int { return 0 }
-func (snapshot legacyChainSnapshot) LeaseUUIDs() []string {
-	leaseUUIDs := make([]string, len(snapshot.leaseUUIDs))
-	copy(leaseUUIDs, snapshot.leaseUUIDs)
-	return leaseUUIDs
-}
-func (snapshot legacyChainSnapshot) LeaseItems() map[string][]backend.LeaseItem {
-	items := make(map[string][]backend.LeaseItem, len(snapshot.leaseItems))
-	for leaseUUID, leaseItems := range snapshot.leaseItems {
-		items[leaseUUID] = append([]backend.LeaseItem(nil), leaseItems...)
-	}
-	return items
-}
-
-// LegacyUpgradeChainProof constructs exact immutable provider-membership
-// evidence for tests that deliberately exercise the v0.13 migration boundary.
-func LegacyUpgradeChainProof(
-	providerUUID string,
-	leaseUUIDs ...string,
-) (placement.LegacyUpgradeChainProof, error) {
-	observed := make([]string, len(leaseUUIDs))
-	copy(observed, leaseUUIDs)
-	items := make(map[string][]backend.LeaseItem, len(observed))
-	for _, leaseUUID := range observed {
-		items[leaseUUID] = []backend.LeaseItem{{
-			SKU: "sku-test", Quantity: 1, ServiceName: "app",
-		}}
-	}
-	return placement.NewLegacyUpgradeChainProof(legacyChainSnapshot{
-		providerUUID: providerUUID,
-		leaseUUIDs:   observed,
-		leaseItems:   items,
-	})
-}
-
 // NewStore explicitly initializes an absent test database through the same
 // proof-backed API used by the offline command, or reopens an existing fixture.
 // Its removable seed topology carries complete empty-inventory evidence; tests
@@ -126,7 +81,6 @@ func NewStoreForProvider(
 				StorageIdentity:        storageID,
 				Provisions:             []string{},
 				ProvisionProviderUUIDs: map[string]string{},
-				ProvisionItems:         map[string][]backend.LeaseItem{},
 				Retentions:             []string{},
 			},
 		},

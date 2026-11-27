@@ -3,7 +3,6 @@ package placement
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,67 +45,56 @@ func TestNewAuthorityExpectation_IsCanonicalDetachedAndRequired(t *testing.T) {
 	require.ErrorContains(t, err, "expectation is invalid")
 }
 
-func TestInspectAuthorityFile_AmbiguousPreparationOutcomes(t *testing.T) {
-	t.Run("unchanged injected commit is pristine v0.13", func(t *testing.T) {
-		path := writeAuthorityInspectionLegacyDB(t)
-		before, err := os.ReadFile(path)
-		require.NoError(t, err)
+// A file still in the v0.13 layout is not an authority this release can read.
+// The classifier reports it as incomplete and leaves it byte-for-byte alone.
+func TestInspectAuthorityFile_V013LayoutIsNotACurrentAuthority(t *testing.T) {
+	path := writeAuthorityInspectionLegacyDB(t)
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
 
-		commitErr := errors.New("synthetic commit outcome error before mutation")
-		assert.Error(t, commitErr)
-		after, err := os.ReadFile(path)
-		require.NoError(t, err)
-		require.Equal(t, before, after)
+	report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
+	require.NoError(t, err)
+	assert.Equal(t, AuthorityMixedOrIncomplete, report.Classification)
+	assert.False(t, report.SafeForCutover())
+	assert.Contains(t, authorityDiagnosticCodes(report), "mixed_bucket_set")
+	assert.Equal(t, []string{"placements"}, report.TopLevelBuckets)
+	assert.Empty(t, report.Rows)
+	assert.True(t, report.PhysicalCheckCompleted)
+	assert.True(t, report.PhysicalCheckValid)
 
-		report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
-		require.NoError(t, err)
-		assert.Equal(t, AuthorityPristineV013, report.Classification)
-		assert.True(t, report.SafeForCutover())
-		assert.Equal(t, 1, report.Counts.PlacementRows)
-		assert.Equal(t, 1, report.Counts.LegacyPlacementRows)
-		assert.True(t, report.PhysicalCheckCompleted)
-		assert.True(t, report.PhysicalCheckValid)
-		assert.Equal(t, []string{"placements"}, report.TopLevelBuckets)
-		require.Len(t, report.Rows, 1)
-		assert.Equal(t, AuthorityRowFact{
-			LeaseUUID: authorityInspectionLease, State: "confirmed",
-			Backend: "backend-a", LifecycleVerdict: "not_present_v0_13",
-		}, report.Rows[0])
-		assert.Empty(t, report.Diagnostics)
-	})
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
 
-	t.Run("committed then synthetic outcome error is prepared current", func(t *testing.T) {
-		path := writeAuthorityInspectionLegacyDB(t)
-		db, err := bolt.Open(path, 0o600, nil)
-		require.NoError(t, err)
-		require.NoError(t, db.Update(prepareAuthorityInspectionTransaction))
-		require.NoError(t, db.Close())
-		commitErr := errors.New("synthetic error returned after durable commit")
-		assert.Error(t, commitErr)
-
-		report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
-		require.NoError(t, err)
-		assert.Equal(t, AuthorityPreparedCurrent, report.Classification)
-		assert.True(t, report.SafeForCutover())
-		assert.Equal(t, uint64(topologyMetadataSchema), report.MetadataSchema)
-		assert.Equal(t, 1, report.Counts.RevisionedPlacementRows)
-		assert.Equal(t, 1, report.Counts.LifecycleRows)
-		assert.Equal(t, []string{
-			"placement_lifecycle_capabilities", "placement_metadata", "placements",
-		}, report.TopLevelBuckets)
-		assert.Equal(t, uint64(1), report.TopologyID)
-		assert.Zero(t, report.BaselineTopologyID)
-		assert.Zero(t, report.InventoryTopologyID)
-		assert.Equal(t, []AuthorityStorageBinding{{
-			Backend: "backend-a", StorageID: authorityInspectionStorage,
-		}}, report.StorageBindings)
-		require.Len(t, report.Rows, 1)
-		assert.Equal(t, uint64(1), report.Rows[0].Revision)
-		assert.Equal(t, "confirmed", report.Rows[0].State)
-		assert.Equal(t, "backend-a", report.Rows[0].Backend)
-		assert.Equal(t, "legacy_active", report.Rows[0].LifecycleVerdict)
-		assert.Empty(t, report.Diagnostics)
-	})
+func TestInspectAuthorityFile_AdoptedLeaseIsPreparedCurrent(t *testing.T) {
+	path := writeAuthorityInspectionLegacyDB(t)
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(prepareAuthorityInspectionTransaction))
+	require.NoError(t, db.Close())
+	report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
+	require.NoError(t, err)
+	assert.Equal(t, AuthorityPreparedCurrent, report.Classification)
+	assert.True(t, report.SafeForCutover())
+	assert.Equal(t, uint64(topologyMetadataSchema), report.MetadataSchema)
+	assert.Equal(t, 1, report.Counts.RevisionedPlacementRows)
+	assert.Equal(t, 1, report.Counts.LifecycleRows)
+	assert.Equal(t, []string{
+		"placement_lifecycle_capabilities", "placement_metadata", "placements",
+	}, report.TopLevelBuckets)
+	assert.Equal(t, uint64(1), report.TopologyID)
+	assert.Zero(t, report.BaselineTopologyID)
+	assert.Zero(t, report.InventoryTopologyID)
+	assert.Equal(t, []AuthorityStorageBinding{{
+		Backend: "backend-a", StorageID: authorityInspectionStorage,
+	}}, report.StorageBindings)
+	require.Len(t, report.Rows, 1)
+	assert.Equal(t, uint64(1), report.Rows[0].Revision)
+	assert.Equal(t, "confirmed", report.Rows[0].State)
+	assert.Equal(t, "backend-a", report.Rows[0].Backend)
+	assert.Equal(t, "legacy_active", report.Rows[0].LifecycleVerdict)
+	assert.Empty(t, report.Diagnostics)
 }
 
 func TestInspectAuthorityFile_UnsafeClassifications(t *testing.T) {
@@ -243,19 +231,6 @@ func TestInspectAuthorityFile_UnsafeClassifications(t *testing.T) {
 			wantCode: "undecodable_lifecycle_row",
 		},
 		{
-			name: "oversized legacy placement value",
-			mutate: func(t *testing.T, path string) {
-				mutateAuthorityInspectionDB(t, path, func(tx *bolt.Tx) error {
-					return tx.Bucket(bucketName).Put(
-						[]byte(authorityInspectionLease),
-						bytes.Repeat([]byte("x"), maxAuthorityRowValueBytes+1),
-					)
-				})
-			},
-			want:     AuthorityCorrupt,
-			wantCode: "oversized_legacy_placement_row",
-		},
-		{
 			name: "oversized current placement value",
 			mutate: func(t *testing.T, path string) {
 				prepareAuthorityInspectionDB(t, path)
@@ -351,8 +326,12 @@ func TestInspectAuthorityFile_MissingPathIsEnvironmentalError(t *testing.T) {
 }
 
 func TestInspectAuthorityFile_PathReplacementCanNeverReturnSafe(t *testing.T) {
+	// Both files are complete current authorities, so only the replacement
+	// itself can make the report unsafe.
 	path := writeAuthorityInspectionLegacyDB(t)
+	prepareAuthorityInspectionDB(t, path)
 	replacement := writeAuthorityInspectionLegacyDB(t)
+	prepareAuthorityInspectionDB(t, replacement)
 	displaced := filepath.Join(filepath.Dir(path), "displaced.db")
 
 	authority, err := bindOfflinePlacementAuthority(path)
@@ -577,10 +556,11 @@ func TestInspectAuthorityFile_RowFactsAreDeterministicAndBounded(t *testing.T) {
 		}
 		return nil
 	})
+	prepareAuthorityInspectionDB(t, path)
 
 	report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
 	require.NoError(t, err)
-	assert.Equal(t, AuthorityPristineV013, report.Classification)
+	assert.Equal(t, AuthorityPreparedCurrent, report.Classification)
 	assert.Len(t, report.Rows, maxAuthorityRows)
 	assert.Equal(t, 6, report.RowsOmitted)
 	assert.True(t, slices.IsSortedFunc(report.Rows, func(left, right AuthorityRowFact) int {
@@ -700,6 +680,11 @@ func TestInspectAuthorityFile_LongCanonicalBackendNameIsSafeButOmitted(t *testin
 			[]byte(authorityInspectionLease), []byte(longName),
 		)
 	})
+	mutateAuthorityInspectionDB(t, path, func(tx *bolt.Tx) error {
+		return prepareV013Placements(tx, authorityInspectionProvider, map[string]string{
+			longName: authorityInspectionStorage,
+		})
+	})
 	expectation, err := NewAuthorityExpectation(
 		authorityInspectionProvider, []string{longName},
 	)
@@ -707,7 +692,7 @@ func TestInspectAuthorityFile_LongCanonicalBackendNameIsSafeButOmitted(t *testin
 
 	report, err := InspectAuthorityFile(path, expectation)
 	require.NoError(t, err)
-	assert.Equal(t, AuthorityPristineV013, report.Classification)
+	assert.Equal(t, AuthorityPreparedCurrent, report.Classification)
 	assert.Equal(t, 1, report.ExpectedBackendTopologyOmitted)
 	require.Len(t, report.Rows, 1)
 	assert.Empty(t, report.Rows[0].Backend)
@@ -739,32 +724,9 @@ func prepareAuthorityInspectionDB(t *testing.T, path string) {
 }
 
 func prepareAuthorityInspectionTransaction(tx *bolt.Tx) error {
-	epoch, err := captureLifecycleInitializationEpoch(tx)
-	if err != nil {
-		return err
-	}
-	if err := initializeMetadata(tx); err != nil {
-		return err
-	}
-	fingerprint, err := topologyFingerprint([]string{"backend-a"})
-	if err != nil {
-		return err
-	}
-	if err := putTopologyMetadata(tx, topologyMetadata{
-		Schema:                 topologyMetadataSchema,
-		ProviderUUID:           authorityInspectionProvider,
-		Topology:               []string{"backend-a"},
-		TopologyFingerprint:    fingerprint,
-		KnownBackends:          []string{"backend-a"},
-		KnownBackendStorageIDs: map[string]string{"backend-a": authorityInspectionStorage},
-		TopologyID:             1,
-	}); err != nil {
-		return err
-	}
-	if err := initializeLifecycleCapabilities(tx, epoch); err != nil {
-		return err
-	}
-	return migrateLegacyConfirmedRevisions(tx)
+	return prepareV013Placements(tx, authorityInspectionProvider, map[string]string{
+		"backend-a": authorityInspectionStorage,
+	})
 }
 
 func mutateAuthorityInspectionDB(
@@ -785,4 +747,21 @@ func authorityDiagnosticCodes(report AuthorityReport) []string {
 		codes = append(codes, diagnostic.Code)
 	}
 	return codes
+}
+
+// The offline tools bind the authority file by an absolute, clean path before
+// they open it: a relative or unclean path names a file that depends on the
+// working directory.
+func TestOfflinePlacementToolsRejectRelativeAuthorityPaths(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"placements.db", "/var/lib/fred/../fred/placements.db"} {
+		report, err := InspectAuthorityFile(path, authorityInspectionExpectation(t))
+		require.ErrorContains(t, err, "absolute and clean", path)
+		require.Equal(t, AuthorityReport{}, report, path)
+
+		repair, err := OpenAttemptRepair(path, authorityInspectionProvider)
+		require.ErrorContains(t, err, "absolute and clean", path)
+		require.Nil(t, repair, path)
+	}
 }

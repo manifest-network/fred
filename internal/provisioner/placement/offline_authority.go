@@ -147,3 +147,28 @@ func (authority *offlinePlacementAuthority) openBolt(
 	}
 	return db, nil
 }
+
+func requireAbsoluteCleanPlacementDBPath(path string) error {
+	if path == "" {
+		return errors.New("placement db path is required")
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("placement db path must be absolute and clean: %q", path)
+	}
+	return nil
+}
+
+func canonicalNewPlacementPath(path string) (string, error) {
+	if path == "" || filepath.Clean(path) != path {
+		return "", errors.New("path must be non-empty and clean")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedParent, filepath.Base(absolute)), nil
+}

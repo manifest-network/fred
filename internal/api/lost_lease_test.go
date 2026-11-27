@@ -13,7 +13,6 @@ import (
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	bolt "go.etcd.io/bbolt"
 
 	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/provisioner/placement"
@@ -24,6 +23,7 @@ import (
 const (
 	lostLeaseBackend     = "backend-a"
 	lostLeaseSurvivor    = "backend-b"
+	lostLeaseLifecycleID = "123e4567-e89b-42d3-a456-426614174000"
 	lostLeaseBodyPattern = `{"error":"the backend storage holding this lease was irrecoverably lost","code":410,"reason":"backend_storage_lost"}`
 )
 
@@ -33,60 +33,17 @@ const (
 func lostLeaseStore(t *testing.T, leaseUUID string) *placement.Store {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "placements.db")
-	db, err := bolt.Open(dbPath, 0o600, nil)
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte("placements"))
-		if err != nil {
-			return err
-		}
-		value, err := json.Marshal(struct {
-			Backend string    `json:"backend"`
-			SetAt   time.Time `json:"set_at"`
-		}{Backend: lostLeaseBackend, SetAt: time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)})
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(leaseUUID), value)
-	}))
-	require.NoError(t, db.Close())
-
-	preparer, err := placement.OpenLegacyUpgradePreparer(dbPath)
-	require.NoError(t, err)
-	chainProof, err := placementstore.LegacyUpgradeChainProof(placementstore.ProviderUUID, leaseUUID)
-	require.NoError(t, err)
-	backupTarget, err := placement.BindExactBackupTarget(dbPath + ".v013.backup")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, backupTarget.Close()) })
-	backends := []string{lostLeaseBackend, lostLeaseSurvivor}
-	inventories := map[string]placement.BackendInventory{
-		lostLeaseBackend: {
-			StorageIdentity:        testAPIBackendStorageID(lostLeaseBackend),
-			Provisions:             []string{leaseUUID},
-			ProvisionProviderUUIDs: map[string]string{leaseUUID: ""},
-			ProvisionItems: map[string][]backend.LeaseItem{
-				leaseUUID: {{SKU: "sku-test", Quantity: 1, ServiceName: "app"}},
+	seedAPIPlacementOwners(t, dbPath, map[string][]backend.ProvisionInfo{
+		lostLeaseBackend: {{
+			LeaseUUID: leaseUUID, BackendName: lostLeaseBackend,
+			Status: backend.ProvisionStatusReady,
+			LifecycleGeneration: &backend.LifecycleGenerationObservation{
+				Kind: backend.LifecycleGenerationTyped,
+				ID:   lostLeaseLifecycleID,
 			},
-			Retentions: []string{},
-		},
-		lostLeaseSurvivor: {
-			StorageIdentity:        testAPIBackendStorageID(lostLeaseSurvivor),
-			Provisions:             []string{},
-			ProvisionProviderUUIDs: map[string]string{},
-			ProvisionItems:         map[string][]backend.LeaseItem{},
-			Retentions:             []string{},
-		},
-	}
-	capability, err := preparer.AuthorizePreparation(
-		t.Context(), placementstore.ProviderUUID, backends, inventories,
-		chainProof, backupTarget, placement.LegacyPreparationDrainAttestation,
-	)
-	require.NoError(t, err)
-	_, err = preparer.PrepareContext(
-		t.Context(), placementstore.ProviderUUID, backends, inventories, chainProof, capability,
-	)
-	require.NoError(t, err)
-	require.NoError(t, preparer.Close())
+		}},
+		lostLeaseSurvivor: {},
+	})
 
 	repair, err := placement.OpenAttemptRepair(dbPath, placementstore.ProviderUUID)
 	require.NoError(t, err)

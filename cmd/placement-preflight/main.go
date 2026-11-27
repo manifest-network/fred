@@ -1,12 +1,15 @@
-// Command placement-preflight verifies that a stopped v0.13 placement database
-// is eligible for Fred's one-time lifecycle and storage-identity migration. It
-// binds complete backend evidence to a height-pinned signer-free chain snapshot.
-// Its default mode is read-only. Explicit --prepare mode holds an exclusive
-// lock, publishes a required backup, then seals the verified database atomically.
-// Explicit --initialize-fresh mode instead proves that the provider has no chain
-// lease history and every backend reports empty inventories, and takes the
-// operator's attestation that the provider and every backend are quiesced,
-// before publishing a new placement authority.
+// Command placement-preflight creates the placement database of a provider
+// that has never run. Explicit --initialize-fresh mode proves that the provider
+// has no chain lease history and that every backend reports empty inventories,
+// takes the operator's attestation that the provider and every backend are
+// quiesced, and then publishes a new placement authority. It binds complete
+// backend evidence to a height-pinned signer-free chain snapshot.
+// --print-fresh-confirmation prints the attestation that mode expects and
+// touches nothing. --inspect-releases is an offline, read-only scan of a
+// stopped backend's releases.db.
+//
+// It does not convert a v0.13 placement database. The 0.14 line's
+// placement-preflight does; a provider upgrades through the final 0.14 release.
 package main
 
 import (
@@ -26,7 +29,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/manifest-network/fred/internal/backend"
 	"github.com/manifest-network/fred/internal/backend/shared"
 	"github.com/manifest-network/fred/internal/chain"
 	"github.com/manifest-network/fred/internal/config"
@@ -37,218 +39,57 @@ import (
 const (
 	defaultProofTimeout       = 2 * time.Minute
 	insecureChainConfirmation = "I ACCEPT UNAUTHENTICATED CHAIN EVIDENCE FOR LOCAL DEVELOPMENT"
-	inspectSuccessVerdict     = "READY_TO_PREPARE"
-	prepareSuccessVerdict     = "PREPARED_FOR_CUTOVER"
 	freshSuccessVerdict       = "INITIALIZED_FOR_CUTOVER"
 )
 
 var version = "dev"
 
-type durablePreflightStatus uint8
+// errPreflightInitialized marks every failure that happens after the fresh
+// placement database was published.
+var errPreflightInitialized = errors.New("placement preflight initialization published")
 
-const (
-	preflightNotMutated durablePreflightStatus = iota
-	preflightPreparationOutcomeUnknown
-	preflightPrepared
-	preflightInitialized
-)
-
-var (
-	errPreflightPrepared       = errors.New("placement preflight preparation committed")
-	errPreflightInitialized    = errors.New("placement preflight initialization published")
-	errPreflightOutcomeUnknown = errors.New(
-		"placement preflight preparation outcome is unknown",
-	)
-)
-
-func (status durablePreflightStatus) label() string {
-	switch status {
-	case preflightPreparationOutcomeUnknown:
-		return "OUTCOME UNKNOWN"
-	case preflightPrepared:
-		return "PREPARED"
-	case preflightInitialized:
-		return "INITIALIZED"
-	default:
-		return ""
-	}
-}
-
-func (status durablePreflightStatus) sentinel() error {
-	switch status {
-	case preflightPreparationOutcomeUnknown:
-		return errPreflightOutcomeUnknown
-	case preflightPrepared:
-		return errPreflightPrepared
-	case preflightInitialized:
-		return errPreflightInitialized
-	default:
-		return nil
-	}
-}
-
+// durablePreflightFailure reports a failure after the fresh placement database
+// was published. The database exists, so the run must not be treated as rolled
+// back.
 type durablePreflightFailure struct {
-	status        durablePreflightStatus
 	stage         string
 	cause         error
 	reportingOnly bool
 }
 
 func (failure *durablePreflightFailure) Error() string {
-	if failure.status == preflightPreparationOutcomeUnknown {
-		return fmt.Sprintf(
-			"OUTCOME UNKNOWN: bbolt Commit returned an error before %s; the live placement "+
-				"authority may or may not contain the preparation. Keep providerd stopped, "+
-				"preserve both the live database and exact backup, do not retry or restore "+
-				"blindly, and run placement-repair -classify with the same providerd config "+
-				"immediately: %v",
-			failure.stage,
-			failure.cause,
-		)
-	}
 	consequence := "the durable result must be inspected and must not be treated as rolled back"
 	if failure.reportingOnly {
 		consequence = "the database was durably written and closed; only command reporting is indeterminate"
 	}
 	return fmt.Sprintf(
-		"%s: placement authority changed before %s failed; %s. Keep providerd stopped, "+
+		"INITIALIZED: placement authority changed before %s failed; %s. Keep providerd stopped, "+
 			"do not retry blindly, and run placement-repair -classify with the same "+
 			"providerd config immediately: %v",
-		failure.status.label(), failure.stage, consequence, failure.cause,
+		failure.stage, consequence, failure.cause,
 	)
 }
 
 func (failure *durablePreflightFailure) Unwrap() []error {
-	return []error{failure.status.sentinel(), failure.cause}
+	return []error{errPreflightInitialized, failure.cause}
 }
 
-func newDurablePreflightFailure(
-	status durablePreflightStatus,
-	stage string,
-	cause error,
-) error {
-	return &durablePreflightFailure{status: status, stage: stage, cause: cause}
+func newDurablePreflightFailure(stage string, cause error) error {
+	return &durablePreflightFailure{stage: stage, cause: cause}
 }
 
-func newDurablePreflightVerdictFailure(
-	status durablePreflightStatus,
-	cause error,
-) error {
+func newDurablePreflightVerdictFailure(cause error) error {
 	return &durablePreflightFailure{
-		status:        status,
 		stage:         "complete cutover verdict reporting",
 		cause:         cause,
 		reportingOnly: true,
 	}
 }
 
-// preparationOutcome is the machine-readable result of one -prepare run, for
-// callers that must choose a retry without parsing prose. The command exits
-// with its code and ends stdout with {"outcome":"<name>"}.
-type preparationOutcome uint8
-
-const (
-	// The zero value is reserved as invalid.
-	_ preparationOutcome = iota
-	// preparationPrepared: the database is prepared and every postcondition
-	// verified.
-	preparationPrepared
-	// preparationNotMutated: neither the database nor the backup path changed,
-	// so rerunning the proof and -prepare is safe.
-	preparationNotMutated
-	// preparationBackupPublished: the exact backup exists but no preparation
-	// committed; retry with a new -backup path.
-	preparationBackupPublished
-	// preparationOutcomeUnknown: the commit returned an error; classify first.
-	preparationOutcomeUnknown
-	// preparationPreparedUnverified: the preparation committed but a later
-	// verification or report failed; classify first.
-	preparationPreparedUnverified
-)
-
-func (outcome preparationOutcome) String() string {
-	switch outcome {
-	case preparationPrepared:
-		return "prepared"
-	case preparationNotMutated:
-		return "not_mutated"
-	case preparationBackupPublished:
-		return "backup_published"
-	case preparationOutcomeUnknown:
-		return "outcome_unknown"
-	case preparationPreparedUnverified:
-		return "prepared_unverified"
-	default:
-		return "invalid"
-	}
-}
-
-// exitCode leaves 1 to failures outside -prepare and to an invalid outcome.
-func (outcome preparationOutcome) exitCode() int {
-	switch outcome {
-	case preparationPrepared:
-		return 0
-	case preparationNotMutated:
-		return 10
-	case preparationBackupPublished:
-		return 11
-	case preparationOutcomeUnknown:
-		return 12
-	case preparationPreparedUnverified:
-		return 13
-	default:
-		return 1
-	}
-}
-
-func (outcome preparationOutcome) line() string {
-	return fmt.Sprintf("{\"outcome\":%q}\n", outcome.String())
-}
-
-// classifyPreparationFailure takes the durable status this command tracked
-// first and the sentinels the preparer authored at each durable step second,
-// and resolves a disagreement toward the more severe outcome. Nothing else
-// can be not_mutated: every failure after the preparation capability is
-// consumed carries one of those sentinels.
-func classifyPreparationFailure(status durablePreflightStatus, err error) preparationOutcome {
-	switch {
-	case status == preflightPreparationOutcomeUnknown,
-		errors.Is(err, errPreflightOutcomeUnknown),
-		errors.Is(err, placement.ErrLegacyPreparationOutcomeUnknown):
-		return preparationOutcomeUnknown
-	case status == preflightPrepared,
-		errors.Is(err, errPreflightPrepared),
-		errors.Is(err, placement.ErrLegacyPreparationCommitted):
-		return preparationPreparedUnverified
-	case errors.Is(err, placement.ErrExactBackupPublished):
-		return preparationBackupPublished
-	default:
-		return preparationNotMutated
-	}
-}
-
-// preparationFailure carries a failed -prepare run's outcome to main.
-type preparationFailure struct {
-	outcome preparationOutcome
-	cause   error
-}
-
-func (failure *preparationFailure) Error() string { return failure.cause.Error() }
-
-func (failure *preparationFailure) Unwrap() error { return failure.cause }
-
-func commandExitCode(err error) int {
-	var failure *preparationFailure
-	if errors.As(err, &failure) {
-		return failure.outcome.exitCode()
-	}
-	return 1
-}
-
 type inventoryClient = placementprobe.Client
 
 type providerLeaseSnapshot interface {
-	placement.ProviderLeaseMembershipSnapshot
+	placement.FreshChainSnapshot
 	BlockingLeaseUUIDs() []string
 }
 
@@ -260,57 +101,10 @@ type freshChainClient interface {
 	Close() error
 }
 
-type legacyUpgradeInspector interface {
-	CheckContext(
-		context.Context,
-		string,
-		[]string,
-		map[string]placement.BackendInventory,
-		placement.LegacyUpgradeChainProof,
-	) (placement.LegacyUpgradePreflightSummary, error)
-	Close() error
-}
-
-type legacyUpgradePreparer interface {
-	AuthorizePreparation(
-		context.Context,
-		string,
-		[]string,
-		map[string]placement.BackendInventory,
-		placement.LegacyUpgradeChainProof,
-		*placement.ExactBackupTarget,
-		string,
-	) (placement.LegacyPreparationCapability, error)
-	PrepareContext(
-		context.Context,
-		string,
-		[]string,
-		map[string]placement.BackendInventory,
-		placement.LegacyUpgradeChainProof,
-		placement.LegacyPreparationCapability,
-	) (placement.LegacyUpgradePreflightSummary, error)
-	Close() error
-}
-
-type preparedAuthorityInspector interface {
-	VerifyLegacyPreparationPostcondition(
-		string,
-		[]string,
-		map[string]placement.BackendInventory,
-		placement.LegacyUpgradePreflightSummary,
-	) error
-	Close() error
-}
-
 type commandDependencies struct {
-	loadConfig                 func(string) (*config.Config, error)
-	newInventoryClients        func(*config.Config) ([]inventoryClient, error)
-	newFreshChainClient        func(chain.ReadOnlyClientConfig) (freshChainClient, error)
-	openLegacyUpgradeInspector func(string) (legacyUpgradeInspector, error)
-	openLegacyUpgradePreparer  func(string) (legacyUpgradePreparer, error)
-	openPreparedAuthority      func(string, string) (preparedAuthorityInspector, error)
-	bindExactBackupTarget      func(string) (*placement.ExactBackupTarget, error)
-	initializeFreshStore       func(context.Context, *placement.FreshInitializationPlan) error
+	loadConfig           func(string) (*config.Config, error)
+	newFreshChainClient  func(chain.ReadOnlyClientConfig) (freshChainClient, error)
+	initializeFreshStore func(context.Context, *placement.FreshInitializationPlan) error
 }
 
 type readOnlyFreshChainClient struct{ client *chain.ReadOnlyClient }
@@ -333,7 +127,7 @@ func main() {
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		writeCommandError(os.Stderr, err)
-		os.Exit(commandExitCode(err))
+		os.Exit(1)
 	}
 }
 
@@ -363,7 +157,7 @@ func runWithDependencies(
 	stdout io.Writer,
 	stderr io.Writer,
 	dependencies commandDependencies,
-) (runErr error) {
+) error {
 	flags := flag.NewFlagSet("placement-preflight", flag.ContinueOnError)
 	// Flag parsing includes the rejected value in its automatic diagnostic.
 	// Suppress that unstructured write; main renders the returned error through
@@ -374,14 +168,7 @@ func runWithDependencies(
 	proofTimeout := flags.Duration(
 		"proof-timeout",
 		defaultProofTimeout,
-		"remote inventory/chain proof and cancellable validation timeout; fresh/legacy capabilities are hard-capped at two minutes; excludes file open/copy/fsync/commit/close and output",
-	)
-	prepare := flags.Bool("prepare", false, "publish a required backup, then atomically seal the verified v0.13 database for the identity-bound upgrade")
-	backupPath := flags.String("backup", "", "new backup path required with -prepare (must not already exist)")
-	attestDrained := flags.String(
-		"attest-drained",
-		"",
-		"exact causal-drain acknowledgement required with -prepare",
+		"remote inventory/chain proof and cancellable validation timeout; the fresh-initialization proof is hard-capped at two minutes; excludes file open/copy/fsync/commit/close and output",
 	)
 	initializeFresh := flags.Bool("initialize-fresh", false, "prove an unused provider/backend fleet and atomically create a new placement database")
 	printFreshConfirmation := flags.Bool(
@@ -419,20 +206,6 @@ func runWithDependencies(
 		}
 		return nil
 	}
-	durableStatus := preflightNotMutated
-	if *prepare {
-		// Registered before the database closer, so it classifies the final
-		// error, including a close failure after the commit. The success
-		// verdict carries its own outcome line.
-		defer func() {
-			if runErr == nil {
-				return
-			}
-			outcome := classifyPreparationFailure(durableStatus, runErr)
-			_, _ = io.WriteString(stdout, outcome.line())
-			runErr = &preparationFailure{outcome: outcome, cause: runErr}
-		}()
-	}
 	if *inspectReleases != "" {
 		var incompatible string
 		flags.Visit(func(f *flag.Flag) {
@@ -459,20 +232,13 @@ func runWithDependencies(
 	if *proofTimeout <= 0 {
 		return fmt.Errorf("-proof-timeout must be positive")
 	}
+	if !*initializeFresh && !*printFreshConfirmation {
+		return fmt.Errorf(
+			"a mode is required: -initialize-fresh, -print-fresh-confirmation, -inspect-releases or -version",
+		)
+	}
 	if *initializeFresh && *printFreshConfirmation {
 		return fmt.Errorf("-initialize-fresh and -print-fresh-confirmation are mutually exclusive")
-	}
-	if *initializeFresh && *prepare {
-		return fmt.Errorf("-initialize-fresh and -prepare are mutually exclusive")
-	}
-	if *printFreshConfirmation && *prepare {
-		return fmt.Errorf("-print-fresh-confirmation and -prepare are mutually exclusive")
-	}
-	if *initializeFresh && *backupPath != "" {
-		return fmt.Errorf("-backup cannot be used with -initialize-fresh")
-	}
-	if *printFreshConfirmation && *backupPath != "" {
-		return fmt.Errorf("-backup cannot be used with -print-fresh-confirmation")
 	}
 	if !*initializeFresh && *confirmQuiesced != "" {
 		return fmt.Errorf("-confirm-quiesced is only valid with -initialize-fresh")
@@ -483,26 +249,8 @@ func runWithDependencies(
 	if *printFreshConfirmation && *expectedBackends == "" {
 		return fmt.Errorf("-expected-backends is required with -print-fresh-confirmation")
 	}
-	if !*initializeFresh && !*printFreshConfirmation && *expectedBackends != "" {
-		return fmt.Errorf("-expected-backends is only valid with -initialize-fresh or -print-fresh-confirmation")
-	}
 	if *printFreshConfirmation && *confirmInsecureChain != "" {
 		return fmt.Errorf("-confirm-insecure-chain is not valid with -print-fresh-confirmation because that mode makes no chain request")
-	}
-	if *prepare && *backupPath == "" {
-		return fmt.Errorf("-backup is required with -prepare")
-	}
-	if *prepare && *attestDrained != placement.LegacyPreparationDrainAttestation {
-		return fmt.Errorf(
-			"-attest-drained must exactly equal %q with -prepare",
-			placement.LegacyPreparationDrainAttestation,
-		)
-	}
-	if !*prepare && *backupPath != "" {
-		return fmt.Errorf("-backup is only valid with -prepare")
-	}
-	if !*prepare && *attestDrained != "" {
-		return fmt.Errorf("-attest-drained is only valid with -prepare")
 	}
 
 	cfg, err := dependencies.loadConfig(*configPath)
@@ -513,28 +261,11 @@ func runWithDependencies(
 		return err
 	}
 	var mutationFleet placementprobe.AuthenticatedFleet
-	if *prepare || *initializeFresh {
+	if *initializeFresh {
 		mutationFleet, err = placementprobe.NewAuthenticatedFleet(cfg)
 		if err != nil {
 			return err
 		}
-	}
-	var boundBackupTarget *placement.ExactBackupTarget
-	if *prepare {
-		boundBackupTarget, err = dependencies.bindExactBackupTarget(*backupPath)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if closeErr := boundBackupTarget.Close(); closeErr != nil {
-				closeErr = fmt.Errorf("close bound exact backup target: %w", closeErr)
-				if runErr == nil {
-					runErr = closeErr
-				} else {
-					runErr = errors.Join(runErr, closeErr)
-				}
-			}
-		}()
 	}
 	if *printFreshConfirmation {
 		expectedRoster, err := parseExpectedBackendRoster(*expectedBackends)
@@ -555,233 +286,23 @@ func runWithDependencies(
 	if err := requireAuthenticatedChainProofTransport(cfg, *confirmInsecureChain); err != nil {
 		return err
 	}
-	if *initializeFresh {
-		expectedRoster, err := parseExpectedBackendRoster(*expectedBackends)
-		if err != nil {
-			return err
-		}
-		target, err := placement.NewFreshInitializationTarget(
-			cfg.PlacementStoreDBPath, cfg.ProviderUUID, expectedRoster,
-		)
-		if err != nil {
-			return err
-		}
-		quiescenceProof, err := placement.ConfirmFreshQuiescence(target, *confirmQuiesced)
-		if err != nil {
-			return err
-		}
-		return runFreshInitialization(
-			ctx, *proofTimeout, cfg, mutationFleet, target, quiescenceProof, stdout, dependencies,
-		)
-	}
-	var closePlacement func() error
-	var inspector legacyUpgradeInspector
-	var preparer legacyUpgradePreparer
-	if *prepare {
-		preparer, err = dependencies.openLegacyUpgradePreparer(cfg.PlacementStoreDBPath)
-		if err != nil {
-			return err
-		}
-		closePlacement = preparer.Close
-	} else {
-		inspector, err = dependencies.openLegacyUpgradeInspector(cfg.PlacementStoreDBPath)
-		if err != nil {
-			return err
-		}
-		closePlacement = inspector.Close
-	}
-	placementClosed := false
-	closePlacementOnce := func() error {
-		if placementClosed {
-			return nil
-		}
-		placementClosed = true
-		return closePlacement()
-	}
-	defer func() {
-		closeErr := closePlacementOnce()
-		if closeErr == nil {
-			return
-		}
-		if durableStatus != preflightNotMutated {
-			closeFailure := newDurablePreflightFailure(
-				durableStatus, "database close verification", closeErr,
-			)
-			if runErr == nil {
-				runErr = closeFailure
-			} else {
-				runErr = errors.Join(runErr, closeFailure)
-			}
-			return
-		}
-		if runErr == nil {
-			runErr = fmt.Errorf("close placement database: %w", closeErr)
-		} else {
-			runErr = errors.Join(runErr, fmt.Errorf("close placement database: %w", closeErr))
-		}
-	}()
-
-	var clients []inventoryClient
-	if *prepare {
-		clients, err = mutationFleet.NewClients()
-	} else {
-		clients, err = dependencies.newInventoryClients(cfg)
-	}
+	expectedRoster, err := parseExpectedBackendRoster(*expectedBackends)
 	if err != nil {
 		return err
 	}
-	preflightCtx, cancel := context.WithTimeout(ctx, *proofTimeout)
-	defer cancel()
-	inventories, err := collectInventories(preflightCtx, clients)
-	if err != nil {
-		return err
-	}
-	chainSnapshot, err := snapshotProviderLeases(
-		preflightCtx, cfg, dependencies.newFreshChainClient,
+	target, err := placement.NewFreshInitializationTarget(
+		cfg.PlacementStoreDBPath, cfg.ProviderUUID, expectedRoster,
 	)
 	if err != nil {
 		return err
 	}
-	chainProof, err := placement.NewLegacyUpgradeChainProof(chainSnapshot)
+	quiescenceProof, err := placement.ConfirmFreshQuiescence(target, *confirmQuiesced)
 	if err != nil {
 		return err
 	}
-
-	backendNames := configuredBackendNames(cfg)
-	var summary placement.LegacyUpgradePreflightSummary
-	if *prepare {
-		capability, capabilityErr := preparer.AuthorizePreparation(
-			preflightCtx,
-			cfg.ProviderUUID,
-			backendNames,
-			inventories,
-			chainProof,
-			boundBackupTarget,
-			*attestDrained,
-		)
-		if capabilityErr != nil {
-			return capabilityErr
-		}
-		summary, err = preparer.PrepareContext(
-			preflightCtx,
-			cfg.ProviderUUID,
-			backendNames,
-			inventories,
-			chainProof,
-			capability,
-		)
-	} else {
-		summary, err = inspector.CheckContext(
-			preflightCtx, cfg.ProviderUUID, backendNames, inventories, chainProof,
-		)
-	}
-	if err != nil {
-		if errors.Is(err, placement.ErrExactBackupPublished) {
-			return fmt.Errorf(
-				"BACKUP PUBLISHED: exact legacy backup %q exists, but its final validation "+
-					"failed before any preparation transaction committed. Preserve it, "+
-					"rerun the read-only proof, and choose a new -backup path: %w",
-				boundBackupTarget.Path(),
-				err,
-			)
-		}
-		if errors.Is(err, placement.ErrLegacyPreparationOutcomeUnknown) {
-			durableStatus = preflightPreparationOutcomeUnknown
-			return newDurablePreflightFailure(
-				durableStatus, "commit outcome could be established", err,
-			)
-		}
-		if errors.Is(err, placement.ErrLegacyPreparationCommitted) {
-			durableStatus = preflightPrepared
-			return newDurablePreflightFailure(
-				durableStatus, "explicit database sync verification", err,
-			)
-		}
-		return err
-	}
-	if *prepare {
-		durableStatus = preflightPrepared
-	}
-	// A preparation verdict is actionable operator output. Close first, render
-	// every auxiliary line before the mode-specific final verdict, then issue
-	// exactly one writer call so partial output cannot authorize a cutover.
-	if err := closePlacementOnce(); err != nil {
-		if durableStatus != preflightNotMutated {
-			return newDurablePreflightFailure(
-				durableStatus, "database close verification", err,
-			)
-		}
-		return fmt.Errorf("close placement database: %w", err)
-	}
-	if *prepare {
-		reopened, openErr := dependencies.openPreparedAuthority(
-			cfg.PlacementStoreDBPath, cfg.ProviderUUID,
-		)
-		if openErr != nil {
-			return newDurablePreflightFailure(
-				durableStatus, "database reopen physical/schema verification", openErr,
-			)
-		}
-		verifyErr := reopened.VerifyLegacyPreparationPostcondition(
-			cfg.ProviderUUID, backendNames, inventories, summary,
-		)
-		closeErr := reopened.Close()
-		if verifyErr != nil {
-			if closeErr != nil {
-				verifyErr = errors.Join(verifyErr, fmt.Errorf("close reopened database: %w", closeErr))
-			}
-			return newDurablePreflightFailure(
-				durableStatus, "reopened database semantic verification", verifyErr,
-			)
-		}
-		if closeErr != nil {
-			return newDurablePreflightFailure(
-				durableStatus, "reopened database close verification", closeErr,
-			)
-		}
-		if err := boundBackupTarget.VerifyPublished(); err != nil {
-			return newDurablePreflightFailure(
-				durableStatus, "final exact-backup authority verification", err,
-			)
-		}
-	}
-	verdict := "database remained read-only"
-	verdictKind := inspectSuccessVerdict
-	if *prepare {
-		verdict = fmt.Sprintf("database prepared; exact legacy backup: %q", boundBackupTarget.Path())
-		verdictKind = prepareSuccessVerdict
-	}
-	var output bytes.Buffer
-	if err := writeBackendStorageIdentities(&output, inventories); err != nil {
-		return err
-	}
-	if *prepare {
-		if _, err := fmt.Fprintln(&output,
-			"WARNING: old-binary rollback now requires restoring the backup; never restore it after upgraded side effects begin."); err != nil {
-			return fmt.Errorf("write preparation warning: %w", err)
-		}
-	} else {
-		if _, err := fmt.Fprintln(&output, "OBSERVATION ONLY: mutation modes independently require certificate-verified HTTPS for every backend."); err != nil {
-			return fmt.Errorf("write observation scope: %w", err)
-		}
-	}
-	if _, err := fmt.Fprintf(&output,
-		"%s: v0.13 placement preflight verified %d rows against %d leases on %d backends; %s\n",
-		verdictKind, summary.PlacementRows, summary.InventoryLeases,
-		summary.ConfiguredBackends, verdict,
-	); err != nil {
-		return fmt.Errorf("render preflight verdict: %w", err)
-	}
-	if *prepare {
-		output.WriteString(preparationPrepared.line())
-	}
-	if err := writeCompleteVerdict(stdout, output.Bytes()); err != nil {
-		if durableStatus != preflightNotMutated {
-			return newDurablePreflightVerdictFailure(durableStatus, err)
-		}
-		return fmt.Errorf("write preflight verdict: %w", err)
-	}
-	return nil
+	return runFreshInitialization(
+		ctx, *proofTimeout, cfg, mutationFleet, target, quiescenceProof, stdout, dependencies,
+	)
 }
 
 func requireCanonicalProviderUUID(providerUUID string) error {
@@ -825,18 +346,7 @@ func requireAuthenticatedChainProofTransport(
 
 func defaultCommandDependencies() commandDependencies {
 	return commandDependencies{
-		loadConfig:          config.Load,
-		newInventoryClients: newInventoryClients,
-		openLegacyUpgradeInspector: func(path string) (legacyUpgradeInspector, error) {
-			return placement.OpenLegacyUpgradeInspector(path)
-		},
-		openLegacyUpgradePreparer: func(path string) (legacyUpgradePreparer, error) {
-			return placement.OpenLegacyUpgradePreparer(path)
-		},
-		openPreparedAuthority: func(path, providerUUID string) (preparedAuthorityInspector, error) {
-			return placement.OpenPreparedAuthorityInspector(path, providerUUID)
-		},
-		bindExactBackupTarget: placement.BindExactBackupTarget,
+		loadConfig: config.Load,
 		newFreshChainClient: func(cfg chain.ReadOnlyClientConfig) (freshChainClient, error) {
 			client, err := chain.NewReadOnlyClient(cfg)
 			if err != nil {
@@ -902,9 +412,7 @@ func runFreshInitialization(
 	}
 	if err := dependencies.initializeFreshStore(freshCtx, plan); err != nil {
 		if errors.Is(err, placement.ErrFreshInitializationPublished) {
-			return newDurablePreflightFailure(
-				preflightInitialized, "post-publication durability verification", err,
-			)
+			return newDurablePreflightFailure("post-publication durability verification", err)
 		}
 		return err
 	}
@@ -926,7 +434,7 @@ func runFreshInitialization(
 		return fmt.Errorf("render fresh initialization verdict: %w", err)
 	}
 	if err := writeCompleteVerdict(stdout, output.Bytes()); err != nil {
-		return newDurablePreflightVerdictFailure(preflightInitialized, err)
+		return newDurablePreflightVerdictFailure(err)
 	}
 	return nil
 }
@@ -1064,10 +572,6 @@ func writeCompleteVerdict(stdout io.Writer, rendered []byte) error {
 		written, len(rendered), err)
 }
 
-func newInventoryClients(cfg *config.Config) ([]inventoryClient, error) {
-	return placementprobe.NewClients(cfg)
-}
-
 func collectInventories(
 	ctx context.Context,
 	clients []inventoryClient,
@@ -1080,11 +584,9 @@ func collectInventories(
 	for backendName, inventory := range collected {
 		provisions := make([]string, 0, len(inventory.Provisions))
 		provisionProviders := make(map[string]string, len(inventory.Provisions))
-		provisionItems := make(map[string][]backend.LeaseItem, len(inventory.Provisions))
 		for _, provision := range inventory.Provisions {
 			provisions = append(provisions, provision.LeaseUUID)
 			provisionProviders[provision.LeaseUUID] = provision.ProviderUUID
-			provisionItems[provision.LeaseUUID] = slices.Clone(provision.Items)
 		}
 		retentions := make([]string, 0, len(inventory.Retentions))
 		for _, retention := range inventory.Retentions {
@@ -1094,7 +596,6 @@ func collectInventories(
 			StorageIdentity:        inventory.StorageIdentity,
 			Provisions:             provisions,
 			ProvisionProviderUUIDs: provisionProviders,
-			ProvisionItems:         provisionItems,
 			Retentions:             retentions,
 		}
 	}
