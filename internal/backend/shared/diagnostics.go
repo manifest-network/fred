@@ -1,8 +1,10 @@
 package shared
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -47,6 +49,10 @@ type DiagnosticsStore struct {
 	retained    map[string]*retainedDiagnostic
 	actions     sync.WaitGroup
 	closing     bool
+	// awaitsSettlement reports whether the journal still holds an attempt's
+	// operation unsettled. NewFailureDiagnostics binds it. Until then expiry
+	// keeps every published operation failure (see RemoveOlderThan).
+	awaitsSettlement func(diagnosticAttemptIdentity) (bool, error)
 }
 
 // DiagnosticsStoreConfig configures the diagnostics store.
@@ -164,12 +170,26 @@ func (s *DiagnosticsStore) Delete(leaseUUID string) error {
 
 // RemoveOlderThan deletes diagnostic entries older than maxAge and returns
 // the number of entries removed.
+//
+// A published operation failure is kept past maxAge while its operation is
+// unsettled. The publication is the durable record that the failure was
+// decided, and recovery settles the operation from it (ENG-939); expiring it
+// first would return the lease to provisioning. It expires only on a positive
+// answer from the journal that the operation no longer awaits settlement. With
+// no journal bound yet, as during the cleanup that runs when the store opens,
+// every published operation failure is kept; expireAfterJournalBinding runs
+// the pass again once NewFailureDiagnostics has bound the journal.
 func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
+	settled, err := s.settledPublishedOperations(cutoff)
+	if err != nil {
+		return 0, err
+	}
 	removed := 0
-	err := s.update(func(tx *bolt.Tx) error {
+	err = s.update(func(tx *bolt.Tx) error {
 		visible := tx.Bucket(diagnosticsBucketName)
 		publications := tx.Bucket(diagnosticPublicationsBucketName)
+		attempts := tx.Bucket(attemptDiagnosticsBucketName)
 		cursor := visible.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			var entry DiagnosticEntry
@@ -179,6 +199,12 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 				continue
 			}
 			if entry.CreatedAt.Before(cutoff) {
+				if selected := publications.Get(key); selected != nil {
+					record, err := decodeAttemptDiagnostic(attempts.Get(selected))
+					if err == nil && publishedOperationIsHeld(record.Identity, selected, settled) {
+						continue
+					}
+				}
 				if err := publications.Delete(key); err != nil {
 					return err
 				}
@@ -188,7 +214,6 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 				removed++
 			}
 		}
-		attempts := tx.Bucket(attemptDiagnosticsBucketName)
 		cursor = attempts.Cursor()
 		for key, value := cursor.First(); key != nil; key, value = cursor.Next() {
 			record, err := decodeAttemptDiagnostic(value)
@@ -196,6 +221,10 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 				continue
 			}
 			if record.Entry.CreatedAt.Before(cutoff) {
+				if bytes.Equal(publications.Get([]byte(record.Identity.LeaseUUID)), key) &&
+					publishedOperationIsHeld(record.Identity, key, settled) {
+					continue
+				}
 				if err := s.deleteAttemptTx(tx, key); err != nil {
 					return err
 				}
@@ -204,4 +233,79 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		return nil
 	})
 	return removed, err
+}
+
+// expireAfterJournalBinding runs the expiry pass the store could not complete
+// when it opened. That pass had no journal to ask, so it kept every published
+// operation failure, the settled ones included. Without this pass they would
+// wait for the next periodic one, a whole maxAge away, and a backend that
+// restarts more often than that would never expire them. As with the pass at
+// open, a failure is logged and the periodic pass retries.
+func (s *DiagnosticsStore) expireAfterJournalBinding() {
+	if s.maxAge <= 0 {
+		return
+	}
+	removed, err := s.RemoveOlderThan(s.maxAge)
+	if err != nil {
+		slog.Warn("diagnostics cleanup after journal binding failed", "error", err)
+		return
+	}
+	if removed > 0 {
+		slog.Info("removed expired diagnostics after journal binding", "count", removed, "max_age", s.maxAge)
+	}
+}
+
+// publishedOperationIsHeld reports whether a published attempt is an operation
+// failure that the journal has not positively reported settled.
+func publishedOperationIsHeld(identity diagnosticAttemptIdentity, key []byte, settled map[string]struct{}) bool {
+	if identity.Kind != "operation" {
+		return false
+	}
+	_, isSettled := settled[string(key)]
+	return !isSettled
+}
+
+// settledPublishedOperations returns the keys of the expired published
+// operation failures whose operation the journal reports no longer awaits
+// settlement. The journal is read outside any diagnostics transaction. An
+// operation only ever moves from unsettled to settled, so an answer read here
+// stays true when expiry applies it.
+func (s *DiagnosticsStore) settledPublishedOperations(cutoff time.Time) (map[string]struct{}, error) {
+	s.retentionMu.Lock()
+	awaitsSettlement := s.awaitsSettlement
+	s.retentionMu.Unlock()
+	settled := make(map[string]struct{})
+	if awaitsSettlement == nil {
+		return settled, nil
+	}
+	var expired []diagnosticAttemptIdentity
+	err := s.view(func(tx *bolt.Tx) error {
+		attempts := tx.Bucket(attemptDiagnosticsBucketName)
+		cursor := tx.Bucket(diagnosticPublicationsBucketName).Cursor()
+		for lease, selected := cursor.First(); lease != nil; lease, selected = cursor.Next() {
+			// A selector without a readable attempt holds nothing.
+			record, err := decodeAttemptDiagnostic(attempts.Get(selected))
+			if err != nil {
+				continue
+			}
+			if record.Identity.Kind == "operation" && string(selected) == record.Identity.key() &&
+				record.Entry.CreatedAt.Before(cutoff) {
+				expired = append(expired, record.Identity)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, identity := range expired {
+		awaits, err := awaitsSettlement(identity)
+		if err != nil {
+			return nil, fmt.Errorf("read settlement of the published failure of lease %q: %w", identity.LeaseUUID, err)
+		}
+		if !awaits {
+			settled[identity.key()] = struct{}{}
+		}
+	}
+	return settled, nil
 }

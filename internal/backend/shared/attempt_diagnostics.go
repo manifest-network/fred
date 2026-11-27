@@ -129,7 +129,29 @@ func NewFailureDiagnostics(store *DiagnosticsStore, operations *OperationSettlem
 		operations.callbacks != maintenance.callbacks || operations.releases != maintenance.releases {
 		return nil, errors.New("failure diagnostics require one open diagnostics store and an exact operation/maintenance journal pair")
 	}
-	return &FailureDiagnostics{store: store, operations: operations, maintenance: maintenance}, nil
+	diagnostics := &FailureDiagnostics{store: store, operations: operations, maintenance: maintenance}
+	store.retentionMu.Lock()
+	store.awaitsSettlement = diagnostics.attemptAwaitsSettlement
+	store.retentionMu.Unlock()
+	store.expireAfterJournalBinding()
+	return diagnostics, nil
+}
+
+// attemptAwaitsSettlement reports whether the lease's mutation head still
+// holds the attempt unsettled, so its publication can still be needed to
+// settle it. The head is the sole mutable authority for a lease's
+// callback-producing work.
+func (diagnostics *FailureDiagnostics) attemptAwaitsSettlement(identity diagnosticAttemptIdentity) (bool, error) {
+	awaits := false
+	err := diagnostics.operations.callbacks.view(func(tx *bolt.Tx) error {
+		head, present, err := getLeaseMutationHeadTx(tx, identity.LeaseUUID)
+		if err != nil || !present {
+			return err
+		}
+		awaits = diagnosticCanPublishThroughHead(identity, head)
+		return nil
+	})
+	return awaits, err
 }
 
 func (diagnostics *FailureDiagnostics) valid() bool {

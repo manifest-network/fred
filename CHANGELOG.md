@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- docker-backend no longer loses a failed deploy when it stops or crashes right after reporting it. The backend reported a lease as `failed` before it recorded the result. A stop or crash in between left the operation pending: after the restart the lease read `provisioning` again, until `provision_timeout`. The failure is now recorded before it is reported, and a restart settles it at once with the same reason.
 ### Security
 
 - deps: bump `go.opentelemetry.io/otel`, `go.opentelemetry.io/otel/sdk` and `go.opentelemetry.io/otel/trace` to v1.47.0 (from v1.45.0). Parsing a W3C baggage header could allocate far more memory than the header's size (GO-2026-6975), and a span attribute holding invalid UTF-8 could exceed the configured attribute length limit (GO-2026-6974). Fred imports none of these packages itself: providerd reaches the first through the gRPC library, and docker-backend the second through the Docker client library's instrumented HTTP transport.

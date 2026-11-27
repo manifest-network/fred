@@ -174,6 +174,49 @@ func (publication FailureDiagnosticPublication) PublishContext(ctx context.Conte
 	return diagnostics.store.publishAttempt(publication.capture, failCount)
 }
 
+// PublishedOperationFailure reports whether the failure of claim's exact
+// operation has been published, and returns the entry tenants read. Only
+// PublishContext publishes an operation's attempt, and it requires the proof
+// that the operation's release is uncommitted, so a publication is a durable
+// record that this journal's owner decided the operation failed. Recovery
+// uses it to settle an operation whose failure was decided and reported
+// before a stop or a crash, without waiting out its deadline.
+func (diagnostics *FailureDiagnostics) PublishedOperationFailure(claim OperationIntentClaim) (DiagnosticEntry, bool, error) {
+	if !diagnostics.valid() || !claim.Valid() || claim.settlement != diagnostics.operations {
+		return DiagnosticEntry{}, false, errors.New("published failure lookup requires this journal's operation claim")
+	}
+	identity := operationClaimDiagnosticIdentity(claim)
+	unlock := diagnostics.operations.lockLease(identity.LeaseUUID)
+	defer unlock()
+	var entry DiagnosticEntry
+	published := false
+	err := diagnostics.store.view(func(tx *bolt.Tx) error {
+		selected := tx.Bucket(diagnosticPublicationsBucketName).Get([]byte(identity.LeaseUUID))
+		if selected == nil || string(selected) != identity.key() {
+			return nil
+		}
+		raw := tx.Bucket(attemptDiagnosticsBucketName).Get(selected)
+		if raw == nil {
+			return nil
+		}
+		record, err := decodeAttemptDiagnostic(raw)
+		if err != nil {
+			return err
+		}
+		if !sameDiagnosticAttempt(record.Identity, identity) {
+			return nil
+		}
+		entry = record.Entry
+		entry.Logs = nil
+		published = true
+		return nil
+	})
+	if err != nil {
+		return DiagnosticEntry{}, false, err
+	}
+	return entry, published, nil
+}
+
 func (store *DiagnosticsStore) publishAttempt(capture FailureDiagnosticCapture, failCount int) error {
 	if !capture.Valid() || capture.store != store {
 		return errors.New("diagnostic publication belongs to another open store")
