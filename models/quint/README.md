@@ -54,7 +54,8 @@ error and, where the case records `distinct_states`, exactly that many distinct
 states. A changed count means the model's state space changed: check the change,
 then update the number. A negative control passes only on a reported violation.
 Mark a case only if its model is finite: TLC enumerates every state and cannot
-pick from an unbounded set.
+pick from an unbounded set. A case with `"sample": false` is skipped by the
+sampler: it is one that only a complete search decides.
 
 Each case is checked in a copy of its model that keeps only that case's variant.
 With every variant in one file, the compiled form of `deletion_settlement.qnt`
@@ -116,14 +117,15 @@ before the first full refresh. `limitOnlyBound` starts the volume above its
 limit, where a size equal to the limit alone is too small.
 
 `ackByProjectID` needs the `recycledKeyWitness` schedule: random sampling at
-the default budget does not find it. `neverBothDone` and `neverReclaimed` are
+the default budget does not find it. The exhaustive check finds it under the
+full `step`, in two cases the sampler skips. `neverBothDone` and `neverReclaimed` are
 reachability controls: a violation shows that the good end state can be reached.
 
-Both models are small enough to check completely, and all their cases but two
-are marked exhaustive: the `plan` variants have 19,076 distinct states
+Both models are small enough to check completely, and every case under the
+full `step` or `progressStep` is marked exhaustive: the `plan` variants have 19,076 distinct states
 (`deletion_settlement.qnt`) and 2,310 (`deletion_quota.qnt`), and hold their
-safety invariants in all of them. The two `plan` cases under
-`recycledKeyWitness` are left to sampling; the full `step` covers them.
+safety invariants in all of them. The cases under `recycledKeyWitness` are
+left to sampling; the full `step` covers them.
 
 Neither model covers the cleanup failure classes, executor fairness, storage
 identity checks, a new volume created under a name whose old tombstone still

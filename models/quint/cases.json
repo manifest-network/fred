@@ -373,16 +373,14 @@
     "variant": "ackByProjectID",
     "invariant": "accounted",
     "expect_violation": true,
-    "step": "recycledKeyWitness",
-    "exhaustive": true
+    "step": "recycledKeyWitness"
   },
   {
     "model": "deletion_settlement.qnt",
     "variant": "ackByProjectID",
     "invariant": "durableSettlement",
     "expect_violation": true,
-    "step": "recycledKeyWitness",
-    "exhaustive": true
+    "step": "recycledKeyWitness"
   },
   {
     "model": "deletion_settlement.qnt",
@@ -526,6 +524,24 @@
     "invariant": "boundCovers",
     "expect_violation": true,
     "step": "step",
+    "exhaustive": true
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackByProjectID",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "step",
+    "sample": false,
+    "exhaustive": true
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackByProjectID",
+    "invariant": "durableSettlement",
+    "expect_violation": true,
+    "step": "step",
+    "sample": false,
     "exhaustive": true
   }
 ]

@@ -31,6 +31,8 @@ def main():
     if version != VERSION:
         parser.error(f"expected Quint {VERSION}, got {version}")
     cases = json.loads((ROOT / "cases.json").read_text())
+    # A case sampling cannot decide at this budget is left to verify.py.
+    cases = [case for case in cases if case.get("sample", True)]
     if args.model:
         cases = [case for case in cases if Path(case["model"]).stem == args.model]
     if not cases:
