@@ -933,14 +933,11 @@ func (lsm *leaseSM) applyMaintenanceRecoveryFailureArgs(
 // the actor reports it. A Failed projection is what tenants read, and until
 // the failure is recorded it exists only in this process: a stop or a crash
 // between the report and the record left the next process with an operation
-// still pending, a lease that read as provisioning again, and no account of
-// why it failed (ENG-939). It returns false when shutdown has begun and
-// nothing could be recorded; the caller then leaves the projection awaiting
-// the operation, exactly as a process that died before the failure would.
+// still pending, and a lease that read as provisioning again until its
+// deadline (ENG-939). It returns false when shutdown has begun and nothing
+// could be recorded; the caller then leaves the projection awaiting the
+// operation, exactly as a process that died before the failure would.
 func (lsm *leaseSM) operationFailureIsDurable(proof shared.OperationReleaseUncommitted, errMsg string) bool {
-	if !proof.Valid() {
-		return true
-	}
 	return lsm.actor.cfg.PrepareOperationFailureFn(proof, errMsg)
 }
 
