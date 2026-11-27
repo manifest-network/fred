@@ -56,9 +56,54 @@ its corresponding product change has shipped.
 | `custom_domain_handoff.qnt` | ENG-2132: overlapping and restored stale routes | Deferred architectural change; partial-fix mutants are included |
 | `billing_fairness.qnt` | ENG-858: reservation contract | Candidate contract, awaiting a product decision |
 | `maintenance_commands.qnt` | Maintenance payload, receipt, and recovery consistency | Baseline audit invariants; no new fix claimed |
+| `deletion_settlement.qnt` | Deletion by rename: when a caller or a listing reader may settle, with crashes, failed and independent publications, and a recycled project ID | Proposed plan, revision 6; not implemented |
+| `deletion_quota.qnt` | Deletion by rename: tombstone size, limit and tombstone lifetime against a leftover writer; project-ID allocation with a kernel check | Proposed plan, revision 6; not implemented |
 
 ENG-2128 was a stale comment and unused event cleanup, included in PR #295; it
 has no separate model.
+
+## Deletion by rename: correspondence and limits
+
+`deletion_settlement.qnt` and `deletion_quota.qnt` model a proposed design, not
+code. Their `plan` variant is revision 6 of the deletion-by-rename plan; every
+other variant turns off one rule of that plan. Read from the fred `main` of
+2026-11-27 (`b1f8a39d8`): the reservation is durable, settlement readers read
+the volume listing without the lease's lock, a publication snapshots first and
+acknowledges after the pool update, the pool serves only after the first
+successful full refresh of a process, and a destroy that runs before that
+refresh (startup's own reap) answers without publishing.
+
+Two variants are expected to hold although they drop a rule. `restartCounted`
+treats tombstones found at startup as already counted; it holds because the
+pool does not serve before the first publication. `tombstoneRuleOnly` drops the
+allocator's kernel check; it holds because a tombstone stays until usage is
+zero. Both rules are a second layer in these models, not the only guard.
+
+`unlockedStartupPublish` keeps the counterexample behind one rule the plan had
+not stated: a destroy's publication takes the lock of every refresh, also
+before the first full refresh. `limitOnlyBound` starts the volume above its
+limit, where a size equal to the limit alone is too small.
+
+`ackByProjectID` needs the `recycledKeyWitness` schedule: random sampling at
+the default budget does not find it. `neverBothDone` and `neverReclaimed` are
+reachability controls: a violation shows that the good end state can be reached.
+
+Both models are small enough to check completely. On 2026-11-27,
+`quint verify --backend=tlc` (Quint 0.33.0, Java 21) visited every reachable
+state and gave the expected outcome for every case: the `plan` variants have
+19,076 distinct states (`deletion_settlement.qnt`) and 2,310
+(`deletion_quota.qnt`), and hold their safety invariants in all of them. The
+runner does not do this; it samples.
+
+`deletion_quota.qnt` verifies as it is. `deletion_settlement.qnt` has to be
+split into one file per variant first, the shared module plus that variant:
+with every variant in one file, its compiled form is just above the 20 MB
+input limit of the Apalache release Quint uses to produce TLA+, and the
+command fails with `error: error`.
+
+Neither model covers the cleanup failure classes, executor fairness, storage
+identity checks, a new volume created under a name whose old tombstone still
+exists, block rounding, or a crash between two steps of one cleanup.
 
 ## ENG-2127 correspondence and limits
 
