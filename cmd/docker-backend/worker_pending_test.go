@@ -84,13 +84,14 @@ func actorLifecyclePendingError(t *testing.T) error {
 			MaintenanceWorkFn: func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) leasesm.ReplaceWorkOutcome {
 				panic("unexpected maintenance")
 			},
-			PersistDiagnosticsFn:     func(shared.DiagnosticEntry, []string, map[string]string) {},
-			SendOperationSuccessFn:   func(shared.OperationReleaseCommitted) {},
-			SendOperationFailureFn:   func(shared.OperationReleaseUncommitted, string) {},
-			SendLifecycleFailureFn:   func(shared.RuntimeGenerationProof, string) {},
-			SendMaintenanceSuccessFn: func(shared.MaintenanceReleaseActive) {},
-			SendMaintenanceFailureFn: func(shared.MaintenanceReleaseFailure, string) {},
-			DoDeprovisionFn:          func(context.Context, leasesm.ActorCloseScope) error { panic("teardown before worker drain") },
+			PersistDiagnosticsFn:      func(shared.DiagnosticEntry, []string, map[string]string) {},
+			SendOperationSuccessFn:    func(shared.OperationReleaseCommitted) {},
+			SendOperationFailureFn:    func(shared.OperationReleaseUncommitted, string) {},
+			PrepareOperationFailureFn: func(shared.OperationReleaseUncommitted, string) bool { return true },
+			SendLifecycleFailureFn:    func(shared.RuntimeGenerationProof, string) {},
+			SendMaintenanceSuccessFn:  func(shared.MaintenanceReleaseActive) {},
+			SendMaintenanceFailureFn:  func(shared.MaintenanceReleaseFailure, string) {},
+			DoDeprovisionFn:           func(context.Context, leasesm.ActorCloseScope) error { panic("teardown before worker drain") },
 		}, func(*leasesm.LeaseActor) {})
 		require.NoError(t, err)
 		defer func() { close(complete); cancel(); workers.Wait() }()

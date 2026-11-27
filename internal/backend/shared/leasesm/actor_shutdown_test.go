@@ -43,13 +43,14 @@ func validConstructionTestActorConfig(ctx context.Context, store LeaseProvisionS
 		OnTerminated: func(string, *LeaseActor) {},
 		PersistDiagnosticsFn: func(shared.DiagnosticEntry, []string, map[string]string) {
 		},
-		SendOperationSuccessFn:   func(shared.OperationReleaseCommitted) {},
-		SendOperationFailureFn:   func(shared.OperationReleaseUncommitted, string) {},
-		SendLifecycleFailureFn:   func(shared.RuntimeGenerationProof, string) {},
-		SendMaintenanceSuccessFn: func(shared.MaintenanceReleaseActive) {},
-		SendMaintenanceFailureFn: func(shared.MaintenanceReleaseFailure, string) {},
-		RecoveryLineage:          lineage,
-		DoDeprovisionFn:          func(context.Context, ActorCloseScope) error { return nil },
+		SendOperationSuccessFn:    func(shared.OperationReleaseCommitted) {},
+		SendOperationFailureFn:    func(shared.OperationReleaseUncommitted, string) {},
+		PrepareOperationFailureFn: func(shared.OperationReleaseUncommitted, string) bool { return true },
+		SendLifecycleFailureFn:    func(shared.RuntimeGenerationProof, string) {},
+		SendMaintenanceSuccessFn:  func(shared.MaintenanceReleaseActive) {},
+		SendMaintenanceFailureFn:  func(shared.MaintenanceReleaseFailure, string) {},
+		RecoveryLineage:           lineage,
+		DoDeprovisionFn:           func(context.Context, ActorCloseScope) error { return nil },
 	}
 }
 

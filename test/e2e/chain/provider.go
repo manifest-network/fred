@@ -62,12 +62,16 @@ type Provider struct {
 	// BillingOnlySKU, when the test asked for one (see Options), is a SKU no
 	// backend serves and the provider is configured to bill for only.
 	BillingOnlySKU string
+	// PlacementDB is the path of providerd's placement database.
+	PlacementDB string
 
-	t       *testing.T
-	binDir  string
-	process *e2e.Process
-	command func(ctx context.Context) *exec.Cmd
-	tenants int
+	t          *testing.T
+	binDir     string
+	process    *e2e.Process
+	command    func(ctx context.Context) *exec.Cmd
+	tool       func(ctx context.Context, binary string, args ...string) *exec.Cmd
+	configPath string
+	tenants    int
 }
 
 // StartProvider starts a chain, registers a provider and its SKUs on it,
@@ -191,36 +195,23 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	}
 	encoded, err := yaml.Marshal(config)
 	require.NoError(t, err)
-	configPath := filepath.Join(state, "providerd.yaml")
-	require.NoError(t, os.WriteFile(configPath, encoded, 0o600))
-	e2e.GiveToServiceAccount(t, append(owned, configPath)...)
+	p.PlacementDB = config["placement_store_db_path"].(string)
+	p.configPath = filepath.Join(state, "providerd.yaml")
+	require.NoError(t, os.WriteFile(p.configPath, encoded, 0o600))
+	e2e.GiveToServiceAccount(t, append(owned, p.configPath)...)
 
 	p.process = e2e.NewProcess(t, "providerd-"+p.Backends[0].Name)
-	command := func(ctx context.Context, binary string, args ...string) *exec.Cmd {
+	p.tool = func(ctx context.Context, binary string, args ...string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, filepath.Join(state, binary), args...) //nolint:gosec // G204: a binary under test and fixture-built arguments
 		cmd.Env = p.process.Env()
 		e2e.AsServiceAccount(cmd)
 		return cmd
 	}
-	p.command = func(ctx context.Context) *exec.Cmd { return command(ctx, "providerd", "--config", configPath) }
+	p.command = func(ctx context.Context) *exec.Cmd { return p.tool(ctx, "providerd", "--config", p.configPath) }
 
 	// providerd never creates its placement database. A new provider's
-	// operator does, once, with every backend running and still empty: the
-	// tool prints an acknowledgement bound to this provider and its backends,
-	// and creates the database only when given it back.
-	names := make([]string, len(p.Backends))
-	for i, backend := range p.Backends {
-		names[i] = backend.Name
-	}
-	roster, err := json.Marshal(names)
-	require.NoError(t, err)
-	confirmation, err := command(t.Context(), "placement-preflight", "-config", configPath,
-		"-print-fresh-confirmation", "-expected-backends", string(roster)).Output()
-	require.NoError(t, err, "print the fresh-placement confirmation: %s", stderrOf(err))
-	out, err := command(t.Context(), "placement-preflight", "-config", configPath,
-		"-initialize-fresh", "-expected-backends", string(roster),
-		"-confirm-insecure-chain", insecureChainConfirmation,
-		"-confirm-quiesced", strings.TrimSpace(string(confirmation))).CombinedOutput()
+	// operator does, once, with every backend running and still empty.
+	out, err := p.InitializePlacements(t)
 	require.NoError(t, err, "create the placement database: %s", out)
 
 	t.Cleanup(func() {
@@ -229,6 +220,28 @@ func StartProviderWith(t *testing.T, backends int, options Options) *Provider {
 	})
 	p.Start()
 	return p
+}
+
+// InitializePlacements creates the placement database as an operator does:
+// placement-preflight prints an acknowledgement bound to this provider and
+// its backends, and creates the database only when given it back. It returns
+// what the tool printed, and its error when it refused.
+func (p *Provider) InitializePlacements(t *testing.T) (output string, err error) {
+	t.Helper()
+	names := make([]string, len(p.Backends))
+	for i, backend := range p.Backends {
+		names[i] = backend.Name
+	}
+	roster, err := json.Marshal(names)
+	require.NoError(t, err)
+	confirmation, err := p.tool(t.Context(), "placement-preflight", "-config", p.configPath,
+		"-print-fresh-confirmation", "-expected-backends", string(roster)).Output()
+	require.NoError(t, err, "print the fresh-placement confirmation: %s", stderrOf(err))
+	out, err := p.tool(t.Context(), "placement-preflight", "-config", p.configPath,
+		"-initialize-fresh", "-expected-backends", string(roster),
+		"-confirm-insecure-chain", insecureChainConfirmation,
+		"-confirm-quiesced", strings.TrimSpace(string(confirmation))).CombinedOutput()
+	return string(out), err
 }
 
 // Start runs providerd and waits until its API answers. StartProvider calls

@@ -873,6 +873,157 @@ func TestRecoverLiveOperationIntent_RetriesFailedActorSettlementWithoutDroppingP
 	assert.Equal(t, "image startup failed", pending[0].Error)
 }
 
+// A process decided a provision had failed, published why, and stopped before
+// it settled the operation. The next process finds the operation pending with
+// nothing on the host. It must not defer it as a young generation, which
+// would read as provisioning until the deadline: the publication is a durable
+// record of the decision, so startup settles the failure at once, with the
+// published reason (ENG-939).
+func TestRecoverOperationIntent_SettlesAPublishedFailureAtStartup(t *testing.T) {
+	const reason = "image startup failed"
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	spec := dockerOperationIntentSpec(t, storageID)
+	_, err = beginDockerTestOperationIntent(t, store, spec, storageID)
+	require.NoError(t, err)
+	projections := readyIntentProjection(spec)
+	projections[spec.LeaseUUID].Status = backend.ProvisionStatusFailed
+	projections[spec.LeaseUUID].Message = reason
+	b := newOperationIntentRecoveryBackend(t, store, storageID, nil, projections)
+	// A young generation: without the publication, recovery defers it for an hour.
+	b.cfg.ProvisionTimeout = time.Hour
+	started := startPendingOperationForRecoveryTest(t, b)
+	b.provisionsMu.Lock()
+	require.True(t, b.provisions[spec.LeaseUUID].AwaitOperation(started))
+	b.provisionsMu.Unlock()
+
+	// The first process: the failure's diagnostic is published, and the journal
+	// write that would settle the operation fails.
+	diagnostic, ok := b.callbackPublisher.(*diagnosticCallbackPublisher)
+	require.True(t, ok, "the recovery fixture publishes through the diagnostic publisher")
+	journal := &transientResolveOperationIntentJournal{
+		callbackPublicationService: diagnostic.callbackPublicationService, failures: 1,
+	}
+	b.callbackPublisher, err = newDiagnosticCallbackPublisher(journal, b.failureDiagnostics)
+	require.NoError(t, err)
+	err = b.recoverLiveOperationIntents(context.Background())
+	require.ErrorContains(t, err, "transient operation settlement failure")
+	_, published, err := b.publishedOperationFailure(started)
+	require.NoError(t, err)
+	require.True(t, published, "the decision is durable before it is settled")
+	intents, err := listOperationIntentsForCallbackTest(t, store)
+	require.NoError(t, err)
+	require.Len(t, intents, 1, "the operation is still pending")
+
+	// Diagnostic retention may be shorter than the provision deadline. It
+	// must not expire the record of a decision that is not settled yet.
+	removed, err := b.diagnosticsStore.RemoveOlderThan(-time.Hour)
+	require.NoError(t, err)
+	require.Zero(t, removed)
+
+	// The next process: nothing of the first one's memory survives.
+	b.provisionsMu.Lock()
+	clear(b.provisions)
+	b.provisionsMu.Unlock()
+	b.callbackPublisher, err = newDiagnosticCallbackPublisher(diagnostic.callbackPublicationService, b.failureDiagnostics)
+	require.NoError(t, err)
+
+	require.NoError(t, b.recoverOperationIntents(context.Background()))
+
+	intents, err = listOperationIntentsForCallbackTest(t, store)
+	require.NoError(t, err)
+	assert.Empty(t, intents, "startup settles a published failure without waiting for its deadline")
+	pending, err := store.ListPending()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, backend.CallbackStatusFailed, pending[0].Status)
+	assert.Equal(t, reason, pending[0].Error, "the settled reason is the published one")
+}
+
+// A failure that was never published proves nothing: the operation stays
+// pending for the classifier and its deadline.
+func TestPublishedOperationFailure_RequiresTheExactPublishedOperation(t *testing.T) {
+	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+	require.NoError(t, err)
+	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
+		DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	spec := dockerOperationIntentSpec(t, storageID)
+	_, err = beginDockerTestOperationIntent(t, store, spec, storageID)
+	require.NoError(t, err)
+	b := newOperationIntentRecoveryBackend(t, store, storageID, nil, nil)
+	b.cfg.ProvisionTimeout = time.Hour
+	started := startPendingOperationForRecoveryTest(t, b)
+
+	message, published, err := b.publishedOperationFailure(started)
+	require.NoError(t, err)
+	require.False(t, published)
+	require.Empty(t, message)
+
+	require.NoError(t, b.recoverOperationIntents(context.Background()))
+	intents, err := listOperationIntentsForCallbackTest(t, store)
+	require.NoError(t, err)
+	assert.Len(t, intents, 1, "an unpublished young operation is still deferred")
+}
+
+// The lease actor records a decided failure before it reports it. While the
+// backend runs, the record is published and names the pending operation.
+// Once shutdown has begun nothing is published, and the actor is told so.
+func TestPrepareOperationFailure_PublishesUnlessShutdownHasBegun(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		shutdown bool
+	}{{name: "running"}, {name: "shutdown has begun", shutdown: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
+			require.NoError(t, err)
+			store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{
+				DBPath: filepath.Join(t.TempDir(), "callbacks.db"),
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, store.Close()) })
+			spec := dockerOperationIntentSpec(t, storageID)
+			_, err = beginDockerTestOperationIntent(t, store, spec, storageID)
+			require.NoError(t, err)
+			b := newOperationIntentRecoveryBackend(t, store, storageID, nil, nil)
+			claims, err := b.operationSettlement.ListOperationIntents()
+			require.NoError(t, err)
+			require.Len(t, claims, 1)
+			candidate, err := b.operationSettlement.PrepareOperationRelease(claims[0])
+			require.NoError(t, err)
+			refused, err := b.operationSettlement.RefuseOperationExecution(candidate)
+			require.NoError(t, err)
+			proof, err := b.operationSettlement.CommitOperationFailure(refused)
+			require.NoError(t, err)
+
+			if test.shutdown {
+				b.stopCancel()
+			}
+			require.Equal(t, !test.shutdown, b.prepareOperationFailure(proof, "container exited during startup"))
+
+			message, published, err := b.publishedOperationFailure(claims[0])
+			require.NoError(t, err)
+			require.Equal(t, !test.shutdown, published)
+			if published {
+				require.Equal(t, "container exited during startup", message)
+			}
+			intents, err := listOperationIntentsForCallbackTest(t, store)
+			require.NoError(t, err)
+			require.Len(t, intents, 1, "recording a failure does not settle its operation")
+			pending, err := store.ListPending()
+			require.NoError(t, err)
+			require.Empty(t, pending, "recording a failure sends no callback")
+		})
+	}
+}
+
 func TestRecoverLiveOperationIntent_DefersLeaseWithActiveCommand(t *testing.T) {
 	storageID, err := backendidentity.Parse("9a72fbc1-38c8-4f31-87f7-f689979b9324")
 	require.NoError(t, err)

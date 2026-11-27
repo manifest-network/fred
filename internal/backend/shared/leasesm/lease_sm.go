@@ -929,6 +929,18 @@ func (lsm *leaseSM) applyMaintenanceRecoveryFailureArgs(
 	return nil
 }
 
+// operationFailureIsDurable makes a definitive operation failure durable before
+// the actor reports it. A Failed projection is what tenants read, and until
+// the failure is recorded it exists only in this process: a stop or a crash
+// between the report and the record left the next process with an operation
+// still pending, and a lease that read as provisioning again until its
+// deadline (ENG-939). It returns false when shutdown has begun and nothing
+// could be recorded; the caller then leaves the projection awaiting the
+// operation, exactly as a process that died before the failure would.
+func (lsm *leaseSM) operationFailureIsDurable(proof shared.OperationReleaseUncommitted, errMsg string) bool {
+	return lsm.actor.cfg.PrepareOperationFailureFn(proof, errMsg)
+}
+
 func (lsm *leaseSM) sendReplaceSuccessCallback(
 	committed shared.OperationReleaseCommitted,
 	active shared.MaintenanceReleaseActive,
@@ -1146,6 +1158,11 @@ func (lsm *leaseSM) onEnterFailedFromReplace(ctx context.Context, args ...any) e
 	cfg := &lsm.actor.cfg
 	leaseUUID := lsm.actor.leaseUUID
 
+	if !info.preserveMaintenance && lsm.actor.replaceCallbackKind != replaceCallbackLifecycle &&
+		!lsm.operationFailureIsDurable(info.operationRelease, info.callbackErr) {
+		return nil
+	}
+
 	now := time.Now()
 	var outcome budgetOutcome
 	applied := cfg.ProvisionStore.UpdateFn(leaseUUID, func(p *ProvisionState) {
@@ -1219,6 +1236,10 @@ func (lsm *leaseSM) onEnterFailedFromProvision(ctx context.Context, args ...any)
 			// decided here: never counted.
 			cause = failurecause.Platform()
 		}
+	}
+
+	if !lsm.operationFailureIsDurable(info.operationFailure, info.callbackErr) {
+		return nil
 	}
 
 	now := time.Now()
