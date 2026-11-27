@@ -249,7 +249,8 @@ type Config struct {
 	DiagnosticsDBPath string `yaml:"diagnostics_db_path"`
 
 	// DiagnosticsMaxAge is the maximum age of a persisted diagnostic entry.
-	// Entries older than this are removed by the diagnostics store's background cleanup.
+	// Entries older than this are removed by the diagnostics store's background cleanup,
+	// except the published failure of an operation that is not settled yet.
 	// Defaults to 7 days.
 	DiagnosticsMaxAge time.Duration `yaml:"diagnostics_max_age"`
 

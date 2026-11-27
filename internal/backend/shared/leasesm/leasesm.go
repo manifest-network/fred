@@ -513,6 +513,13 @@ type LeaseActorConfig struct {
 	// Separate function types prevent a caller-selected status from bypassing
 	// the committed-release proof required by success.
 	SendOperationFailureFn func(shared.OperationReleaseUncommitted, string)
+	// PrepareOperationFailureFn makes a definitive Provision/Restore failure
+	// durable before the actor reports it, so a failure a tenant has read
+	// survives a stop or a crash. It returns false only when the record could
+	// not be written because shutdown has begun. The actor then reports
+	// nothing: its projection keeps awaiting the operation, and the next
+	// process settles it.
+	PrepareOperationFailureFn func(shared.OperationReleaseUncommitted, string) bool
 
 	// SendLifecycleFailureFn is the sole callback surface for autonomous
 	// substrate observations. Success is not representable here; successful
