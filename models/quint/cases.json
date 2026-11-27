@@ -278,5 +278,201 @@
     "invariant": "noDivergenceUnderClose",
     "expect_violation": true,
     "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "accounted",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "durableSettlement",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "noGhostName",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "neverBothDone",
+    "expect_violation": true,
+    "step": "progressStep"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "accounted",
+    "expect_violation": false,
+    "step": "recycledKeyWitness"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "plan",
+    "invariant": "durableSettlement",
+    "expect_violation": false,
+    "step": "recycledKeyWitness"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "absenceOnly",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "absenceOnly",
+    "invariant": "durableSettlement",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackBeforeDurable",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackBeforeDurable",
+    "invariant": "durableSettlement",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "noAckOnReclaim",
+    "invariant": "noGhostName",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackByProjectID",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "recycledKeyWitness"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "ackByProjectID",
+    "invariant": "durableSettlement",
+    "expect_violation": true,
+    "step": "recycledKeyWitness"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "returnBeforePublish",
+    "invariant": "accounted",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "restartCounted",
+    "invariant": "accounted",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_settlement.qnt",
+    "variant": "restartCounted",
+    "invariant": "durableSettlement",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "plan",
+    "invariant": "boundCovers",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "plan",
+    "invariant": "noInheritedUsage",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "plan",
+    "invariant": "exclusiveIDs",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "plan",
+    "invariant": "neverReclaimed",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "measuredBound",
+    "invariant": "boundCovers",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "clearLimitEarly",
+    "invariant": "boundCovers",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "removeTombstoneEarly",
+    "invariant": "boundCovers",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "removeTombstoneEarly",
+    "invariant": "noInheritedUsage",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "noReuseGuard",
+    "invariant": "noInheritedUsage",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "tombstoneRuleOnly",
+    "invariant": "noInheritedUsage",
+    "expect_violation": false,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "unreservedAllocator",
+    "invariant": "exclusiveIDs",
+    "expect_violation": true,
+    "step": "step"
+  },
+  {
+    "model": "deletion_quota.qnt",
+    "variant": "rootStaysTagged",
+    "invariant": "neverReclaimed",
+    "expect_violation": false,
+    "step": "step"
   }
 ]
