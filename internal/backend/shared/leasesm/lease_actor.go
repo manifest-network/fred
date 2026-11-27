@@ -1272,7 +1272,8 @@ func validateLeaseActorConfig(cfg LeaseActorConfig) error {
 		return errors.New("lease actor requires metrics")
 	case cfg.OnTerminated == nil || cfg.PersistDiagnosticsFn == nil ||
 		cfg.SendOperationSuccessFn == nil ||
-		cfg.SendOperationFailureFn == nil || cfg.SendLifecycleFailureFn == nil ||
+		cfg.SendOperationFailureFn == nil || cfg.PrepareOperationFailureFn == nil ||
+		cfg.SendLifecycleFailureFn == nil ||
 		cfg.SendMaintenanceSuccessFn == nil || cfg.SendMaintenanceFailureFn == nil ||
 		cfg.ProvisionWorkFn == nil || cfg.RestoreWorkFn == nil ||
 		cfg.MaintenanceWorkFn == nil || cfg.DoDeprovisionFn == nil:
