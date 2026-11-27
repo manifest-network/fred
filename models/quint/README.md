@@ -35,6 +35,38 @@ Apalache bounded checking requires a separate installation; this runner does not
 execute it. Historical Apalache claims in FINDINGS.md have not been independently
 reproduced by this suite.
 
+## Exhaustive check
+
+Sampling can miss a violation. A case marked `"exhaustive": true` in
+`cases.json` is also checked in every reachable state:
+
+```sh
+make test-models-exhaustive
+python3 models/quint/verify.py --model deletion_settlement
+```
+
+This runs `quint verify --backend=tlc`, one case at a time. It needs a Java
+runtime on `PATH` (Java 21 was used), and on its first run Quint downloads the
+checkers into `~/.quint`. `make test-models` needs neither and does not run it.
+
+A case that should hold passes only when TLC reports a completed search with no
+error and, where the case records `distinct_states`, exactly that many distinct
+states. A changed count means the model's state space changed: check the change,
+then update the number. A negative control passes only on a reported violation.
+Mark a case only if its model is finite: TLC enumerates every state and cannot
+pick from an unbounded set. A case with `"sample": false` is skipped by the
+sampler: it is one that only a complete search decides.
+
+Each case is checked in a copy of its model that keeps only that case's variant.
+With every variant in one file, the compiled form of `deletion_settlement.qnt`
+is just above the 20 MB input limit of the Apalache release Quint uses to
+produce TLA+, and the command fails with `error: error`. A model that imports
+another file is checked whole. Copies, logs and a JSON summary go to ignored
+`results/exhaustive/`.
+
+A completed search covers the model as bounded in its source (for example two
+leases), not larger instances, and says nothing about the implementation.
+
 ## Model map and implementation status
 
 `current` means the historical baseline modeled in the bundle, **not today's
@@ -85,21 +117,15 @@ before the first full refresh. `limitOnlyBound` starts the volume above its
 limit, where a size equal to the limit alone is too small.
 
 `ackByProjectID` needs the `recycledKeyWitness` schedule: random sampling at
-the default budget does not find it. `neverBothDone` and `neverReclaimed` are
+the default budget does not find it. The exhaustive check finds it under the
+full `step`, in two cases the sampler skips. `neverBothDone` and `neverReclaimed` are
 reachability controls: a violation shows that the good end state can be reached.
 
-Both models are small enough to check completely. On 2026-11-27,
-`quint verify --backend=tlc` (Quint 0.33.0, Java 21) visited every reachable
-state and gave the expected outcome for every case: the `plan` variants have
-19,076 distinct states (`deletion_settlement.qnt`) and 2,310
-(`deletion_quota.qnt`), and hold their safety invariants in all of them. The
-runner does not do this; it samples.
-
-`deletion_quota.qnt` verifies as it is. `deletion_settlement.qnt` has to be
-split into one file per variant first, the shared module plus that variant:
-with every variant in one file, its compiled form is just above the 20 MB
-input limit of the Apalache release Quint uses to produce TLA+, and the
-command fails with `error: error`.
+Both models are small enough to check completely, and every case under the
+full `step` or `progressStep` is marked exhaustive: the `plan` variants have 19,076 distinct states
+(`deletion_settlement.qnt`) and 2,310 (`deletion_quota.qnt`), and hold their
+safety invariants in all of them. The cases under `recycledKeyWitness` are
+left to sampling; the full `step` covers them.
 
 Neither model covers the cleanup failure classes, executor fairness, storage
 identity checks, a new volume created under a name whose old tombstone still
