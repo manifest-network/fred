@@ -88,6 +88,19 @@ limit, where a size equal to the limit alone is too small.
 the default budget does not find it. `neverBothDone` and `neverReclaimed` are
 reachability controls: a violation shows that the good end state can be reached.
 
+Both models are small enough to check completely. On 2026-11-27,
+`quint verify --backend=tlc` (Quint 0.33.0, Java 21) visited every reachable
+state and gave the expected outcome for every case: the `plan` variants have
+19,076 distinct states (`deletion_settlement.qnt`) and 2,310
+(`deletion_quota.qnt`), and hold their safety invariants in all of them. The
+runner does not do this; it samples.
+
+`deletion_quota.qnt` verifies as it is. `deletion_settlement.qnt` has to be
+split into one file per variant first, the shared module plus that variant:
+with every variant in one file, its compiled form is just above the 20 MB
+input limit of the Apalache release Quint uses to produce TLA+, and the
+command fails with `error: error`.
+
 Neither model covers the cleanup failure classes, executor fairness, storage
 identity checks, a new volume created under a name whose old tombstone still
 exists, block rounding, or a crash between two steps of one cleanup.
