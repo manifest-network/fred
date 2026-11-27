@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"strconv"
 
 	grpctypes "github.com/cosmos/cosmos-sdk/types/grpc"
@@ -15,8 +14,6 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	billingtypes "github.com/manifest-network/manifest-ledger/x/billing/types"
-
-	"github.com/manifest-network/fred/internal/backend"
 )
 
 // ReadOnlyClientConfig is the subset of chain configuration needed by an
@@ -46,8 +43,6 @@ type ProviderLeaseSnapshot struct {
 	blockHeight  int64
 	total        int
 	blocking     []BlockingProviderLease
-	leaseUUIDs   []string
-	leaseItems   map[string][]backend.LeaseItem
 }
 
 // BlockingProviderLease is a lease whose state is not terminal. Unknown and
@@ -89,36 +84,11 @@ func (snapshot ProviderLeaseSnapshot) BlockingLeaseUUIDs() []string {
 // aggregate eligibility evidence without depending on chain protobuf types.
 func (snapshot ProviderLeaseSnapshot) BlockingLeaseCount() int { return len(snapshot.blocking) }
 
-// LeaseUUIDs returns a defensive copy of the exact all-state membership seen
-// at BlockHeight. Offline v0.13 preparation uses this to prove that every
-// placement/backend survivor belongs to the provider being installed as
-// durable authority, including retention-only terminal leases.
-func (snapshot ProviderLeaseSnapshot) LeaseUUIDs() []string {
-	leaseUUIDs := make([]string, len(snapshot.leaseUUIDs))
-	copy(leaseUUIDs, snapshot.leaseUUIDs)
-	return leaseUUIDs
-}
-
-// LeaseItems returns a detached copy of the immutable paid topology for every
-// lease in LeaseUUIDs. SnapshotProviderLeases has already checked the uint64 to
-// int boundary and converted the protobuf values to Fred's backend wire shape.
-func (snapshot ProviderLeaseSnapshot) LeaseItems() map[string][]backend.LeaseItem {
-	if snapshot.leaseItems == nil {
-		return nil
-	}
-	items := make(map[string][]backend.LeaseItem, len(snapshot.leaseItems))
-	for leaseUUID, leaseItems := range snapshot.leaseItems {
-		items[leaseUUID] = append([]backend.LeaseItem(nil), leaseItems...)
-	}
-	return items
-}
-
 // Valid reports whether the snapshot came from a complete positive-height
 // query for one provider. A valid snapshot may still contain blocking leases.
 func (snapshot ProviderLeaseSnapshot) Valid() bool {
 	return snapshot.providerUUID != "" && snapshot.blockHeight > 0 &&
-		snapshot.total >= len(snapshot.blocking) && snapshot.leaseItems != nil &&
-		len(snapshot.leaseItems) == snapshot.total
+		snapshot.total >= len(snapshot.blocking)
 }
 
 // NewReadOnlyClient constructs a signer-free chain query client.
@@ -171,11 +141,7 @@ func (client *ReadOnlyClient) SnapshotProviderLeases(
 		return ProviderLeaseSnapshot{}, err
 	}
 
-	snapshot := ProviderLeaseSnapshot{
-		providerUUID: providerUUID,
-		leaseUUIDs:   make([]string, 0),
-		leaseItems:   make(map[string][]backend.LeaseItem),
-	}
+	snapshot := ProviderLeaseSnapshot{providerUUID: providerUUID}
 	seenLeases := make(map[string]struct{})
 	seenContinuationKeys := make(map[string]struct{})
 	var nextKey []byte
@@ -236,25 +202,6 @@ func (client *ReadOnlyClient) SnapshotProviderLeases(
 				)
 			}
 			seenLeases[lease.Uuid] = struct{}{}
-			snapshot.leaseUUIDs = append(snapshot.leaseUUIDs, lease.Uuid)
-			leaseItems := make([]backend.LeaseItem, len(lease.Items))
-			for itemIndex, item := range lease.Items {
-				if item.Quantity > uint64(math.MaxInt) {
-					return ProviderLeaseSnapshot{}, fmt.Errorf(
-						"query provider leases returned lease %s item %d quantity %d larger than int",
-						lease.Uuid,
-						itemIndex,
-						item.Quantity,
-					)
-				}
-				leaseItems[itemIndex] = backend.LeaseItem{
-					SKU:          item.SkuUuid,
-					Quantity:     int(item.Quantity),
-					ServiceName:  item.ServiceName,
-					CustomDomain: item.CustomDomain,
-				}
-			}
-			snapshot.leaseItems[lease.Uuid] = leaseItems
 			snapshot.total++
 			if !terminalLeaseState(lease.State) {
 				snapshot.blocking = append(snapshot.blocking, BlockingProviderLease{

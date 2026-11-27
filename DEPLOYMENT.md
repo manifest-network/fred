@@ -346,10 +346,10 @@ separate lifecycle worker after successful startup, with its own 30-second
 budget per pass at the backend reconcile cadence. A large backlog may take
 multiple passes; it cannot consume the state/operation-recovery budget.
 
-Startup intentionally remains fail-closed if a retained v0.13 row lacks immutable
-resource profiles and its SKU has been removed from configuration: Fred cannot
-prove quota/accounting from that row. Keep the original SKU profile configured
-until one start has recorded that row's sizing; do not substitute guessed limits
+Startup intentionally remains fail-closed if a retention row lacks immutable
+resource profiles: Fred cannot prove quota/accounting from that row. Only the
+0.14 line records sizing on a row retained under v0.13; start its final release
+once with the original SKU profile configured. Do not substitute guessed limits
 or delete the retention row. Similarly, a directory in the managed `fred-*`
 namespace with an invalid volume name or unverifiable quota substrate must be
 attributed and corrected while stopped. An ordinary file/symlink is not adopted

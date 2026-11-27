@@ -3,7 +3,9 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,14 +19,13 @@ import (
 
 const v013RetainedLease = "550e8400-e29b-41d4-a716-446655440000"
 
-// reopenRetentionStoreWithV013Row writes entry as it was persisted before
-// retention rows carried a resource snapshot, then points b at the reopened
-// store. No current writer can produce such a row; only an adopted v0.13
-// journal holds one. The close and restore settlements are rebuilt over the
-// reopened store.
-func reopenRetentionStoreWithV013Row(t *testing.T, b *Backend, entry shared.RetentionEntry) *shared.RetentionStore {
+// reopenRetentionStoreWithRow writes entry straight into the retention journal,
+// then points b at the reopened store. It is how a test places a row that
+// records no sizing: no current writer can produce one, and only a journal
+// that never started on the 0.14 line holds one. The close and restore
+// settlements are rebuilt over the reopened store.
+func reopenRetentionStoreWithRow(t *testing.T, b *Backend, entry shared.RetentionEntry) *shared.RetentionStore {
 	t.Helper()
-	require.Empty(t, entry.ResourceProfiles)
 	path := b.cfg.RetentionDBPath
 	require.NoError(t, b.retentionStore.Close())
 	row, err := json.Marshal(struct {
@@ -32,7 +33,7 @@ func reopenRetentionStoreWithV013Row(t *testing.T, b *Backend, entry shared.Rete
 		Entry         shared.RetentionEntry `json:"entry"`
 	}{SchemaVersion: 1, Entry: entry})
 	require.NoError(t, err)
-	writeRawLegacyRetentionRow(t, path, entry.OriginalLeaseUUID, row)
+	writeRawRetentionRow(t, path, entry.OriginalLeaseUUID, row)
 
 	require.True(t, b.storageAuthority.Valid())
 	reopened, err := shared.OpenIdentityBoundRetentionStore(
@@ -53,9 +54,9 @@ func reopenRetentionStoreWithV013Row(t *testing.T, b *Backend, entry shared.Rete
 	return reopened
 }
 
-// writeRawLegacyRetentionRow puts row under leaseUUID in the retention bucket
-// of a closed retention journal.
-func writeRawLegacyRetentionRow(t *testing.T, dbPath, leaseUUID string, row []byte) {
+// writeRawRetentionRow puts row under leaseUUID in the retention bucket of a
+// closed retention journal.
+func writeRawRetentionRow(t *testing.T, dbPath, leaseUUID string, row []byte) {
 	t.Helper()
 	db, err := bolt.Open(dbPath, 0o600, nil)
 	require.NoError(t, err)
@@ -65,7 +66,7 @@ func writeRawLegacyRetentionRow(t *testing.T, dbPath, leaseUUID string, row []by
 	require.NoError(t, db.Close())
 }
 
-// frozenRetainedProfilesForTest returns the sizing Start freezes onto a
+// frozenRetainedProfilesForTest returns the sizing a close records on a
 // retained record of items under b's configuration.
 func frozenRetainedProfilesForTest(t *testing.T, b *Backend, items []backend.LeaseItem) []shared.SKUResourceSnapshot {
 	t.Helper()
@@ -88,9 +89,9 @@ func v013RetentionEntry(sku string) shared.RetentionEntry {
 }
 
 // startableBackendOverJournals builds a backend bound to the journals in dir,
-// with profiles as its SKU configuration and the v0.13 row's retained volume
-// on disk. seed, when set, writes the v0.13 row before the backend captures
-// its inventory. It returns the quota each Start applies, by volume name.
+// with profiles as its SKU configuration and the seeded row's retained volume
+// on disk. seed, when set, writes that row before the backend captures its
+// inventory. It returns the quota each Start applies, by volume name.
 func startableBackendOverJournals(
 	t *testing.T,
 	dir string,
@@ -107,7 +108,7 @@ func startableBackendOverJournals(
 	attachRetentionStore(t, b)
 	t.Cleanup(b.stopCancel)
 	if seed != nil {
-		reopenRetentionStoreWithV013Row(t, b, *seed)
+		reopenRetentionStoreWithRow(t, b, *seed)
 	}
 
 	b.cfg.SKUProfiles = maps.Clone(profiles)
@@ -129,20 +130,16 @@ var v013RetentionProfiles = map[string]SKUProfile{
 	"stateful": {CPUCores: 1, MemoryMB: 512, DiskMB: 100},
 }
 
-func startableBackendWithV013Retention(t *testing.T, sku string) (*Backend, map[string]int64) {
-	t.Helper()
-	seed := v013RetentionEntry(sku)
-	return startableBackendOverJournals(t, t.TempDir(), v013RetentionProfiles, &seed)
-}
-
-// The first start freezes a v0.13 row's sizing. A full restart over the same
-// journals, with the row's SKU profile removed, must then start and enforce
-// the frozen size (ENG-1517 F-1).
-func TestRestartAfterSKUProfileRemovalStartsOnFrozenV013RetentionSizing(t *testing.T) {
+// A retained row is sized by the snapshot its close recorded. A full restart
+// over the same journals, with the row's SKU profile removed, must start and
+// enforce the recorded size (ENG-1517 F-1).
+func TestRestartAfterSKUProfileRemovalStartsOnRecordedRetentionSizing(t *testing.T) {
 	ctx := context.Background()
 	volumeName := retainedName(canonicalVolumeName(v013RetainedLease, "app", 0))
 	journals := t.TempDir()
+	recorded := []shared.SKUResourceSnapshot{{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100}}
 	seed := v013RetentionEntry("stateful")
+	seed.ResourceProfiles = recorded
 	first, firstQuotas := startableBackendOverJournals(t, journals, v013RetentionProfiles, &seed)
 	require.NoError(t, first.Start(ctx))
 	assert.Equal(t, int64(100), firstQuotas[volumeName])
@@ -152,7 +149,7 @@ func TestRestartAfterSKUProfileRemovalStartsOnFrozenV013RetentionSizing(t *testi
 	_, profileErr := second.cfg.GetSKUProfile("stateful")
 	require.Error(t, profileErr, "the restarted backend no longer configures the row's SKU")
 	require.NoError(t, second.Start(ctx), "a restart after the profile is removed must start")
-	assert.Equal(t, int64(100), secondQuotas[volumeName], "the retained quota keeps its frozen size")
+	assert.Equal(t, int64(100), secondQuotas[volumeName], "the retained quota keeps its recorded size")
 	retainedMB, count, _, err := second.computeRetainedDiskMB()
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
@@ -160,27 +157,23 @@ func TestRestartAfterSKUProfileRemovalStartsOnFrozenV013RetentionSizing(t *testi
 
 	stored, err := second.retentionStore.Get(v013RetainedLease)
 	require.NoError(t, err)
-	assert.Equal(t, []shared.SKUResourceSnapshot{{SKU: "stateful", CPUCores: 1, MemoryMB: 512, DiskMB: 100}},
-		stored.ResourceProfiles, "the first start froze the row's sizing")
-	frozen, err := second.freezeRetentionSizing()
-	require.NoError(t, err)
-	assert.Zero(t, frozen, "a frozen row is never resolved again")
+	assert.Equal(t, recorded, stored.ResourceProfiles, "no start rewrites the row's sizing")
 }
 
-// A v0.13 row whose SKU is already gone has bytes on disk and no recorded
-// size. Sizing it as zero would undercount the admission pool, so start fails
-// and names what to restore.
-func TestStartRefusesAV013RetentionWhoseSKUNoLongerResolves(t *testing.T) {
-	b, quotas := startableBackendWithV013Retention(t, "removed-v0.13-sku")
-	err := b.Start(context.Background())
-	require.ErrorContains(t, err, "freeze retained resource sizing")
-	require.ErrorContains(t, err, v013RetainedLease)
-	require.ErrorContains(t, err, "removed-v0.13-sku")
-	require.ErrorContains(t, err, "restore the SKU profile it was retained under")
-	assert.Empty(t, quotas, "start stops before any consumer sizes the row")
-	stored, getErr := b.retentionStore.Get(v013RetainedLease)
-	require.NoError(t, getErr)
-	assert.Empty(t, stored.ResourceProfiles)
+// One refusal names a bounded number of leases and counts them all.
+func TestRefuseUnsizedRetentionsBoundsTheNamedLeases(t *testing.T) {
+	b, _ := startableBackendOverJournals(t, t.TempDir(), v013RetentionProfiles, nil)
+	const rows = maxNamedUnsizedRetentions + 3
+	for index := range rows {
+		entry := v013RetentionEntry("stateful")
+		entry.OriginalLeaseUUID = fmt.Sprintf("550e8400-e29b-41d4-a716-4466554400%02d", index)
+		entry.RetainedVolumeNames = []string{retainedName(canonicalVolumeName(entry.OriginalLeaseUUID, "app", 0))}
+		reopenRetentionStoreWithRow(t, b, entry)
+	}
+	err := b.refuseUnsizedRetentions()
+	require.ErrorIs(t, err, errRetainedSizingUnfrozen)
+	require.ErrorContains(t, err, fmt.Sprintf("%d retention records", rows))
+	assert.Equal(t, maxNamedUnsizedRetentions, strings.Count(err.Error(), "550e8400-e29b-41d4-a716-4466554400"))
 }
 
 func TestRetainedResourceProfilesNeverFallsBackToConfiguration(t *testing.T) {

@@ -3,13 +3,15 @@ package docker
 import (
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 // errRetainedSizingUnfrozen reports a retention row that carries no immutable
-// resource snapshot. Start freezes every such row before anything sizes a
-// retained footprint, so a running backend observes one only if a row was
+// resource snapshot. Every close records one and Start refuses a journal that
+// holds a row without it, so a running backend observes one only if a row was
 // written without sizing after startup, which is a bug.
 var errRetainedSizingUnfrozen = errors.New("retention record carries no frozen resource snapshot")
 
@@ -27,40 +29,35 @@ func retainedResourceProfiles(entry shared.RetentionEntry) ([]shared.SKUResource
 	return shared.CloneSKUResourceSnapshot(entry.ResourceProfiles), nil
 }
 
-// freezeRetentionSizing freezes immutable sizing onto every retention row
-// written before rows carried a resource snapshot (v0.13). Each such row's
-// SKUs are resolved against the configuration exactly once, here; afterwards
-// only retainedResourceProfiles sizes it. It must run at startup before any
-// consumer of retained sizing.
-//
-// A row whose SKU the configuration cannot resolve fails startup, naming the
-// lease and SKU. Its bytes are on disk with no recorded size, and sizing them
-// as zero would undercount the admission pool. Restoring that SKU's profile
-// once lets the row freeze; the profile can then be removed.
-func (b *Backend) freezeRetentionSizing() (frozen int, err error) {
+// maxNamedUnsizedRetentions bounds how many leases one startup refusal names.
+const maxNamedUnsizedRetentions = 8
+
+// refuseUnsizedRetentions fails startup when a retention row records no
+// sizing. Only a row retained under v0.13 lacks it, and only the 0.14 line
+// records it from the configuration. The row's bytes are on disk with no
+// recorded size, and sizing them as zero would undercount the admission pool.
+// It must run at startup before any consumer of retained sizing.
+func (b *Backend) refuseUnsizedRetentions() error {
 	if b.retentionStore == nil {
-		return 0, nil
+		return nil
 	}
-	candidates, err := b.retentionStore.ListUnfrozenSizingCandidates()
+	entries, err := b.retentionStore.List()
 	if err != nil {
-		return 0, fmt.Errorf("list retention records without frozen sizing: %w", err)
+		return fmt.Errorf("list retention records: %w", err)
 	}
-	var errs []error
-	for _, candidate := range candidates {
-		entry := candidate.Entry()
-		profiles, resolveErr := b.resolveResourceProfiles(entry.Items)
-		if resolveErr != nil {
-			errs = append(errs, fmt.Errorf(
-				"retention %s has no frozen sizing and its SKU no longer resolves; restore the SKU profile it was retained under so its sizing can be frozen: %w",
-				entry.OriginalLeaseUUID, resolveErr,
-			))
-			continue
+	var unsized []string
+	for _, entry := range entries {
+		if len(entry.ResourceProfiles) == 0 {
+			unsized = append(unsized, entry.OriginalLeaseUUID)
 		}
-		if freezeErr := b.retentionStore.FreezeResourceProfiles(candidate, profiles); freezeErr != nil {
-			errs = append(errs, fmt.Errorf("freeze sizing for retention %s: %w", entry.OriginalLeaseUUID, freezeErr))
-			continue
-		}
-		frozen++
 	}
-	return frozen, errors.Join(errs...)
+	if len(unsized) == 0 {
+		return nil
+	}
+	slices.Sort(unsized)
+	named := unsized[:min(len(unsized), maxNamedUnsizedRetentions)]
+	return fmt.Errorf(
+		"%d retention records, including %s: %w; start the final 0.14 release once to record their sizing",
+		len(unsized), strings.Join(named, ", "), errRetainedSizingUnfrozen,
+	)
 }

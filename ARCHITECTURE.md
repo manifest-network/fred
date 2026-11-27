@@ -1374,10 +1374,9 @@ conservative `deprovisioning` projection and resource reservation from its
 immutable snapshot instead of attempting to reconstruct authority from whatever
 Docker still reports or repricing it from mutable configuration. Retained and
 reaping records created by this version inherit the same exact resource
-snapshot. Pre-upgrade retention rows have no such field and use the current SKU
-configuration. If one of those legacy rows references a SKU missing from the
-current configuration, the final strict retained-accounting rebuild in `Start`
-fails and docker-backend exits 1 before it serves HTTP. A cleanup-only close is
+snapshot. A retention row that records none is never sized from the current
+SKU configuration: `Start` refuses it and docker-backend exits 1 before it
+serves HTTP. A cleanup-only close is
 used when the volatile projection is
 already absent but a fenced release still authorizes substrate cleanup: it
 publishes no tenant-visible provision, never retains data, and remains the

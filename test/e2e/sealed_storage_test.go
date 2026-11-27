@@ -305,3 +305,39 @@ func TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted(t *testi
 		})
 	}
 }
+
+// TestBackend_RefusesToStartOnARetentionThatRecordsNoSizing removes the
+// recorded sizing from a retained lease's row, which is how a row retained
+// before 0.14 looks. The backend sized such a row from its configuration
+// once; it now refuses to start, names the lease, and changes nothing. With
+// the row put back, the same backend starts and still holds the data.
+func TestBackend_RefusesToStartOnARetentionThatRecordsNoSizing(t *testing.T) {
+	b := StartBackend(t)
+	lease := retire(t, b, "tenant-a", "")
+	requireRetained(t, b, lease)
+	roots, err := volumeRoots(b, lease)
+	require.NoError(t, err)
+	b.Stop()
+	retention := journals(b)[2]
+	original, stripped := rewriteJournalRow(t, retention, "retention", lease, func(row map[string]any) {
+		entry, ok := row["entry"].(map[string]any)
+		require.True(t, ok, "a retention row wraps its entry")
+		require.Contains(t, entry, "resource_profiles", "a retained lease records its sizing")
+		delete(entry, "resource_profiles")
+	})
+
+	out, err := runBackend(t, b)
+	require.Error(t, err, "the backend must refuse to start:\n%s", out)
+	require.Contains(t, out, "retained resource sizing")
+	require.Contains(t, out, lease)
+	require.Contains(t, out, "start the final 0.14 release once")
+	after, err := volumeRoots(b, lease)
+	require.NoError(t, err)
+	require.Equal(t, roots, after, "a refused start must leave the retained volume in place")
+	require.Equal(t, stripped, readJournalRow(t, retention, "retention", lease),
+		"a refused start must leave the retention row as it found it")
+
+	restoreJournalRow(t, retention, "retention", lease, original)
+	b.Start()
+	requireRetained(t, b, lease)
+}

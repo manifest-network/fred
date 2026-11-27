@@ -365,10 +365,10 @@ none of them from an observed cohort: recovery refuses to start on an active
 release that lacks its `Items` (unless a pending operation supersedes it), its
 profiles, or the runtime authority of a cohort that still carries a callback
 pair, and the error names the lease. A service-name-less pre-stack cohort is
-unsupported and startup refuses it before any substrate mutation. Startup
-still freezes the sizing of a v0.13 retention row onto the row, so after it a
-SKU profile change can neither reprice a retained footprint nor block a
-restart.
+unsupported and startup refuses it before any substrate mutation. A retention
+row is sized only by the snapshot recorded on it, so a SKU profile change can
+neither reprice a retained footprint nor block a restart; startup refuses a
+row that records none.
 
 Each encoded per-lease history is capped at 32 MiB. Before a provision or
 restore mutates substrate, the backend proves that the exact terminal release
@@ -583,7 +583,8 @@ Startup quota backfill uses each generation's immutable effective authority:
 durable `disk_mb` for stateful volumes and pinned scratch for a physically
 present diskless writable-path volume. Mutable config is consulted only for a
 live provision that no durable record sizes, and nothing is persisted from it;
-an active release that records no profiles stops recovery before this point. Scratch remains excluded from retention caps; an exact scratch
+an active release or a retention row that records no profiles stops startup
+before this point. Scratch remains excluded from retention caps; an exact scratch
 name conservatively present in a retention row stays physically counted and
 re-capped only until it is destroyed.
 

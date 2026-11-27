@@ -118,7 +118,7 @@ func resourceSnapshotMap(
 }
 
 // resolveResourceProfiles sizes items from the live configuration. It is for
-// live leases and for freezing v0.13 authority only: a retained footprint is
+// live leases only: a retained footprint is
 // sized solely by its frozen snapshot (retainedResourceProfiles), which the
 // [live-sizing] lint rule enforces.
 func (b *Backend) resolveResourceProfiles(
