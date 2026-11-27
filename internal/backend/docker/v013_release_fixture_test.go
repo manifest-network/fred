@@ -1,7 +1,6 @@
 package docker
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -10,10 +9,11 @@ import (
 	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
-// seedUpgradedV013ReleaseForBackendTest writes the historical, authorityless
-// stack row at the file boundary and then drives the same typed backfills used
-// by stopped production adoption. It intentionally does not expose a runtime
-// writer capable of manufacturing legacy authority from a new release.
+// seedUpgradedV013ReleaseForBackendTest writes the active release of a lease
+// adopted from v0.13 as the first 0.14 start left it: the v0.13 row with its
+// items, resource profiles and tokenless runtime authority recorded. Nothing in
+// production writes this state any more; restart and update only carry it
+// forward.
 func seedUpgradedV013ReleaseForBackendTest(
 	t *testing.T,
 	b *Backend,
@@ -28,6 +28,11 @@ func seedUpgradedV013ReleaseForBackendTest(
 	if legacy.Version == 0 {
 		legacy.Version = 1
 	}
+	require.Nil(t, legacy.RuntimeAuthority)
+	require.False(t, legacy.OperationID.Valid())
+	legacy.Items = items
+	legacy.ResourceProfiles = profiles
+	legacy.LegacyRuntimeAuthority = &authority
 	fixture := &fakeReleaseStore{
 		Store:   b.releaseStore,
 		backend: b,
@@ -40,27 +45,17 @@ func seedUpgradedV013ReleaseForBackendTest(
 			gate:    b.storeAuthorityGate,
 		},
 	}
-	fixture.SeedRelease(t, leaseUUID, legacy)
+	fixture.seedReleaseRows(t, map[string]shared.Release{leaseUUID: legacy})
 	operations, ok := concreteOperationSettlementForTest(b.operationSettlement)
 	require.True(t, ok)
 	require.NoError(t, bindBackendTestPhysicalExecutors(
 		t, b, operations, b.maintenanceSettlement,
 	))
-	backfiller, err := shared.NewReleaseBackfiller(b.callbackStore, fixture.Store)
-	require.NoError(t, err)
 	t.Cleanup(func() { _ = fixture.Store.Close() })
 
-	require.NoError(t, backfiller.BackfillLegacyActiveAuthorityContext(
-		context.Background(), leaseUUID, legacy, items, profiles,
-	))
-	backfilled, err := fixture.Store.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, backfilled)
-	freeze, err := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *backfilled, authority)
-	require.NoError(t, err)
-	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(context.Background(), freeze))
 	upgraded, err := fixture.Store.LatestActive(leaseUUID)
 	require.NoError(t, err)
 	require.NotNil(t, upgraded)
+	require.NotNil(t, upgraded.LegacyRuntimeAuthority)
 	return *upgraded
 }

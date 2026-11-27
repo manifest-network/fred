@@ -3,7 +3,6 @@ package shared
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -803,64 +802,6 @@ func TestReleaseStore_RemoveOlderThan_KeepsLoneOldNonActive(t *testing.T) {
 	assert.Equal(t, "failed", releases[0].Status)
 }
 
-func TestReleaseStore_BackfillLegacyActiveAuthorityFreezesMultiSKUProfile(t *testing.T) {
-	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
-		DBPath: filepath.Join(t.TempDir(), "legacy_authority.db"),
-	})
-	require.NoError(t, err)
-	defer store.Close()
-
-	legacy := Release{
-		Manifest: []byte(`{"services":{"web":{"image":"nginx:1.25"},"db":{"image":"postgres:16"}}}`),
-		Image:    "stack", Status: "active", CreatedAt: time.Now().UTC(),
-	}
-	require.NoError(t, store.append("lease-1", legacy))
-	stored, err := store.LatestActive("lease-1")
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	items := []backend.LeaseItem{
-		{SKU: "docker-small", Quantity: 2, ServiceName: "web", CustomDomain: "web.example"},
-		{SKU: "docker-large", Quantity: 1, ServiceName: "db"},
-	}
-	profiles, err := BuildSKUResourceSnapshot(items, func(sku string) (SKUProfile, error) {
-		switch sku {
-		case "docker-small":
-			return SKUProfile{CPUCores: 1, MemoryMB: 512, DiskMB: 1024}, nil
-		case "docker-large":
-			return SKUProfile{CPUCores: 4, MemoryMB: 4096, DiskMB: 8192}, nil
-		default:
-			return SKUProfile{}, errors.New("unexpected SKU")
-		}
-	})
-	require.NoError(t, err)
-	require.NoError(t, store.backfillLegacyActiveAuthority(
-		"lease-1", *stored, items, profiles,
-	))
-	require.NoError(t, store.backfillLegacyActiveAuthority(
-		"lease-1", *stored, items, profiles,
-	),
-		"an exact retry after an uncertain commit must be idempotent")
-
-	backfilled, err := store.LatestActive("lease-1")
-	require.NoError(t, err)
-	require.NotNil(t, backfilled)
-	assert.Equal(t, items, backfilled.Items)
-	assert.Equal(t, profiles, backfilled.ResourceProfiles)
-	items[0].Quantity = 9
-	profiles[0].MemoryMB = 1
-	assert.Equal(t, 2, backfilled.Items[0].Quantity)
-	small, found := LookupSKUResourceSnapshotRow(backfilled.ResourceProfiles, "docker-small")
-	require.True(t, found)
-	assert.Equal(t, int64(512), small.MemoryMB)
-
-	changedFence := *stored
-	changedFence.Image = "manually-rewritten"
-	err = store.backfillLegacyActiveAuthority(
-		"lease-1", changedFence, backfilled.Items, backfilled.ResourceProfiles,
-	)
-	require.ErrorContains(t, err, "changed before legacy authority backfill")
-}
-
 func TestReleaseStore_DeleteCloseHistory_ExactAndIdempotent(t *testing.T) {
 	store, err := newUnboundReleaseStoreForTest(ReleaseStoreConfig{
 		DBPath: filepath.Join(t.TempDir(), "close_fence.db"),
@@ -997,9 +938,6 @@ func TestReleaseStore_CorruptAuthorityFailsEveryDecodeMutationClosed(t *testing.
 	assertInvalid("Append", store.append(leaseUUID, Release{
 		Image: "nginx:2.0", Status: "deploying", CreatedAt: time.Now(),
 	}))
-	assertInvalid("BackfillActiveResourceProfiles", store.backfillActiveResourceProfiles(
-		leaseUUID, 1, items, profiles,
-	))
 	assertInvalid("UpdateLatestStatus", store.updateLatestStatus(
 		leaseUUID, "failed", backend.ReasonUpdateFailed, "failed",
 	))

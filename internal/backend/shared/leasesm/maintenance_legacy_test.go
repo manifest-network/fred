@@ -1,7 +1,6 @@
 package leasesm
 
 import (
-	"context"
 	"encoding/json"
 	"path/filepath"
 	"testing"
@@ -39,9 +38,11 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.27"}}}`),
 		Image:    "stack", Status: "active", CreatedAt: time.Now().Add(-time.Minute),
 	}
-	// Seed the exact bare v0.13 wire shape, then drive the real stopped-upgrade
-	// APIs. This preserves compatibility coverage without retaining a public
-	// current-writer escape hatch for legacy authority.
+	// Seed the release as the first 0.14 start left it for a lease adopted
+	// from v0.13: items, resource profiles and tokenless authority recorded.
+	legacySource.Items = items
+	legacySource.ResourceProfiles = profiles
+	legacySource.LegacyRuntimeAuthority = &oldAuthority
 	require.NoError(t, releases.Close())
 	db, err := bolt.Open(filepath.Join(dir, "releases.db"), 0o600, nil)
 	require.NoError(t, err)
@@ -62,17 +63,6 @@ func TestMaintenanceRecoveryProjectionAcceptsLegacyRuntimeAuthority(t *testing.T
 		require.NoError(t, callbacks.Close())
 		require.NoError(t, releases.Close())
 	})
-	backfiller, err := shared.NewReleaseBackfiller(callbacks, releases)
-	require.NoError(t, err)
-	require.NoError(t, backfiller.BackfillLegacyActiveAuthorityContext(
-		context.Background(), leaseUUID, legacySource, items, profiles,
-	))
-	backfilled, err := releases.LatestActive(leaseUUID)
-	require.NoError(t, err)
-	require.NotNil(t, backfilled)
-	freeze, err := shared.FreezeLegacyRuntimeAuthority(leaseUUID, *backfilled, oldAuthority)
-	require.NoError(t, err)
-	require.NoError(t, backfiller.BackfillLegacyRuntimeAuthorityContext(context.Background(), freeze))
 	settlement, err := shared.NewMaintenanceSettlement(callbacks, releases)
 	require.NoError(t, err)
 	active, sourceClaim, err := settlement.ClaimLatestActive(leaseUUID)

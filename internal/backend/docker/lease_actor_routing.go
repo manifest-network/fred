@@ -144,9 +144,8 @@ func (b *Backend) dispatchContainerDeathObservation(
 // captureRuntimeGenerationProofs snapshots observational authority before a
 // recovery inventory begins. A later cohort classification may use only the
 // proof captured here and only while its full release-row digest remains
-// current. Legacy v0.13 rows without frozen runtime authority are skipped for
-// this pass; recovery may backfill them from the observed cohort, and the next
-// level-triggered pass can then capture a proof before its inventory.
+// current. A release that records no runtime authority is skipped: it has
+// no generation to prove.
 func (b *Backend) captureRuntimeGenerationProofs() (
 	map[string]shared.RuntimeGenerationProof,
 	error,

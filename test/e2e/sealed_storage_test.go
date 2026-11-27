@@ -3,7 +3,9 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -181,4 +183,125 @@ func TestBackend_SealRefusesABackendThatIsNotEmpty(t *testing.T) {
 	after, err := volumeRoots(b, lease.LeaseUUID)
 	require.NoError(t, err)
 	require.Equal(t, roots, after, "the volume must be left in place")
+}
+
+// rewriteJournalRow rewrites one row of a stopped backend's journal, as JSON.
+// It returns the row as it was, so the test can put it back, and as written,
+// so the test can tell whether a refused start changed it.
+func rewriteJournalRow(t *testing.T, path, bucket, key string, edit func(row map[string]any)) (original, rewritten []byte) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second})
+	require.NoError(t, err, "open %s: is the backend stopped?", path)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		rows := tx.Bucket([]byte(bucket))
+		require.NotNil(t, rows, "%s has no %q bucket", path, bucket)
+		stored := rows.Get([]byte(key))
+		require.NotNil(t, stored, "%s holds no row for %s", path, key)
+		original = bytes.Clone(stored)
+		decoder := json.NewDecoder(bytes.NewReader(stored))
+		// Numbers are written back exactly as they were read.
+		decoder.UseNumber()
+		var row map[string]any
+		require.NoError(t, decoder.Decode(&row))
+		edit(row)
+		var encodeErr error
+		rewritten, encodeErr = json.Marshal(row)
+		require.NoError(t, encodeErr)
+		return rows.Put([]byte(key), rewritten)
+	}))
+	return original, rewritten
+}
+
+// readJournalRow reads one row of a stopped backend's journal.
+func readJournalRow(t *testing.T, path, bucket, key string) (stored []byte) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second, ReadOnly: true})
+	require.NoError(t, err, "open %s: is the backend stopped?", path)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.NoError(t, db.View(func(tx *bolt.Tx) error {
+		stored = bytes.Clone(tx.Bucket([]byte(bucket)).Get([]byte(key)))
+		return nil
+	}))
+	return stored
+}
+
+// restoreJournalRow puts a row back as rewriteJournalRow found it.
+func restoreJournalRow(t *testing.T, path, bucket, key string, original []byte) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 10 * time.Second})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(bucket)).Put([]byte(key), original)
+	}))
+}
+
+// TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted strips a
+// running lease's release down to what v0.13 recorded, three ways: with no
+// items, with items and no sizing, and with both and no authority. The
+// backend completed such a release from the containers it found; it now
+// refuses to start, names the lease, and leaves the workload running. With
+// the row put back, the same backend starts and reports the lease ready on
+// the same container.
+func TestBackend_RefusesToStartOnAReleaseTheFirst014StartNeverCompleted(t *testing.T) {
+	for _, shape := range []struct {
+		name   string
+		strip  []string
+		refuse string
+	}{
+		{
+			name:   "no items",
+			strip:  []string{"items", "resource_profiles", "runtime_authority", "operation_id"},
+			refuse: "records no items",
+		},
+		{
+			name:   "no sizing",
+			strip:  []string{"resource_profiles", "runtime_authority", "operation_id"},
+			refuse: "records no resource profiles",
+		},
+		{
+			name:   "no authority",
+			strip:  []string{"runtime_authority", "operation_id"},
+			refuse: "records no runtime authority",
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			b := StartBackend(t)
+			lease := stateless("tenant-a")
+			require.NoError(t, b.Client.Apply(t.Context(), lease))
+			requireStatus(t, b, lease.LeaseUUID, statusReady)
+			running := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			b.Stop()
+			releases := journals(b)[1]
+			original, stripped := rewriteJournalRow(t, releases, "releases", lease.LeaseUUID, func(row map[string]any) {
+				history, ok := row["releases"].([]any)
+				require.True(t, ok, "a release row wraps its history")
+				require.NotEmpty(t, history)
+				active, ok := history[len(history)-1].(map[string]any)
+				require.True(t, ok)
+				require.Equal(t, "active", active["status"])
+				for _, field := range shape.strip {
+					require.Contains(t, active, field, "an active release records its %s", field)
+					delete(active, field)
+				}
+			})
+
+			out, err := runBackend(t, b)
+			require.Error(t, err, "the backend must refuse to start:\n%s", out)
+			require.Contains(t, out, shape.refuse)
+			require.Contains(t, out, lease.LeaseUUID)
+			require.Contains(t, out, "the release predates the first 0.14 start")
+			still := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			require.Equal(t, running.ID, still.ID, "a refused start must leave the workload running")
+			require.Equal(t, stripped, readJournalRow(t, releases, "releases", lease.LeaseUUID),
+				"a refused start must leave the release as it found it")
+
+			restoreJournalRow(t, releases, "releases", lease.LeaseUUID, original)
+			b.Start()
+			requireStatus(t, b, lease.LeaseUUID, statusReady)
+			again := requireOneRunningContainer(t, b, lease.LeaseUUID)
+			require.Equal(t, running.ID, again.ID, "the lease must come back on the same container")
+		})
+	}
 }

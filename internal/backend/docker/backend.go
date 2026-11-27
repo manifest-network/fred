@@ -127,16 +127,6 @@ type operationSettlementService interface {
 	ProveCommittedOperation(context.Context, shared.OperationIntentClaim) (shared.OperationReleaseCommitted, error)
 }
 
-// releaseBackfillService is the pair-bound authority for enriching an active
-// Release during recovery or lazy v0.13 adoption. It deliberately has no
-// operation-settlement methods: a backfill is a release CAS, not an operation
-// outcome, even though both serialize through the same per-lease journal gate.
-type releaseBackfillService interface {
-	BackfillActiveResourceProfilesContext(context.Context, string, int, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
-	BackfillLegacyActiveAuthorityContext(context.Context, string, shared.Release, []backend.LeaseItem, []shared.SKUResourceSnapshot) error
-	BackfillLegacyRuntimeAuthorityContext(context.Context, shared.LegacyRuntimeAuthorityFreeze) error
-}
-
 // callbackPublicationService is the semantic publication boundary consumed by
 // Docker. Production supplies the construction-validated CallbackPublisher;
 // tests may decorate it to inject a transport-independent journal failure
@@ -287,7 +277,6 @@ type Backend struct {
 	// releaseStore persists release history in bbolt
 	releaseStore          *shared.ReleaseStore
 	operationSettlement   operationSettlementService
-	releaseBackfiller     releaseBackfillService
 	maintenanceSettlement *shared.MaintenanceSettlement
 	restoreSettlement     *shared.RestoreSettlement
 	closeSettlement       *shared.CloseSettlement
@@ -1648,15 +1637,6 @@ func newBackend(
 		_ = docker.Close()
 		return nil, fmt.Errorf("bind operation journals: %w", err)
 	}
-	releaseBackfiller, err := shared.NewReleaseBackfiller(cbStore, releaseStore)
-	if err != nil {
-		_ = cbStore.Close()
-		_ = diagStore.Close()
-		_ = releaseStore.Close()
-		_ = retentionStore.Close()
-		_ = docker.Close()
-		return nil, fmt.Errorf("bind release backfill authority: %w", err)
-	}
 	maintenanceSettlement, err := shared.NewMaintenanceSettlement(cbStore, releaseStore)
 	if err != nil {
 		_ = cbStore.Close()
@@ -1710,7 +1690,6 @@ func newBackend(
 		diagnosticsStore:                diagStore,
 		releaseStore:                    releaseStore,
 		operationSettlement:             operationSettlement,
-		releaseBackfiller:               releaseBackfiller,
 		maintenanceSettlement:           maintenanceSettlement,
 		restoreSettlement:               restoreSettlement,
 		closeSettlement:                 closeSettlement,

@@ -2,7 +2,6 @@ package docker
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -16,12 +15,65 @@ import (
 	"github.com/manifest-network/fred/internal/backendidentity"
 )
 
-// Model an adopted, sized v0.13 release losing one member before the first
-// startup snapshot. Recovery can conservatively publish Failed, but cannot
-// freeze the missing cohort's callback authority. A new request must not leave
-// a Pending head whose eventual failure is impossible to settle.
-func TestProvisionPartialLegacyPredecessorRefusesBeforeDurableAdmission(t *testing.T) {
-	for _, mode := range []string{"partial cohort", "inspect unavailable", "caller cancels during inspection", "foreign principal", "mixed callback generation", "restored cohort capacity refusal", "caller cancels after admission"} {
+// A predecessor release that records no runtime authority is one the first
+// 0.14 start never completed. A provision over it used to record the authority
+// it observed on the surviving cohort. It is now refused before anything is
+// durable: no operation intent, no callback, and the release as it was.
+func TestProvisionOverPredecessorWithoutRecordedAuthorityRefusesBeforeDurableAdmission(t *testing.T) {
+	store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "callbacks.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	items := []backend.LeaseItem{{SKU: "docker-small", ServiceName: "app", Quantity: 2}}
+	spec := shared.OperationIntentSpec{
+		LeaseUUID: durableCallbackTestLeaseUUID, Tenant: "tenant-a", ProviderUUID: nominalDockerProviderUUID,
+		CallbackURL: "https://legacy.example/callbacks/provision?route=v013", Items: items,
+		ResourceProfiles: testResourceProfiles(t, items),
+		Manifest:         validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
+	}
+	seedV013OperationReleaseForTest(t, store, spec.LeaseUUID, shared.Release{
+		Manifest: spec.Manifest, Image: "stack", Items: slices.Clone(items), ResourceProfiles: spec.ResourceProfiles,
+		Status: "active", CreatedAt: time.Now().Add(-time.Hour),
+	})
+	// One of the two instances survives. Recovery reports that incomplete
+	// cohort as a failed lease instead of refusing to start, so the release
+	// reaches provision admission.
+	survivor := dockerIntentContainer(spec, "legacy-survivor", "docker-small", 0)
+	b := newOperationIntentRecoveryBackend(t, store, backendidentity.ID{}, []ContainerInfo{survivor}, nil)
+	t.Cleanup(func() { b.stopCancel(); b.wg.Wait() })
+	require.NoError(t, b.recoverState(t.Context()))
+	info, err := b.GetProvision(t.Context(), spec.LeaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
+	before, err := b.releaseStore.LatestActive(spec.LeaseUUID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.Nil(t, before.LegacyRuntimeAuthority)
+	originalAllocs := b.pool.ListAllocations()
+	forbidOperationRecoveryTeardown(t, b)
+
+	err = b.Provision(t.Context(), newProvisionRequest(spec.LeaseUUID, spec.Tenant, "docker-small", 2, spec.Manifest))
+	require.ErrorIs(t, err, backend.ErrInvalidState)
+	require.ErrorContains(t, err, "incomplete runtime authority")
+
+	claims, err := b.operationSettlement.ListOperationIntents()
+	require.NoError(t, err)
+	require.Empty(t, claims)
+	callbacks, err := store.ListPending()
+	require.NoError(t, err)
+	require.Empty(t, callbacks)
+	after, err := b.releaseStore.LatestActive(spec.LeaseUUID)
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.ElementsMatch(t, originalAllocs, b.pool.ListAllocations())
+}
+
+// A provision over the release of a lease adopted from v0.13 is admitted on the
+// authority that release records. A foreign principal is refused before
+// anything is durable. An accepted replacement that the pool then refuses
+// settles as one durable Failed callback, even after its caller disconnects,
+// and leaves the recorded authority, the release and the pool as they were.
+func TestProvisionOverAdoptedPredecessorKeepsItsRecordedAuthority(t *testing.T) {
+	for _, mode := range []string{"foreign principal", "capacity refusal", "caller cancels after admission"} {
 		t.Run(mode, func(t *testing.T) {
 			store, err := newBoundOperationIntentTestStore(t, shared.CallbackStoreConfig{DBPath: filepath.Join(t.TempDir(), "callbacks.db")})
 			require.NoError(t, err)
@@ -33,11 +85,12 @@ func TestProvisionPartialLegacyPredecessorRefusesBeforeDurableAdmission(t *testi
 				ResourceProfiles: testResourceProfiles(t, items),
 				Manifest:         validStackManifestJSON(map[string]string{"app": "docker.io/library/nginx:1.27"}),
 			}
-			seedV013OperationReleaseForTest(t, store, spec.LeaseUUID, shared.Release{
+			seedAdoptedOperationReleaseForTest(t, store, spec, shared.Release{
 				Manifest: spec.Manifest, Image: "stack", Items: slices.Clone(items), ResourceProfiles: spec.ResourceProfiles,
 				Status: "active", CreatedAt: time.Now().Add(-time.Hour),
 			})
 			first := dockerIntentContainer(spec, "legacy-survivor", "docker-small", 0)
+			second := dockerIntentContainer(spec, "legacy-second", "docker-small", 1)
 			b := newOperationIntentRecoveryBackend(t, store, backendidentity.ID{}, []ContainerInfo{first}, nil)
 			t.Cleanup(func() { b.stopCancel(); b.wg.Wait() })
 			require.NoError(t, b.recoverState(t.Context()))
@@ -47,43 +100,38 @@ func TestProvisionPartialLegacyPredecessorRefusesBeforeDurableAdmission(t *testi
 			before, err := b.releaseStore.LatestActive(spec.LeaseUUID)
 			require.NoError(t, err)
 			require.NotNil(t, before)
-			require.Nil(t, before.LegacyRuntimeAuthority)
+			require.NotNil(t, before.LegacyRuntimeAuthority)
 			originalAllocs := b.pool.ListAllocations()
 			forbidOperationRecoveryTeardown(t, b)
 			caller, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			mock := b.docker.(*mockDockerClient)
-			if mode != "partial cohort" {
-				second := dockerIntentContainer(spec, "legacy-second", "docker-small", 1)
-				if mode == "mixed callback generation" {
-					second.CallbackURL = "https://foreign.example/callbacks/provision?route=v013"
-				}
-				mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) { return []ContainerInfo{first, second}, nil }
-				mock.InspectContainerFn = func(_ context.Context, id string) (*ContainerInfo, error) {
-					if mode == "inspect unavailable" {
-						return nil, errors.New("Docker inspect unavailable")
-					}
-					if mode == "caller cancels during inspection" {
-						cancel()
-					}
-					if id == first.ContainerID {
-						copy := first
-						return &copy, nil
-					}
-					copy := second
+			mock.ListManagedContainersFn = func(context.Context) ([]ContainerInfo, error) { return []ContainerInfo{first, second}, nil }
+			mock.InspectContainerFn = func(_ context.Context, id string) (*ContainerInfo, error) {
+				if id == first.ContainerID {
+					copy := first
 					return &copy, nil
 				}
+				copy := second
+				return &copy, nil
 			}
 			req := newProvisionRequest(spec.LeaseUUID, spec.Tenant, "docker-small", 2, spec.Manifest)
-			completePredecessor := mode == "restored cohort capacity refusal" || mode == "caller cancels after admission"
-			if completePredecessor {
+
+			accepted := mode != "foreign principal"
+			switch mode {
+			case "foreign principal":
+				req.Tenant = "tenant-b"
+				err = b.Provision(caller, req)
+				require.ErrorIs(t, err, backend.ErrInvalidState)
+				require.ErrorContains(t, err, "belongs to a different tenant or provider")
+			case "capacity refusal":
 				hold := b.pool.HoldUnaccountedFootprint()
 				defer hold.Release()
-			}
-			if mode == "foreign principal" {
-				req.Tenant = "tenant-b"
-			}
-			if mode == "caller cancels after admission" {
+				err = b.Provision(caller, req)
+				require.ErrorIs(t, err, backend.ErrInsufficientResources)
+			case "caller cancels after admission":
+				hold := b.pool.HoldUnaccountedFootprint()
+				defer hold.Release()
 				planner := &pausedProvisionCapacityPlanner{
 					next: b.releaseCapacityPlanner, entered: make(chan struct{}), resume: make(chan struct{}),
 				}
@@ -95,29 +143,24 @@ func TestProvisionPartialLegacyPredecessorRefusesBeforeDurableAdmission(t *testi
 				close(planner.resume)
 				err = <-returned
 				require.ErrorIs(t, err, backend.ErrInsufficientResources,
-					"an accepted replacement owns its bounded backfill after HTTP disconnect")
-			} else {
-				err = b.Provision(caller, req)
+					"an accepted replacement owns its settlement after HTTP disconnect")
 			}
-			require.Error(t, err)
+
 			claims, err := b.operationSettlement.ListOperationIntents()
 			require.NoError(t, err)
-			require.Empty(t, claims, "pre-admission uncertainty must not strand an un-settleable Pending head")
+			require.Empty(t, claims, "no refusal may strand an un-settleable Pending head")
 			callbacks, err := store.ListPending()
 			require.NoError(t, err)
 			after, err := b.releaseStore.LatestActive(spec.LeaseUUID)
 			require.NoError(t, err)
-			if completePredecessor {
-				require.Len(t, callbacks, 1, "the accepted refusal is now durably representable")
+			if accepted {
+				require.Len(t, callbacks, 1, "the accepted refusal is durably representable")
 				require.Equal(t, backend.CallbackStatusFailed, callbacks[0].Status)
-				require.NotNil(t, after.LegacyRuntimeAuthority)
-				require.Equal(t, spec.CallbackURL, after.LegacyRuntimeAuthority.CallbackURL())
-				require.Equal(t, before.Version, after.Version)
-				require.Equal(t, before.Items, after.Items)
 			} else {
 				require.Empty(t, callbacks, "no operation was accepted or failed")
-				require.Equal(t, before, after)
 			}
+			require.Equal(t, before, after, "the recorded authority and the release are unchanged")
+			require.Equal(t, spec.CallbackURL, after.LegacyRuntimeAuthority.CallbackURL())
 			require.ElementsMatch(t, originalAllocs, b.pool.ListAllocations())
 			require.True(t, b.provisionStore.Exists(spec.LeaseUUID))
 		})

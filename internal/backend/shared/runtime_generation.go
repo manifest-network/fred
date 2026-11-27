@@ -93,7 +93,7 @@ func (proof RuntimeGenerationProof) Version() int {
 
 // MatchesRelease reports whether release is the exact durable row from which
 // this proof was minted. The comparison includes the full serialized digest,
-// not only Version or OperationID, so an in-place legacy-authority backfill
+// not only Version or OperationID, so any in-place rewrite of the row
 // invalidates an observation captured before that write.
 func (proof RuntimeGenerationProof) MatchesRelease(release Release) bool {
 	if !proof.Valid() || release.Version != proof.claim.Version() {

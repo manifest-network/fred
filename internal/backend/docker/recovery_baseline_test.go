@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/manifest-network/fred/internal/backend/shared"
 )
 
 func TestRecoveryBaselineReuseStillDetectsMutationDuringPublicationHandoff(t *testing.T) {
@@ -67,4 +69,27 @@ func BenchmarkRecoveryPublicationBaselineStableFleet(b *testing.B) {
 		backend.refreshProvisionRecoveryBaselineLocked(baseline, changed)
 		backend.provisionsMu.Unlock()
 	}
+}
+
+// Recovery compares the durable intents it planned from with the ones present
+// at publication. A lease whose intent changed, went away, or appeared in
+// between is reported; an unchanged one is not.
+func TestChangedRecoveryIntentGenerations(t *testing.T) {
+	operation := func(id string) recoveryIntentGeneration {
+		return recoveryIntentGeneration{class: recoveryOperationIntent, id: id}
+	}
+	maintenance := func(id string) recoveryIntentGeneration {
+		return recoveryIntentGeneration{class: recoveryMaintenanceIntent, id: id, maintenanceKind: shared.MaintenanceIntentRestart}
+	}
+	before := map[string]recoveryIntentGeneration{
+		"unchanged": operation("o1"), "replaced": operation("o1"), "settled": maintenance("m1"), "reclassed": operation("x"),
+	}
+	after := map[string]recoveryIntentGeneration{
+		"unchanged": operation("o1"), "replaced": operation("o2"), "admitted": operation("o3"), "reclassed": maintenance("x"),
+	}
+	assert.Equal(t, map[string]struct{}{
+		"replaced": {}, "settled": {}, "admitted": {}, "reclassed": {},
+	}, changedRecoveryIntentGenerations(before, after))
+	assert.Empty(t, changedRecoveryIntentGenerations(before, before))
+	assert.Empty(t, changedRecoveryIntentGenerations(nil, nil))
 }

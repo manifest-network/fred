@@ -311,3 +311,38 @@ func TestRecoverState_PartialDurableReleaseCohortTransitionsExistingActor(t *tes
 	require.Equal(t, backend.ProvisionStatusFailed, info.Status)
 	require.Equal(t, backend.ReasonInternal, info.Reason)
 }
+
+// A release that records a runtime authority binds every container of its
+// cohort to it, not only the first one listed.
+func TestValidateRecoveredReleaseCohort_RuntimeAuthorityBindsEveryContainer(t *testing.T) {
+	const callbackURL = "https://fred.example/callbacks/provision"
+	authority, err := shared.NewLegacyRuntimeAuthority(releaseCohortTenant, releaseCohortProviderUUID, callbackURL, "")
+	require.NoError(t, err)
+	items := []backend.LeaseItem{{SKU: "docker-small", Quantity: 2, ServiceName: "app"}}
+	release := &shared.Release{
+		Manifest: []byte(`{"services":{"app":{"image":"nginx:1.25"}}}`), Image: "stack",
+		Items: items, ResourceProfiles: testResourceProfiles(t, items),
+		LegacyRuntimeAuthority: &authority,
+	}
+	cohort := func() []ContainerInfo {
+		return []ContainerInfo{
+			{
+				ContainerID: "c0", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
+				SKU: "docker-small", ServiceName: "app", InstanceIndex: 0, Image: "nginx:1.25", CallbackURL: callbackURL,
+			},
+			{
+				ContainerID: "c1", LeaseUUID: releaseCohortLeaseUUID, Tenant: releaseCohortTenant, ProviderUUID: releaseCohortProviderUUID,
+				SKU: "docker-small", ServiceName: "app", InstanceIndex: 1, Image: "nginx:1.25", CallbackURL: callbackURL,
+			},
+		}
+	}
+	require.NoError(t, validateRecoveredReleaseCohort(release, cohort()))
+
+	for index, id := range []string{"c0", "c1"} {
+		mutated := cohort()
+		mutated[index].CallbackURL = "https://other.example/callbacks/provision"
+		err := validateRecoveredReleaseCohort(release, mutated)
+		require.ErrorContains(t, err, "identity differs from durable runtime authority")
+		require.ErrorContains(t, err, id)
+	}
+}

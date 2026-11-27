@@ -196,8 +196,6 @@ func newItemslessV013PredecessorRecoveryFixture(
 	writeItemslessActiveRelease(t, cfg.ReleasesDBPath, spec.LeaseUUID, spec.Manifest)
 	b, stores := openCloseRecoveryBackend(t, dir, mock, nil)
 	b.cfg.RetentionDBPath = cfg.RetentionDBPath
-	b.releaseBackfiller, err = shared.NewReleaseBackfiller(stores.callbacks, stores.releases)
-	require.NoError(t, err)
 	t.Cleanup(func() { closeCloseRecoveryBackend(t, b, stores) })
 	return b, stores
 }
