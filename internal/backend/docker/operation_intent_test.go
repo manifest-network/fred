@@ -923,6 +923,12 @@ func TestRecoverOperationIntent_SettlesAPublishedFailureAtStartup(t *testing.T) 
 	require.NoError(t, err)
 	require.Len(t, intents, 1, "the operation is still pending")
 
+	// Diagnostic retention may be shorter than the provision deadline. It
+	// must not expire the record of a decision that is not settled yet.
+	removed, err := b.diagnosticsStore.RemoveOlderThan(-time.Hour)
+	require.NoError(t, err)
+	require.Zero(t, removed)
+
 	// The next process: nothing of the first one's memory survives.
 	b.provisionsMu.Lock()
 	clear(b.provisions)
