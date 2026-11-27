@@ -530,22 +530,25 @@ func (m *mockDiagnosticsGatherer) GatherDiagnostics(ctx context.Context, instanc
 // that need specific behavior set the relevant field; everything else
 // inherits sensible defaults.
 type testActorOpts struct {
-	Logger                    *slog.Logger
-	StopCtx                   context.Context
-	WG                        *sync.WaitGroup
-	WorkerDrainTimeout        time.Duration
-	CloseTimeout              time.Duration
-	CommandFence              *shared.CommandFence
-	Inspector                 InstanceInspector
-	Diag                      DiagnosticsGatherer
-	ProvisionStore            LeaseProvisionStore
-	Metrics                   SMMetrics
-	ProvisionWorkFn           func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
-	RestoreWorkFn             func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
-	MaintenanceWorkFn         func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
-	OnTerminated              func(uuid string)
-	PersistDiagnosticsFn      func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
-	SendOperationCallbackFn   func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	Logger                  *slog.Logger
+	StopCtx                 context.Context
+	WG                      *sync.WaitGroup
+	WorkerDrainTimeout      time.Duration
+	CloseTimeout            time.Duration
+	CommandFence            *shared.CommandFence
+	Inspector               InstanceInspector
+	Diag                    DiagnosticsGatherer
+	ProvisionStore          LeaseProvisionStore
+	Metrics                 SMMetrics
+	ProvisionWorkFn         func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome
+	RestoreWorkFn           func(context.Context, shared.OperationIntentClaim) ReplaceWorkOutcome
+	MaintenanceWorkFn       func(shared.MaintenanceWorkerLifetime, shared.MaintenanceReleaseClaim) ReplaceWorkOutcome
+	OnTerminated            func(uuid string)
+	PersistDiagnosticsFn    func(entry shared.DiagnosticEntry, ids []string, keys map[string]string)
+	SendOperationCallbackFn func(uuid, url string, status backend.CallbackStatus, errMsg string)
+	// PrepareOperationFailureFn records a decided operation failure before it
+	// is reported. Unset, every failure is recorded.
+	PrepareOperationFailureFn func(proof shared.OperationReleaseUncommitted, errMsg string) bool
 	SendLifecycleFailureFn    func(runtime shared.RuntimeGenerationProof, errMsg string)
 	SendMaintenanceCallbackFn func(claim shared.MaintenanceIntentClaim, status backend.CallbackStatus, errMsg string)
 	DoDeprovisionFn           func(ctx context.Context, scope ActorCloseScope) error
@@ -653,6 +656,9 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 	if opts.SendOperationCallbackFn == nil {
 		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
+	if opts.PrepareOperationFailureFn == nil {
+		opts.PrepareOperationFailureFn = func(shared.OperationReleaseUncommitted, string) bool { return true }
+	}
 	if opts.SendLifecycleFailureFn == nil {
 		opts.SendLifecycleFailureFn = func(shared.RuntimeGenerationProof, string) {}
 	}
@@ -691,7 +697,8 @@ func newTestActor(t *testing.T, leaseUUID string, opts testActorOpts) *LeaseActo
 			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
 			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusFailed, errMsg)
 		},
-		SendLifecycleFailureFn: opts.SendLifecycleFailureFn,
+		PrepareOperationFailureFn: opts.PrepareOperationFailureFn,
+		SendLifecycleFailureFn:    opts.SendLifecycleFailureFn,
 		SendMaintenanceSuccessFn: func(active shared.MaintenanceReleaseActive) {
 			claim := active.Intent()
 			if !claim.Valid() {
@@ -791,6 +798,9 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 	if opts.SendOperationCallbackFn == nil {
 		opts.SendOperationCallbackFn = func(string, string, backend.CallbackStatus, string) {}
 	}
+	if opts.PrepareOperationFailureFn == nil {
+		opts.PrepareOperationFailureFn = func(shared.OperationReleaseUncommitted, string) bool { return true }
+	}
 	if opts.SendLifecycleFailureFn == nil {
 		opts.SendLifecycleFailureFn = func(shared.RuntimeGenerationProof, string) {}
 	}
@@ -834,7 +844,8 @@ func newTestActorNoSpawn(t *testing.T, leaseUUID string, opts testActorOpts) *Le
 			opts.ProvisionStore.UpdateFn(leaseUUID, func(state *ProvisionState) { url = state.CallbackURL })
 			opts.SendOperationCallbackFn(leaseUUID, url, backend.CallbackStatusFailed, errMsg)
 		},
-		SendLifecycleFailureFn: opts.SendLifecycleFailureFn,
+		PrepareOperationFailureFn: opts.PrepareOperationFailureFn,
+		SendLifecycleFailureFn:    opts.SendLifecycleFailureFn,
 		SendMaintenanceSuccessFn: func(active shared.MaintenanceReleaseActive) {
 			claim := active.Intent()
 			if !claim.Valid() {

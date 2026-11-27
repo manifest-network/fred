@@ -733,6 +733,26 @@ func (b *Backend) recoverOperationIntentClaims(
 			})
 			continue
 		}
+		// A published failure diagnostic for this exact operation is a durable
+		// record that its failure was decided, and possibly reported, by a
+		// process that did not settle it. Settle it now, with the reason that
+		// was published, instead of deferring it as a young empty generation
+		// that would read as provisioning until its deadline (ENG-939).
+		errMsg, published, publishedErr := b.publishedOperationFailure(claim)
+		if publishedErr != nil {
+			return fmt.Errorf("read published %s failure for lease %q: %w",
+				claim.Kind(), claim.LeaseUUID(), publishedErr)
+		}
+		if published {
+			classified = append(classified, classifiedOperationIntent{
+				claim: claim,
+				classification: operationIntentSubstrate{
+					status: backend.CallbackStatusFailed,
+					errMsg: errMsg,
+				},
+			})
+			continue
+		}
 		needsInventory = true
 		classified = append(classified, classifiedOperationIntent{claim: claim})
 	}

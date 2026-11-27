@@ -200,3 +200,73 @@ func TestPendingOperation_AwaitRequiresAClaimForTheSameLease(t *testing.T) {
 	require.True(t, own.AwaitOperation(claim))
 	assert.True(t, own.PendingOperation.Names(claim.OperationID()))
 }
+
+// A definitive provision failure is recorded before it is reported. The
+// projection is what tenants read: when the record comes first, a failure
+// anyone has read survives a stop or a crash. When shutdown has begun and
+// nothing could be recorded, the actor reports nothing and sends nothing, and
+// the projection keeps awaiting the operation for the next process to settle.
+func TestProvisionFailureIsRecordedBeforeItIsReported(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		recorded   bool
+		wantStatus backend.ProvisionStatus
+		wantSent   int
+	}{
+		{name: "recorded", recorded: true, wantStatus: backend.ProvisionStatusFailed, wantSent: 1},
+		{name: "shutdown began first", recorded: false, wantStatus: backend.ProvisionStatusProvisioning, wantSent: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := newMockProvisionStore()
+			store.put(testActorLeaseUUID, &ProvisionState{
+				LeaseUUID: testActorLeaseUUID, Status: backend.ProvisionStatusProvisioning,
+			})
+			admission, failure := newTestProvisionFailure(t, testActorLeaseUUID)
+			operationID := admission.Operation().OperationID()
+			var statusWhenRecorded []backend.ProvisionStatus
+			var sent []string
+			actor := newTestActorNoSpawn(t, testActorLeaseUUID, testActorOpts{
+				ProvisionStore: store,
+				ProvisionWorkFn: func(context.Context, shared.ProvisionResourceExecution) ProvisionWorkOutcome {
+					outcome, err := NewProvisionWorkFailure(
+						errors.New("refused"), ErrMsgInternal, backend.ReasonInternal, failure,
+					)
+					require.NoError(t, err)
+					return outcome
+				},
+				PrepareOperationFailureFn: func(proof shared.OperationReleaseUncommitted, errMsg string) bool {
+					require.True(t, proof.Valid())
+					require.Equal(t, ErrMsgInternal, errMsg)
+					state, ok := store.Get(testActorLeaseUUID)
+					require.True(t, ok)
+					statusWhenRecorded = append(statusWhenRecorded, state.Status)
+					return test.recorded
+				},
+				SendOperationCallbackFn: func(_, _ string, status backend.CallbackStatus, errMsg string) {
+					require.Equal(t, backend.CallbackStatusFailed, status)
+					sent = append(sent, errMsg)
+				},
+			})
+			ack := make(chan error, 1)
+			actor.handleProvisionRequested(provisionRequestedMsg{Ctx: context.Background(), Ack: ack, Admission: admission})
+			require.NoError(t, <-ack)
+			select {
+			case terminal := <-actor.inbox:
+				actor.handleAcceptedMessage(terminal)
+			case <-time.After(5 * time.Second):
+				t.Fatal("provision worker sent no terminal message")
+			}
+
+			require.Equal(t, []backend.ProvisionStatus{backend.ProvisionStatusProvisioning}, statusWhenRecorded,
+				"the failure is recorded once, while the lease still reads as provisioning")
+			state, _ := store.Get(testActorLeaseUUID)
+			require.Equal(t, test.wantStatus, state.Status)
+			assert.True(t, state.PendingOperation.Names(operationID), "the projection keeps awaiting the operation")
+			assert.Len(t, sent, test.wantSent)
+			if !test.recorded {
+				assert.Zero(t, state.FailCount, "an unreported failure is not counted")
+				assert.Empty(t, state.Message)
+			}
+		})
+	}
+}

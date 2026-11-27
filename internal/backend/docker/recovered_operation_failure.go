@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -59,6 +60,20 @@ func (b *Backend) prepareRecoveredOperationFailure(
 		return preparer.prepareOperationFailure(ctx, proof, message)
 	}
 	return operationFailureSurface{reason: backend.ReasonInternal, message: message, lastError: message}, nil
+}
+
+// publishedOperationFailure reports whether claim's failure was already
+// published, and the message to settle it with. A backend without attempt
+// diagnostics publishes nothing and reports false.
+func (b *Backend) publishedOperationFailure(claim shared.OperationIntentClaim) (string, bool, error) {
+	if b.failureDiagnostics == nil {
+		return "", false, nil
+	}
+	entry, published, err := b.failureDiagnostics.PublishedOperationFailure(claim)
+	if err != nil || !published {
+		return "", false, err
+	}
+	return cmp.Or(entry.Message, interruptedOperationFailure), true, nil
 }
 
 // publishRecoveredOperationFailure publishes Failed on the projection that

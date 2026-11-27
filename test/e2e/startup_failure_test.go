@@ -187,10 +187,14 @@ func TestBackend_WorkloadTheRuntimeRefusesFailsTheLease(t *testing.T) {
 }
 
 // TestBackend_FailedDeployStaysExplained fails a deploy and reads why from
-// the backend three times: at once, after the backend has restarted, and
-// after the lease is closed. The reason must be the same each time. A tenant
-// asks why a deploy failed after the fact, when the provider has already
-// closed the lease for it (ENG-939).
+// the backend: at once, after the backend crashed and came back, after it
+// restarted, and after the lease is closed. The reason must be the same each
+// time. A tenant asks why a deploy failed after the fact, when the provider
+// has already closed the lease for it (ENG-939).
+//
+// The backend is killed the moment it reports the lease failed, before it can
+// have settled the operation or sent a callback about it: a failure a tenant
+// has read must already be on disk.
 func TestBackend_FailedDeployStaysExplained(t *testing.T) {
 	b := StartBackendWithConfig(t, failsAtStartup)
 	lease := leaseRunning("false")
@@ -208,6 +212,10 @@ func TestBackend_FailedDeployStaysExplained(t *testing.T) {
 		require.Equal(t, messageExitedDuringStartup, reported.Message, when)
 		require.Equal(t, 1, reported.FailCount, when)
 	}
+	b.Kill()
+	b.Start()
+	requireExplained("after a crash")
+
 	b.Stop()
 	b.Start()
 	requireExplained("after a restart")

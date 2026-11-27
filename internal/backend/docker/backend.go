@@ -2656,13 +2656,43 @@ func (b *Backend) sendOperationSuccessWithURL(
 	}
 }
 
+// operationFailureCallbackMessage truncates a failure message to fit the
+// on-chain rejection reason limit.
+func operationFailureCallbackMessage(errMsg string) string {
+	if len(errMsg) > callbackMaxErrorLen {
+		return errMsg[:callbackMaxErrorLen-3] + "..."
+	}
+	return errMsg
+}
+
+// prepareOperationFailure publishes the failure diagnostic of a decided
+// operation failure before the lease actor reports the lease Failed. The
+// publication is durable and names the exact operation, so a process that
+// starts with that operation still pending settles it at once, with the same
+// reason (publishedOperationFailure).
+//
+// It returns false only when shutdown has begun and nothing was published.
+// Any other error changes nothing: the actor reports the failure and
+// the periodic pass settles it from the Failed projection.
+func (b *Backend) prepareOperationFailure(proof shared.OperationReleaseUncommitted, errMsg string) bool {
+	_, err := b.prepareRecoveredOperationFailure(b.stopCtx, proof, operationFailureCallbackMessage(errMsg))
+	if err == nil {
+		return true
+	}
+	if b.stopCtx.Err() != nil {
+		b.logger.Warn("shutdown began before an operation failure was recorded; the next start settles it",
+			"error", err, "lease_uuid", proof.LeaseUUID())
+		return false
+	}
+	b.logger.Error("failed to record an operation failure before reporting it", "error", err,
+		"lease_uuid", proof.LeaseUUID())
+	return true
+}
+
 // sendOperationFailure dispatches a definitive requested-operation failure
 // whose callback route and generation are sealed by the store-issued proof.
 func (b *Backend) sendOperationFailure(proof shared.OperationReleaseUncommitted, errMsg string) {
-	// Truncate error to fit the on-chain rejection reason limit.
-	if len(errMsg) > callbackMaxErrorLen {
-		errMsg = errMsg[:callbackMaxErrorLen-3] + "..."
-	}
+	errMsg = operationFailureCallbackMessage(errMsg)
 
 	if err := b.callbackPublisher.PublishOperationFailureContext(b.stopCtx, proof, errMsg); err != nil {
 		b.logger.Error("failed to publish operation failure", "error", err,
