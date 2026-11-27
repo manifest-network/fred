@@ -289,12 +289,16 @@ callback_max_age: 24h
 # to this store when the provision is no longer in memory.
 
 # Path to bbolt database for persisting failure diagnostics. This store carries
-# no lifecycle authority and may be recreated if its history is lost.
+# no lifecycle authority and may be recreated if its history is lost. It also
+# holds the record of a deploy failure that is decided but not settled yet:
+# without it, a backend that stopped in between settles that failure at the
+# provision deadline instead of at startup.
 # Default: "diagnostics.db"
 diagnostics_db_path: "diagnostics.db"
 
 # Maximum age of persisted diagnostic entries. Entries older than this are
-# removed by background cleanup. Default: 7 days (168h).
+# removed by background cleanup, except the failure of an operation that is
+# not settled yet, which is kept until it is. Default: 7 days (168h).
 diagnostics_max_age: 168h
 
 # =============================================================================

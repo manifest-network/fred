@@ -80,6 +80,12 @@ func newLeaseActor(b *Backend, leaseUUID string) *leasesm.LeaseActor {
 		) {
 			b.sendOperationFailure(proof, errMsg)
 		},
+		PrepareOperationFailureFn: func(
+			proof shared.OperationReleaseUncommitted,
+			errMsg string,
+		) bool {
+			return b.prepareOperationFailure(proof, errMsg)
+		},
 		SendLifecycleFailureFn: func(runtime shared.RuntimeGenerationProof, errMsg string) {
 			b.sendLifecycleFailure(runtime, errMsg)
 		},
