@@ -208,6 +208,13 @@ func TestBackend_FailedDeployStaysExplained(t *testing.T) {
 		require.Equal(t, messageExitedDuringStartup, reported.Message, when)
 		require.Equal(t, 1, reported.FailCount, when)
 	}
+	// A 0.14 backend reports a lease failed before it has recorded the result
+	// of the operation that failed, and the reason lives only in that record.
+	// A stop that lands in between leaves the operation pending, and the
+	// restarted backend reports the lease as provisioning until it settles the
+	// operation again, without the reason. The callback is sent once the
+	// result is recorded, so the restart waits for it.
+	b.AwaitCompletionCallback(t, lease.LeaseUUID)
 	b.Stop()
 	b.Start()
 	requireExplained("after a restart")
