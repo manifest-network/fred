@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -176,7 +177,8 @@ func (s *DiagnosticsStore) Delete(leaseUUID string) error {
 // first would return the lease to provisioning. It expires only on a positive
 // answer from the journal that the operation no longer awaits settlement. With
 // no journal bound yet, as during the cleanup that runs when the store opens,
-// every published operation failure is kept.
+// every published operation failure is kept; expireAfterJournalBinding runs
+// the pass again once NewFailureDiagnostics has bound the journal.
 func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge)
 	settled, err := s.settledPublishedOperations(cutoff)
@@ -231,6 +233,26 @@ func (s *DiagnosticsStore) RemoveOlderThan(maxAge time.Duration) (int, error) {
 		return nil
 	})
 	return removed, err
+}
+
+// expireAfterJournalBinding runs the expiry pass the store could not complete
+// when it opened. That pass had no journal to ask, so it kept every published
+// operation failure, the settled ones included. Without this pass they would
+// wait for the next periodic one, a whole maxAge away, and a backend that
+// restarts more often than that would never expire them. As with the pass at
+// open, a failure is logged and the periodic pass retries.
+func (s *DiagnosticsStore) expireAfterJournalBinding() {
+	if s.maxAge <= 0 {
+		return
+	}
+	removed, err := s.RemoveOlderThan(s.maxAge)
+	if err != nil {
+		slog.Warn("diagnostics cleanup after journal binding failed", "error", err)
+		return
+	}
+	if removed > 0 {
+		slog.Info("removed expired diagnostics after journal binding", "count", removed, "max_age", s.maxAge)
+	}
 }
 
 // publishedOperationIsHeld reports whether a published attempt is an operation

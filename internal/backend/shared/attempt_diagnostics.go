@@ -133,6 +133,7 @@ func NewFailureDiagnostics(store *DiagnosticsStore, operations *OperationSettlem
 	store.retentionMu.Lock()
 	store.awaitsSettlement = diagnostics.attemptAwaitsSettlement
 	store.retentionMu.Unlock()
+	store.expireAfterJournalBinding()
 	return diagnostics, nil
 }
 

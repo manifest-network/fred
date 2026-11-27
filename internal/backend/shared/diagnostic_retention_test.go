@@ -121,18 +121,37 @@ func TestFailureDiagnosticsRetainsConstantCaptureCountAcrossManyFailedAttempts(t
 // not expire it while the operation is unsettled, or a backend that stopped
 // between the decision and its settlement would start with nothing to settle
 // and report the lease as provisioning again (ENG-939). It is kept by the
-// periodic cleanup and by the cleanup that runs when the store opens, and
-// expires as any other diagnostic once the operation is settled.
+// periodic cleanup and across a restart. Once the operation is settled it
+// expires as any other diagnostic, at the next start at the latest: the
+// cleanup that runs when the store opens cannot tell, so the pass runs again
+// when the journal is bound.
 func TestDiagnosticsExpiryKeepsAPublishedOperationFailureUntilItsOperationSettles(t *testing.T) {
 	const reason = "image pull failed"
-	// Everything in the store is older than a cutoff an hour from now.
-	const everything = -time.Hour
 	fixture := newCallbackPublisherFixture(t, "docker-a")
 	path := filepath.Join(t.TempDir(), "diagnostics.db")
-	store, err := NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: path})
-	require.NoError(t, err)
-	diagnostics, err := NewFailureDiagnostics(store, fixture.stores.settlement, fixture.maintenance)
-	require.NoError(t, err)
+	var store *DiagnosticsStore
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	// restart closes the store and opens it as a backend start does, with a
+	// retention every stored diagnostic has outlived and its periodic cleanup
+	// far away. The cleanup at open has run when it returns; the journal is
+	// not bound yet.
+	restart := func() {
+		t.Helper()
+		if store != nil {
+			require.NoError(t, store.Close())
+		}
+		var err error
+		store, err = NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: path, MaxAge: time.Nanosecond, CleanupInterval: time.Hour})
+		require.NoError(t, err)
+	}
+	bind := func() *FailureDiagnostics {
+		t.Helper()
+		diagnostics, err := NewFailureDiagnostics(store, fixture.stores.settlement, fixture.maintenance)
+		require.NoError(t, err)
+		return diagnostics
+	}
+	restart()
+	diagnostics := bind()
 	claim := beginHandoffOperation(t, fixture.stores.settlement, testOperationIntentSpec(t, "published-failure"))
 	uncommitted := commitHandoffRefusal(t, fixture.stores.settlement, claim)
 	publication, err := diagnostics.OperationFailureContext(t.Context(), uncommitted, FailureDiagnosticObservation{
@@ -140,40 +159,37 @@ func TestDiagnosticsExpiryKeepsAPublishedOperationFailureUntilItsOperationSettle
 	})
 	require.NoError(t, err)
 	require.NoError(t, publication.PublishContext(t.Context(), 1))
-	requirePublished := func(diagnostics *FailureDiagnostics, when string) {
+	requirePublished := func(when string) {
 		t.Helper()
 		entry, published, err := diagnostics.PublishedOperationFailure(claim)
 		require.NoError(t, err, when)
 		require.True(t, published, when)
 		require.Equal(t, reason, entry.Message, when)
-		visible, err := diagnostics.store.Get(claim.LeaseUUID())
+		visible, err := store.Get(claim.LeaseUUID())
 		require.NoError(t, err, when)
 		require.NotNil(t, visible, when)
 		require.Equal(t, reason, visible.Message, when)
 	}
 
-	removed, err := store.RemoveOlderThan(everything)
+	removed, err := store.RemoveOlderThan(time.Nanosecond)
 	require.NoError(t, err)
 	require.Zero(t, removed)
-	requirePublished(diagnostics, "after a periodic cleanup")
+	requirePublished("after a periodic cleanup")
 
-	// The cleanup that runs when the store opens has no journal to ask yet.
-	require.NoError(t, store.Close())
-	store, err = NewDiagnosticsStore(DiagnosticsStoreConfig{DBPath: path, MaxAge: time.Nanosecond, CleanupInterval: time.Hour})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	diagnostics, err = NewFailureDiagnostics(store, fixture.stores.settlement, fixture.maintenance)
-	require.NoError(t, err)
-	requirePublished(diagnostics, "after the store reopened")
+	restart()
+	diagnostics = bind()
+	requirePublished("after a restart")
 
 	require.NoError(t, fixture.publisher.PublishOperationFailureContext(t.Context(), uncommitted, reason))
-	removed, err = store.RemoveOlderThan(everything)
+	restart()
+	visible, err := store.Get(claim.LeaseUUID())
 	require.NoError(t, err)
-	require.Equal(t, 1, removed, "a settled operation's failure expires as any other diagnostic")
+	require.NotNil(t, visible, "the cleanup at open has no journal to ask, and keeps what it cannot judge")
+	diagnostics = bind()
 	_, published, err := diagnostics.PublishedOperationFailure(claim)
 	require.NoError(t, err)
-	require.False(t, published)
-	visible, err := store.Get(claim.LeaseUUID())
+	require.False(t, published, "a settled operation's failure expires once the journal is bound")
+	visible, err = store.Get(claim.LeaseUUID())
 	require.NoError(t, err)
 	require.Nil(t, visible)
 }
